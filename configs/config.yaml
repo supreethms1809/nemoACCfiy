@@ -157,6 +157,11 @@ training_stages:
       tokenizer_path: "tokenizers/qwen3-coder-30b-a3b-instruct-custom"
       use_flash_attention: true
       disable_flash_attention: false
+      
+      # Model architecture options (inherited from model_config_1.7B)
+      tie_weights: true             # Tie embedding and LM head weights
+      freeze_embedder_decoder: true # Freeze embedder decoder
+      embedder_checkpoint_path: null # Path to embedder checkpoint
 
     training:
       epochs: 2
@@ -167,6 +172,18 @@ training_stages:
       gradient_accumulation_steps: 2
       gradient_checkpointing: true
       mixed_precision: "bf16"
+      
+      # Training monitoring and control
+      log_every_n_steps: 10         # Log frequency
+      val_check_interval: 1.0       # Validation frequency
+      save_top_k: 3                 # Number of best checkpoints to keep
+      monitor: "val_loss"           # Metric to monitor
+      mode: "min"                   # Monitor mode (min/max)
+      patience: 5                   # Early stopping patience
+      
+      # Gradient optimization
+      gradient_clip_val: 1.0        # Gradient clipping value
+      gradient_clip_algorithm: "norm"  # Gradient clipping algorithm
     
     # Distributed training configuration
     distributed:
@@ -204,11 +221,15 @@ training_stages:
     
     # Dataset configuration
     data:
-      # Path to your real dataset (leave empty to use sample data)
-      # Supported formats: .txt, .json, .jsonl files or directories containing these files
-      # For JSON/JSONL: each item should have a 'text' field
-      data_path: "data/example_training_data.jsonl"  # Using example dataset
-      max_samples: null  # Limit number of samples (null = no limit)
+      # Use HuggingFace datasets from the datasets section below
+      data_path: null  # Set to null to use HuggingFace datasets
+      max_samples: 10000  # Limit samples for testing (remove for full training)
+      
+      # Data loading performance options
+      num_workers: 8                # Number of DataLoader workers
+      pin_memory: true              # Pin memory for faster GPU transfer
+      persistent_workers: true      # Keep workers alive between epochs
+      prefetch_factor: 2            # Prefetch batches for better performance
 
     checkpoint_dir: "outputs/checkpoints/stage1"
     model_output_dir: "outputs/models"
@@ -230,6 +251,12 @@ training_stages:
       profiler_log_dir: "./profiler_logs/stage1"
       save_steps: 1000
       validation_steps: 1000
+    
+    # Environment and reproducibility
+    environment:
+      seed: 42                      # Random seed for reproducibility
+      deterministic: false          # Deterministic training (slower but reproducible)
+      benchmark: true               # CUDNN benchmark for better performance
 
   # Stage 2: Fine-tuning
   stage2:

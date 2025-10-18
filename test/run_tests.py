@@ -8,8 +8,8 @@ import sys
 import os
 from pathlib import Path
 
-# Add the test directory to the path
-test_dir = Path(__file__).parent / "test"
+# Add the current directory to the path (since we're now in the test directory)
+test_dir = Path(__file__).parent
 sys.path.append(str(test_dir))
 
 # Import and run the test runner

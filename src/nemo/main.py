@@ -20,8 +20,10 @@ from nemo_wrapper import create_modular_model_nemo, ModularModelConfig, create_m
 try:
     from ModularModelstage1_NTPtraining import train_basic_mode, train_production_mode, train_foundation_mode
     TRAINING_AVAILABLE = True
+    FOUNDATION_TRAINING_AVAILABLE = True
 except ImportError:
     TRAINING_AVAILABLE = False
+    FOUNDATION_TRAINING_AVAILABLE = False
     print("Warning: Unified training not available. Training functionality disabled.")
 
 
@@ -99,7 +101,7 @@ def train_model(
     warmup_steps: int = 1000,
     max_epochs: int = 10,
     batch_size: int = 4,
-    num_workers: int = 4,
+    num_workers: int = 8,
     devices: int = 1,
     precision: str = "16-mixed",
     gradient_clip_val: float = 1.0,
@@ -114,6 +116,7 @@ def train_model(
     use_existing_config: bool = False,
     model_config_key: str = "model_config_1.7B",
     base_path: Optional[str] = None,
+    resume_from_checkpoint: Optional[str] = None,
     **kwargs
 ):
     """Train a ModularModel with NeMo integration."""
@@ -145,16 +148,17 @@ def train_model(
             'mode': mode,
             'patience': patience,
             'output_dir': output_dir,
+            'resume_from_checkpoint': resume_from_checkpoint,
             **kwargs
         }
         
-        return train_modular_model_nemo(
-            model=model,
+        return train_production_mode(
+            model_config_key=model_config_key,
             stage=stage,
             **training_kwargs
         )
     else:
-        return train_modular_model_nemo(
+        return train_basic_mode(
             stage=stage,
             vocab_size=vocab_size,
             hidden_size=hidden_size,
@@ -277,13 +281,16 @@ Examples:
                               help='Model configuration key from config.json')
     train_parser.add_argument('--base_path', type=str, default=None,
                               help='Base path to src directory (auto-detected if not provided)')
+    train_parser.add_argument('--dataset_source', type=str, default='auto', 
+                              choices=['auto', 'sample', 'huggingface'],
+                              help='Dataset source: auto (use config), sample (local datasets), huggingface (HF datasets)')
     
     train_parser.add_argument('--learning_rate', type=float, default=1e-4)
     train_parser.add_argument('--weight_decay', type=float, default=0.01)
     train_parser.add_argument('--warmup_steps', type=int, default=1000)
     train_parser.add_argument('--max_epochs', type=int, default=10)
     train_parser.add_argument('--batch_size', type=int, default=4)
-    train_parser.add_argument('--num_workers', type=int, default=4)
+    train_parser.add_argument('--num_workers', type=int, default=8)
     train_parser.add_argument('--devices', type=int, default=1)
     train_parser.add_argument('--precision', type=str, default='16-mixed')
     train_parser.add_argument('--gradient_clip_val', type=float, default=1.0)
@@ -295,6 +302,8 @@ Examples:
     train_parser.add_argument('--mode', type=str, default='min', choices=['min', 'max'])
     train_parser.add_argument('--patience', type=int, default=5)
     train_parser.add_argument('--output_dir', type=str, default='./outputs')
+    train_parser.add_argument('--resume_from_checkpoint', type=str, default=None,
+                              help='Path to checkpoint to resume training from')
     
     # Foundation training arguments
     foundation_parser.add_argument('--stage', type=str, default='stage1', choices=['stage1', 'stage2'])
@@ -304,6 +313,9 @@ Examples:
                                   help='Model configuration key from config.json')
     foundation_parser.add_argument('--base_path', type=str, default=None,
                                   help='Base path to src directory (auto-detected if not provided)')
+    foundation_parser.add_argument('--dataset_source', type=str, default='auto', 
+                                  choices=['auto', 'sample', 'huggingface'],
+                                  help='Dataset source: auto (use config), sample (local datasets), huggingface (HF datasets)')
     
     # Dataset configuration
     foundation_parser.add_argument('--data_path', type=str, default='./data', help='Path to training data')
@@ -318,7 +330,7 @@ Examples:
     foundation_parser.add_argument('--warmup_steps', type=int, default=100)
     foundation_parser.add_argument('--max_epochs', type=int, default=3)
     foundation_parser.add_argument('--batch_size', type=int, default=4)
-    foundation_parser.add_argument('--num_workers', type=int, default=4)
+    foundation_parser.add_argument('--num_workers', type=int, default=8)
     foundation_parser.add_argument('--devices', type=int, default=1)
     foundation_parser.add_argument('--precision', type=str, default='bf16-mixed')
     foundation_parser.add_argument('--mixed_precision', type=str, default='bf16')
@@ -340,6 +352,8 @@ Examples:
     foundation_parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints')
     foundation_parser.add_argument('--model_output_dir', type=str, default='./models')
     foundation_parser.add_argument('--model_output_name', type=str, default='nemo_foundation_model.ckpt')
+    foundation_parser.add_argument('--resume_from_checkpoint', type=str, default=None,
+                                  help='Path to checkpoint to resume training from')
     
     # Wandb configuration
     foundation_parser.add_argument('--use_wandb', action='store_true', default=False)
@@ -379,7 +393,7 @@ Examples:
             print("❌ NeMo foundation training not available. Please check NeMo installation.")
             sys.exit(1)
         print(f"Training ModularModel with NeMo foundation datasets for {args.stage}...")
-        model, trainer = train_nemo_foundation_model(**vars(args))
+        model, trainer = train_foundation_mode(**vars(args))
         print(f"✅ NeMo foundation training completed successfully!")
         
     elif args.command == 'test':

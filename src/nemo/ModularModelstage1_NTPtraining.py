@@ -28,6 +28,13 @@ try:
 except ImportError:
     print("Warning: Could not import config loader: No module named 'config_loader'")
     ConfigLoader = None
+
+try:
+    from huggingface_dataset_loader import HuggingFaceDatasetLoader, HuggingFaceDatasetWrapper
+    HF_DATASETS_AVAILABLE = True
+except ImportError:
+    print("Warning: Could not import HuggingFace dataset loader: No module named 'huggingface_dataset_loader'")
+    HF_DATASETS_AVAILABLE = False
     create_nemo_config_from_existing = None
 from nemo_wrapper import create_modular_model_nemo, ModularModelConfig
 
@@ -220,7 +227,6 @@ class NeMoFoundationDataset(Dataset):
         
         # Initialize NeMo GPTDataset
         self.gpt_dataset = GPTDataset(
-            data_path=data_path,
             indexed_dataset=MMapIndexedDataset if use_mmap else IndexedDataset,
             tokenizer=tokenizer,
             max_seq_length=max_length,
@@ -364,18 +370,18 @@ class ModularModelTrainingModule(pl.LightningModule):
         if optimizer_type == "AdamW":
             optimizer = torch.optim.AdamW(
                 self.parameters(),
-                lr=lr,
-                weight_decay=self.optimizer_config.get("weight_decay", 0.01),
+                lr=float(lr),
+                weight_decay=float(self.optimizer_config.get("weight_decay", 0.01)),
                 betas=tuple(self.optimizer_config.get("betas", [0.9, 0.999])),
-                eps=self.optimizer_config.get("eps", 1e-8)
+                eps=float(self.optimizer_config.get("eps", 1e-8))
             )
         elif optimizer_type == "Adam":
             optimizer = torch.optim.Adam(
                 self.parameters(),
-                lr=lr,
-                weight_decay=self.optimizer_config.get("weight_decay", 0.01),
+                lr=float(lr),
+                weight_decay=float(self.optimizer_config.get("weight_decay", 0.01)),
                 betas=tuple(self.optimizer_config.get("betas", [0.9, 0.999])),
-                eps=self.optimizer_config.get("eps", 1e-8)
+                eps=float(self.optimizer_config.get("eps", 1e-8))
             )
         else:
             raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
@@ -551,10 +557,36 @@ def load_processed_dataset(processed_data_path: str) -> List[Dict[str, Any]]:
     return data
 
 
-def process_datasets_for_training(config_path: str = "configs/config.yaml", output_filename: str = "training_data", total_samples: int = 10000) -> str:
-    """Process datasets for training using the dataset processor."""
+def process_datasets_for_training(config_path: str = "configs/config.yaml", output_filename: str = "training_data", total_samples: int = 10000, base_path: Optional[str] = None) -> str:
+    """Process datasets for training using the dataset processor or HuggingFace datasets."""
     import sys
     from pathlib import Path
+    import yaml
+    
+    # Resolve config path relative to base_path if provided
+    if base_path is not None:
+        config_path = str(Path(base_path) / config_path)
+    
+    # Check if we should use HuggingFace datasets
+    try:
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+        
+        # Check if data_path is None (use HuggingFace datasets)
+        training_stages = config.get("training_stages", {})
+        stage1_config = training_stages.get("stage1", {})
+        data_config = stage1_config.get("data", {})
+        data_path = data_config.get("data_path")
+        
+        if data_path is None and HF_DATASETS_AVAILABLE:
+            logging.info("Using HuggingFace datasets for training...")
+            return _process_huggingface_datasets(config_path, output_filename, total_samples, base_path)
+        
+    except Exception as e:
+        logging.warning(f"Could not check config for HuggingFace datasets: {e}")
+    
+    # Fallback to original dataset processor
+    logging.info("Using local dataset processor...")
     
     # Add the dataset processing module to path
     ds_processing_path = Path(__file__).parent.parent / "ds_processing"
@@ -585,6 +617,39 @@ def process_datasets_for_training(config_path: str = "configs/config.yaml", outp
     except Exception as e:
         logging.error(f"Failed to process datasets: {e}")
         raise
+
+
+def _process_huggingface_datasets(config_path: str, output_filename: str, total_samples: int, base_path: Optional[str] = None) -> str:
+    """Process HuggingFace datasets for training."""
+    from pathlib import Path
+    import json
+    
+    # Resolve paths
+    if base_path is not None:
+        config_path = str(Path(base_path) / config_path)
+        output_dir = Path(base_path) / "data" / "processed"
+    else:
+        output_dir = Path("data") / "processed"
+    
+    # Create output directory
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Load HuggingFace datasets
+    tokenizer_path = "tokenizers/qwen3-coder-30b-a3b-instruct-custom"
+    if base_path is not None:
+        tokenizer_path = str(Path(base_path) / tokenizer_path)
+    
+    loader = HuggingFaceDatasetLoader(config_path, tokenizer_path)
+    training_data = loader.create_training_data(max_samples=total_samples)
+    
+    # Save to JSONL file
+    output_path = output_dir / f"{output_filename}.jsonl"
+    with open(output_path, 'w', encoding='utf-8') as f:
+        for sample in training_data:
+            f.write(json.dumps(sample, ensure_ascii=False) + '\n')
+    
+    logging.info(f"Saved {len(training_data)} HuggingFace dataset samples to {output_path}")
+    return str(output_path)
 
 
 def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None):
@@ -678,12 +743,32 @@ def train_basic_mode(
     devices: int = 1,
     precision: str = "16-mixed",
     max_epochs: int = 3,
+    resume_from_checkpoint: Optional[str] = None,
+    seed: Optional[int] = None,
+    deterministic: bool = False,
+    benchmark: bool = True,
     **kwargs
 ):
     """Basic training mode with simple datasets."""
     
     if not LIGHTNING_AVAILABLE:
         raise RuntimeError("PyTorch Lightning not available for basic training mode.")
+    
+    # Set environment for reproducibility
+    if seed is not None:
+        pl.seed_everything(seed, workers=True)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    
+    # Set deterministic behavior
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    else:
+        torch.backends.cudnn.benchmark = benchmark
+    
+    # Optimize for Tensor Cores (RTX 6000 Ada Generation)
+    torch.set_float32_matmul_precision('high')
     
     logging.info(f"🚀 Starting basic training: {stage}")
     
@@ -717,8 +802,26 @@ def train_basic_mode(
     val_dataset = BasicDataset(val_data, stage=stage)
     
     # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=collate_fn)
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=8, 
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2,
+        collate_fn=collate_fn
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=8, 
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2,
+        collate_fn=collate_fn
+    )
     
     # Create training module
     training_module = ModularModelTrainingModule(
@@ -747,7 +850,7 @@ def train_basic_mode(
     
     # Create strategy if distributed config is provided
     distributed_config = kwargs.get("distributed_config", {})
-    strategy = create_strategy(distributed_config) if distributed_config else None
+    strategy = create_strategy(distributed_config) if distributed_config else "auto"
     
     # Get num_nodes from distributed config
     num_nodes = distributed_config.get("num_nodes", 1)
@@ -766,7 +869,9 @@ def train_basic_mode(
     )
     
     # Train
-    trainer.fit(training_module, train_loader, val_loader)
+    if resume_from_checkpoint:
+        logging.info(f"🔄 Resuming training from checkpoint: {resume_from_checkpoint}")
+    trainer.fit(training_module, train_loader, val_loader, ckpt_path=resume_from_checkpoint)
     
     logging.info("✅ Basic training completed successfully!")
     return trainer, training_module
@@ -777,6 +882,11 @@ def train_production_mode(
     stage: str = "stage1",
     devices: int = 1,
     precision: str = "bf16-mixed",
+    base_path: Optional[str] = None,
+    resume_from_checkpoint: Optional[str] = None,
+    seed: Optional[int] = None,
+    deterministic: bool = False,
+    benchmark: bool = True,
     **kwargs
 ):
     """Production training mode using configuration files."""
@@ -787,10 +897,26 @@ def train_production_mode(
     if create_nemo_config_from_existing is None:
         raise RuntimeError("Config loader not available for production training mode.")
     
+    # Set environment for reproducibility
+    if seed is not None:
+        pl.seed_everything(seed, workers=True)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    
+    # Set deterministic behavior
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    else:
+        torch.backends.cudnn.benchmark = benchmark
+    
+    # Optimize for Tensor Cores (RTX 6000 Ada Generation)
+    torch.set_float32_matmul_precision('high')
+    
     logging.info(f"🚀 Starting production training: {model_config_key} - {stage}")
     
     # Load configuration
-    config = create_nemo_config_from_existing(model_config_key, stage)
+    config = create_nemo_config_from_existing(model_config_key, stage, base_path)
     
     # Override parameters if provided
     for key, value in kwargs.items():
@@ -834,7 +960,8 @@ def train_production_mode(
                 processed_data_path = process_datasets_for_training(
                     config_path="configs/config.yaml",
                     output_filename="training_data",
-                    total_samples=total_samples
+                    total_samples=total_samples,
+                    base_path=base_path
                 )
                 all_data = load_processed_dataset(processed_data_path)
             
@@ -877,8 +1004,8 @@ def train_production_mode(
     val_dataset = BasicDataset(val_data, stage=stage)
     
     # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True, num_workers=0, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=config["batch_size"], shuffle=False, num_workers=0, collate_fn=collate_fn)
+    train_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True, num_workers=8, collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=config["batch_size"], shuffle=False, num_workers=8, collate_fn=collate_fn)
     
     # Create training module with optimizer and scheduler configs
     training_module = ModularModelTrainingModule(
@@ -928,7 +1055,9 @@ def train_production_mode(
     )
     
     # Train
-    trainer.fit(training_module, train_loader, val_loader)
+    if resume_from_checkpoint:
+        logging.info(f"🔄 Resuming training from checkpoint: {resume_from_checkpoint}")
+    trainer.fit(training_module, train_loader, val_loader, ckpt_path=resume_from_checkpoint)
     
     logging.info("✅ Production training completed successfully!")
     return trainer, training_module
@@ -943,6 +1072,7 @@ def train_foundation_mode(
     batch_size: int = 4,
     devices: int = 1,
     precision: str = "bf16-mixed",
+    resume_from_checkpoint: Optional[str] = None,
     **kwargs
 ):
     """Foundation training mode using NeMo native datasets."""
@@ -995,8 +1125,26 @@ def train_foundation_mode(
     )
     
     # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=collate_fn)
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=8, 
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2,
+        collate_fn=collate_fn
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=8, 
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2,
+        collate_fn=collate_fn
+    )
     
     # Create training module
     training_module = ModularModelTrainingModule(
@@ -1025,7 +1173,7 @@ def train_foundation_mode(
     
     # Create strategy if distributed config is provided
     distributed_config = kwargs.get("distributed_config", {})
-    strategy = create_strategy(distributed_config) if distributed_config else None
+    strategy = create_strategy(distributed_config) if distributed_config else "auto"
     
     # Get num_nodes from distributed config
     num_nodes = distributed_config.get("num_nodes", 1)
@@ -1044,7 +1192,9 @@ def train_foundation_mode(
     )
     
     # Train
-    trainer.fit(training_module, train_loader, val_loader)
+    if resume_from_checkpoint:
+        logging.info(f"🔄 Resuming training from checkpoint: {resume_from_checkpoint}")
+    trainer.fit(training_module, train_loader, val_loader, ckpt_path=resume_from_checkpoint)
     
     logging.info("✅ Foundation training completed successfully!")
     return trainer, training_module

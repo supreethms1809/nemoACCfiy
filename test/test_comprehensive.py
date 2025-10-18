@@ -107,18 +107,37 @@ def create_test_batch_nemo(tokenizer, max_length: int = 128) -> Dict[str, Any]:
     # Create attention mask (1 for real tokens, 0 for padding)
     attention_mask = [1 if token != tokenizer.pad_token_id else 0 for token in tokens]
     
-    # Create labels for next-token prediction (shifted by 1, with -100 for padding)
-    labels = tokens[1:] + [-100]  # Shift by 1, last token has no target
+    # Create labels for next-token prediction
+    # For position i, the target should be tokens[i+1] (next token)
+    # Last position has no target (-100)
+    # Padding positions have no target (-100)
+    # If next token is padding, current position has no target (-100)
+    labels = []
+    for i in range(len(tokens)):
+        if i == len(tokens) - 1:
+            # Last position has no target
+            labels.append(-100)
+        elif tokens[i] == tokenizer.pad_token_id:
+            # Padding position has no target
+            labels.append(-100)
+        elif tokens[i + 1] == tokenizer.pad_token_id:
+            # Next token is padding, so no target for current position
+            labels.append(-100)
+        else:
+            # Target is the next token
+            labels.append(tokens[i + 1])
     
     print(f"Tokenized length: {len(tokens)}")
     print(f"Real tokens: {sum(attention_mask)}")
     print(f"Padding tokens: {len(tokens) - sum(attention_mask)}")
     
-    # Create batch (single item)
+    # Create batch (single item) - convert to tensors for NeMo compatibility
+    # Note: input_ids and labels should be long (int64) for token IDs
+    # attention_mask can be long or float, but long is more memory efficient
     batch = {
-        'input_ids': [tokens],
-        'attention_mask': [attention_mask],
-        'labels': [labels]
+        'input_ids': torch.tensor([tokens], dtype=torch.long),
+        'attention_mask': torch.tensor([attention_mask], dtype=torch.long),
+        'labels': torch.tensor([labels], dtype=torch.long)
     }
     
     return batch
@@ -155,10 +174,26 @@ def test_nemo_stage1_training():
     print("\n3. Creating NeMo model using config...")
     try:
         # Try to use existing config
+        project_root = os.path.dirname(os.path.dirname(__file__))
         model = create_modular_model_from_existing_config(
             model_config_key="model_config_1.7B",
-            stage="stage1"
+            stage="stage1",
+            base_path=project_root
         )
+        
+        # Move model to GPU device first, then set precision
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = model.to(device)
+        
+        # Ensure consistent mixed precision (BFloat16) throughout the model
+        # Convert the entire model to BFloat16 for proper mixed precision
+        model = model.to(torch.bfloat16)
+        # Also ensure the underlying modular model is in BFloat16
+        if hasattr(model, 'modular_model'):
+            model.modular_model = model.modular_model.to(device).to(torch.bfloat16)
+            # Ensure the core model is also in BFloat16
+            if hasattr(model.modular_model, 'model'):
+                model.modular_model.model = model.modular_model.model.to(device).to(torch.bfloat16)
         print(f"   ✅ NeMo model created from existing config")
     except Exception as e:
         print(f"   ⚠️  Failed to create from existing config: {e}")
@@ -219,6 +254,10 @@ def test_nemo_stage1_training():
         # Set model to training mode
         actual_model.train()
         
+        # Move batch to the same device as the model
+        device = next(model.parameters()).device
+        batch = {k: v.to(device) for k, v in batch.items()}
+        
         # Run the training step
         loss = training_module.training_step(batch, batch_idx=0)
         
@@ -236,10 +275,10 @@ def test_nemo_stage1_training():
     # Additional verification
     print("\n6. Additional verification...")
     
-    # Get the batch data that was actually used
-    input_ids = torch.tensor(batch['input_ids'], dtype=torch.long)
-    attention_mask = torch.tensor(batch['attention_mask'], dtype=torch.long)
-    labels = torch.tensor(batch['labels'], dtype=torch.long)
+    # Get the batch data that was actually used (already tensors)
+    input_ids = batch['input_ids']
+    attention_mask = batch['attention_mask']
+    labels = batch['labels']
     
     print(f"   Input IDs shape: {input_ids.shape}")
     print(f"   Attention mask shape: {attention_mask.shape}")
@@ -409,7 +448,9 @@ def test_nemo_fsdp_integration():
     # Test FSDP configuration loading
     print("\n8.1 Testing FSDP configuration loading...")
     try:
-        config = create_nemo_config_from_existing("model_config_1.7B", "stage1")
+        # Get the project root directory (parent of test directory)
+        project_root = os.path.dirname(os.path.dirname(__file__))
+        config = create_nemo_config_from_existing("model_config_1.7B", "stage1", project_root)
         distributed_config = config.get("distributed", {})
         fsdp_config = distributed_config.get("fsdp", {})
         
@@ -448,11 +489,13 @@ def test_nemo_production_training():
         from ModularModelstage1_NTPtraining import train_production_mode
         
         # Test with a small configuration
+        project_root = os.path.dirname(os.path.dirname(__file__))
         trainer, module = train_production_mode(
             model_config_key="model_config_1.7B",
             stage="stage1",
             devices=1,  # Single device for testing
             precision="bf16-mixed",
+            base_path=project_root,
             # Override some settings for testing
             **{
                 "max_epochs": 1,
@@ -505,10 +548,26 @@ def test_nemo_stage1_training_comprehensive():
     print("\n3. Creating NeMo model using config...")
     try:
         # Try to use existing config
+        project_root = os.path.dirname(os.path.dirname(__file__))
         model = create_modular_model_from_existing_config(
             model_config_key="model_config_1.7B",
-            stage="stage1"
+            stage="stage1",
+            base_path=project_root
         )
+        
+        # Move model to GPU device first, then set precision
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = model.to(device)
+        
+        # Ensure consistent mixed precision (BFloat16) throughout the model
+        # Convert the entire model to BFloat16 for proper mixed precision
+        model = model.to(torch.bfloat16)
+        # Also ensure the underlying modular model is in BFloat16
+        if hasattr(model, 'modular_model'):
+            model.modular_model = model.modular_model.to(device).to(torch.bfloat16)
+            # Ensure the core model is also in BFloat16
+            if hasattr(model.modular_model, 'model'):
+                model.modular_model.model = model.modular_model.model.to(device).to(torch.bfloat16)
         print(f"   ✅ NeMo model created from existing config")
     except Exception as e:
         print(f"   ⚠️  Failed to create from existing config: {e}")
@@ -569,6 +628,10 @@ def test_nemo_stage1_training_comprehensive():
         # Set model to training mode
         actual_model.train()
         
+        # Move batch to the same device as the model
+        device = next(model.parameters()).device
+        batch = {k: v.to(device) for k, v in batch.items()}
+        
         # Run the training step
         loss = training_module.training_step(batch, batch_idx=0)
         
@@ -586,10 +649,10 @@ def test_nemo_stage1_training_comprehensive():
     # Additional verification
     print("\n6. Additional verification...")
     
-    # Get the batch data that was actually used
-    input_ids = torch.tensor(batch['input_ids'], dtype=torch.long)
-    attention_mask = torch.tensor(batch['attention_mask'], dtype=torch.long)
-    labels = torch.tensor(batch['labels'], dtype=torch.long)
+    # Get the batch data that was actually used (already tensors)
+    input_ids = batch['input_ids']
+    attention_mask = batch['attention_mask']
+    labels = batch['labels']
     
     print(f"   Input IDs shape: {input_ids.shape}")
     print(f"   Attention mask shape: {attention_mask.shape}")

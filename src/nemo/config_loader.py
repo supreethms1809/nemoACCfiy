@@ -239,14 +239,15 @@ class ConfigLoader:
             "mlp_type": model_config.get("mlp_type", "mlp_gated"),
             
             # Training configuration from run_config
-            "learning_rate": training_config.get("training", {}).get("learning_rate", 1e-6),
-            "batch_size": training_config.get("training", {}).get("batch_size", 8),
+            "learning_rate": float(training_config.get("training", {}).get("learning_rate", 1e-6)),
+            "batch_size": int(training_config.get("training", {}).get("batch_size", 8)),
             "sequence_length": training_config.get("training", {}).get("sequence_length", 2048),
             "max_epochs": training_config.get("training", {}).get("epochs", 3),
             "max_grad_norm": training_config.get("training", {}).get("max_grad_norm", 1.5),
             "gradient_accumulation_steps": training_config.get("training", {}).get("gradient_accumulation_steps", 2),
             "gradient_checkpointing": training_config.get("training", {}).get("gradient_checkpointing", True),
             "mixed_precision": training_config.get("training", {}).get("mixed_precision", "bf16"),
+            "precision": training_config.get("training", {}).get("mixed_precision", "bf16"),  # Alias for compatibility
             
             # Tokenizer configuration
             "tokenizer_path": training_config.get("model", {}).get("tokenizer_path", "tokenizers/qwen3-coder-30b-a3b-instruct-custom"),
