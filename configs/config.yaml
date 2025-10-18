@@ -150,50 +150,6 @@ model_configs:
 
 # Training Stage Configurations
 training_stages:
-  # Stage 0: Foundation Training
-  stage0:
-    model:
-      model_config_key: "model_config_micro"
-      tokenizer_path: "tokenizers/qwen3-coder-30b-a3b-instruct-custom"
-      use_flash_attention: true
-      disable_flash_attention: false
-
-    training:
-      epochs: 3
-      batch_size: 4
-      sequence_length: 2048
-      learning_rate: 1.5e-5
-      max_grad_norm: 2.5
-      gradient_accumulation_steps: 1
-      gradient_checkpointing: false
-      mixed_precision: "bf16"
-    
-    # Dataset configuration
-    data:
-      data_path: ""  # e.g., "data/foundation_data.jsonl"
-      max_samples: null
-
-    checkpoint_dir: "outputs/checkpoints/stage0"
-    model_output_dir: "outputs/models"
-    model_output_name: "stage0_model.pth"
-
-    wandb:
-      use_wandb: false
-      project: "accfiy-stage0"
-      entity: null
-      run_name: null
-      tags: ["stage0", "foundation"]
-      group: null
-      notes: null
-
-    logging:
-      debug: false
-      log_file: null
-      enable_profiling: false
-      profiler_log_dir: "./profiler_logs/stage0"
-      save_steps: 100
-      validation_steps: 100
-
   # Stage 1: Pre-training
   stage1:
     model:
@@ -211,6 +167,40 @@ training_stages:
       gradient_accumulation_steps: 2
       gradient_checkpointing: true
       mixed_precision: "bf16"
+    
+    # Distributed training configuration
+    distributed:
+      strategy: "auto"  # Options: "auto", "ddp", "fsdp", "deepspeed"
+      num_nodes: 1
+      devices: "auto"  # Can be "auto", number, or list of device IDs
+      sync_batchnorm: false
+      
+      # FSDP specific configuration
+      fsdp:
+        enabled: false
+        cpu_offload: false
+        sharding_strategy: "FULL_SHARD"  # Options: "FULL_SHARD", "SHARD_GRAD_OP", "NO_SHARD"
+        backward_prefetch: "BACKWARD_PRE"  # Options: "BACKWARD_PRE", "BACKWARD_POST", "NONE"
+        forward_prefetch: false
+        limit_all_gathers: true
+        activation_checkpointing: true
+        use_orig_params: false
+    
+    # Optimizer configuration
+    optimizer:
+      type: "AdamW"
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1e-8
+    
+    # Learning rate scheduler configuration
+    scheduler:
+      type: "LinearLR"
+      start_factor: 0.1
+      end_factor: 1.0
+      warmup_steps: 1000
+      interval: "step"
+      frequency: 1
     
     # Dataset configuration
     data:
@@ -260,6 +250,40 @@ training_stages:
       gradient_checkpointing: false
       mixed_precision: "bf16"
     
+    # Distributed training configuration
+    distributed:
+      strategy: "auto"  # Options: "auto", "ddp", "fsdp", "deepspeed"
+      num_nodes: 1
+      devices: "auto"  # Can be "auto", number, or list of device IDs
+      sync_batchnorm: false
+      
+      # FSDP specific configuration
+      fsdp:
+        enabled: false
+        cpu_offload: false
+        sharding_strategy: "FULL_SHARD"  # Options: "FULL_SHARD", "SHARD_GRAD_OP", "NO_SHARD"
+        backward_prefetch: "BACKWARD_PRE"  # Options: "BACKWARD_PRE", "BACKWARD_POST", "NONE"
+        forward_prefetch: false
+        limit_all_gathers: true
+        activation_checkpointing: true
+        use_orig_params: false
+    
+    # Optimizer configuration
+    optimizer:
+      type: "AdamW"
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1e-8
+    
+    # Learning rate scheduler configuration
+    scheduler:
+      type: "LinearLR"
+      start_factor: 0.1
+      end_factor: 1.0
+      warmup_steps: 1000
+      interval: "step"
+      frequency: 1
+    
     # Dataset configuration
     data:
       data_path: ""  # e.g., "data/fine_tuning_data.jsonl"
@@ -286,161 +310,6 @@ training_stages:
       save_steps: 1000
       validation_steps: 1000
 
-  # RL PPO Training
-  rl_ppo:
-    model:
-      model_config_key: "model_config_1.7B"
-      tokenizer_path: "tokenizers/qwen3-coder-30b-a3b-instruct-custom"
-      use_flash_attention: true
-      disable_flash_attention: false
-
-    training:
-      epochs: 3
-      batch_size: 4
-      sequence_length: 2048
-      learning_rate: 1e-5
-      max_grad_norm: 2.5
-      gradient_accumulation_steps: 1
-      gradient_checkpointing: false
-      mixed_precision: "bf16"
-
-    checkpoint_dir: "outputs/checkpoints/rl_ppo"
-    model_output_dir: "outputs/models"
-    model_output_name: "rl_ppo_model.pth"
-
-    wandb:
-      use_wandb: false
-      project: "accfiy-rl-ppo"
-      entity: null
-      run_name: null
-      tags: ["rl", "ppo"]
-      group: null
-      notes: null
-
-    logging:
-      debug: false
-      log_file: null
-      enable_profiling: false
-      profiler_log_dir: "./profiler_logs/rl_ppo"
-      save_steps: 100
-      validation_steps: 100
-
-  # RL GRPO Training
-  rl_grpo:
-    model:
-      model_config_key: "model_config_1.7B"
-      tokenizer_path: "tokenizers/qwen3-coder-30b-a3b-instruct-custom"
-      use_flash_attention: true
-      disable_flash_attention: false
-
-    training:
-      epochs: 3
-      batch_size: 4
-      sequence_length: 2048
-      learning_rate: 1e-5
-      max_grad_norm: 2.5
-      gradient_accumulation_steps: 1
-      gradient_checkpointing: false
-      mixed_precision: "bf16"
-
-    checkpoint_dir: "outputs/checkpoints/rl_grpo"
-    model_output_dir: "outputs/models"
-    model_output_name: "rl_grpo_model.pth"
-
-    wandb:
-      use_wandb: false
-      project: "accfiy-rl-grpo"
-      entity: null
-      run_name: null
-      tags: ["rl", "grpo"]
-      group: null
-      notes: null
-
-    logging:
-      debug: false
-      log_file: null
-      enable_profiling: false
-      profiler_log_dir: "./profiler_logs/rl_grpo"
-      save_steps: 100
-      validation_steps: 100
-
-  # Agent Training
-  agent:
-    model:
-      model_config_key: "model_config_1.7B"
-      tokenizer_path: "tokenizers/qwen3-coder-30b-a3b-instruct-custom"
-      use_flash_attention: true
-      disable_flash_attention: false
-
-    training:
-      epochs: 3
-      batch_size: 8
-      sequence_length: 2048
-      learning_rate: 1e-5
-      max_grad_norm: 2.5
-      gradient_accumulation_steps: 1
-      gradient_checkpointing: false
-      mixed_precision: "bf16"
-
-    checkpoint_dir: "outputs/checkpoints/agent"
-    model_output_dir: "outputs/models"
-    model_output_name: "agent_model.pth"
-
-    wandb:
-      use_wandb: false
-      project: "accfiy-agent"
-      entity: null
-      run_name: null
-      tags: ["agent", "training"]
-      group: null
-      notes: null
-
-    logging:
-      debug: false
-      log_file: null
-      enable_profiling: false
-      profiler_log_dir: "./profiler_logs/agent"
-      save_steps: 100
-      validation_steps: 100
-
-  # Agent Evaluation
-  agent_evaluation:
-    model:
-      model_config_key: "model_config_1.7B"
-      tokenizer_path: "tokenizers/qwen3-coder-30b-a3b-instruct-custom"
-      use_flash_attention: true
-      disable_flash_attention: false
-
-    training:
-      epochs: 1
-      batch_size: 4
-      sequence_length: 2048
-      learning_rate: 1e-5
-      max_grad_norm: 2.5
-      gradient_accumulation_steps: 1
-      gradient_checkpointing: false
-      mixed_precision: "bf16"
-
-    checkpoint_dir: "outputs/checkpoints/agent_evaluation"
-    model_output_dir: "outputs/models"
-    model_output_name: "agent_evaluation_model.pth"
-
-    wandb:
-      use_wandb: false
-      project: "accfiy-agent-evaluation"
-      entity: null
-      run_name: null
-      tags: ["agent", "evaluation"]
-      group: null
-      notes: null
-
-    logging:
-      debug: false
-      log_file: null
-      enable_profiling: false
-      profiler_log_dir: "./profiler_logs/agent_evaluation"
-      save_steps: 100
-      validation_steps: 100
 
 # Global Configuration
 global_config:
@@ -461,6 +330,52 @@ global_config:
   # Default wandb settings
   default_wandb_project: "accfiy"
   default_wandb_entity: null
+
+# Example distributed training configurations
+distributed_examples:
+  # Single node, multiple GPUs with FSDP
+  single_node_fsdp:
+    strategy: "fsdp"
+    num_nodes: 1
+    devices: 8  # 8 GPUs on single node
+    fsdp:
+      enabled: true
+      cpu_offload: false
+      sharding_strategy: "FULL_SHARD"
+      activation_checkpointing: true
+  
+  # Multi-node, multiple GPUs with FSDP
+  multi_node_fsdp:
+    strategy: "fsdp"
+    num_nodes: 4  # 4 nodes
+    devices: 8    # 8 GPUs per node
+    fsdp:
+      enabled: true
+      cpu_offload: true  # Enable CPU offload for very large models
+      sharding_strategy: "FULL_SHARD"
+      activation_checkpointing: true
+  
+  # Multi-node with DDP (alternative to FSDP)
+  multi_node_ddp:
+    strategy: "ddp"
+    num_nodes: 4
+    devices: 8
+    sync_batchnorm: true
+  
+  # Large scale training with CPU offload
+  large_scale_fsdp:
+    strategy: "fsdp"
+    num_nodes: 8
+    devices: 8
+    fsdp:
+      enabled: true
+      cpu_offload: true
+      sharding_strategy: "FULL_SHARD"
+      backward_prefetch: "BACKWARD_PRE"
+      forward_prefetch: true
+      limit_all_gathers: true
+      activation_checkpointing: true
+      use_orig_params: false
 
 # Dataset Configuration for Pretraining
 datasets:

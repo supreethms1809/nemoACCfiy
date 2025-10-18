@@ -269,6 +269,13 @@ class ConfigLoader:
             
             # Logging configuration
             "logging": training_config.get("logging", {}),
+            
+            # Optimizer and scheduler configurations
+            "optimizer": training_config.get("optimizer", {}),
+            "scheduler": training_config.get("scheduler", {}),
+            
+            # Distributed training configuration
+            "distributed": training_config.get("distributed", {}),
         }
         
         return nemo_config

@@ -38,6 +38,7 @@ try:
     import lightning as pl
     from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
     from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
+    from lightning.pytorch.strategies import FSDPStrategy, DDPStrategy
     from torch.utils.data import DataLoader, Dataset
     LIGHTNING_AVAILABLE = True
 except ImportError:
@@ -256,6 +257,8 @@ class ModularModelTrainingModule(pl.LightningModule):
         weight_decay: float = 0.01,
         warmup_steps: int = 100,
         max_steps: int = 1000,
+        optimizer_config: dict = None,
+        scheduler_config: dict = None,
     ):
         super().__init__()
         self.model = model
@@ -264,6 +267,22 @@ class ModularModelTrainingModule(pl.LightningModule):
         self.weight_decay = weight_decay
         self.warmup_steps = warmup_steps
         self.max_steps = max_steps
+        
+        # Store optimizer and scheduler configurations
+        self.optimizer_config = optimizer_config or {
+            "type": "AdamW",
+            "weight_decay": 0.01,
+            "betas": [0.9, 0.999],
+            "eps": 1e-8
+        }
+        self.scheduler_config = scheduler_config or {
+            "type": "LinearLR",
+            "start_factor": 0.1,
+            "end_factor": 1.0,
+            "warmup_steps": 1000,
+            "interval": "step",
+            "frequency": 1
+        }
         
         # Loss function
         self.loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
@@ -336,29 +355,62 @@ class ModularModelTrainingModule(pl.LightningModule):
         return loss
     
     def configure_optimizers(self):
-        # Ensure learning_rate is not None
+        # Get learning rate from config or fallback to instance variable
         lr = self.learning_rate if self.learning_rate is not None else 1e-4
-        wd = self.weight_decay if self.weight_decay is not None else 0.01
         
-        optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=lr,
-            weight_decay=wd
-        )
+        # Create optimizer based on configuration
+        optimizer_type = self.optimizer_config.get("type", "AdamW")
         
-        scheduler = torch.optim.lr_scheduler.LinearLR(
-            optimizer,
-            start_factor=0.1,
-            end_factor=1.0,
-            total_iters=self.warmup_steps
-        )
+        if optimizer_type == "AdamW":
+            optimizer = torch.optim.AdamW(
+                self.parameters(),
+                lr=lr,
+                weight_decay=self.optimizer_config.get("weight_decay", 0.01),
+                betas=tuple(self.optimizer_config.get("betas", [0.9, 0.999])),
+                eps=self.optimizer_config.get("eps", 1e-8)
+            )
+        elif optimizer_type == "Adam":
+            optimizer = torch.optim.Adam(
+                self.parameters(),
+                lr=lr,
+                weight_decay=self.optimizer_config.get("weight_decay", 0.01),
+                betas=tuple(self.optimizer_config.get("betas", [0.9, 0.999])),
+                eps=self.optimizer_config.get("eps", 1e-8)
+            )
+        else:
+            raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
+        
+        # Create scheduler based on configuration
+        scheduler_type = self.scheduler_config.get("type", "LinearLR")
+        warmup_steps = self.scheduler_config.get("warmup_steps", self.warmup_steps)
+        
+        if scheduler_type == "LinearLR":
+            scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=self.scheduler_config.get("start_factor", 0.1),
+                end_factor=self.scheduler_config.get("end_factor", 1.0),
+                total_iters=warmup_steps
+            )
+        elif scheduler_type == "CosineAnnealingLR":
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=warmup_steps
+            )
+        elif scheduler_type == "StepLR":
+            scheduler = torch.optim.lr_scheduler.StepLR(
+                optimizer,
+                step_size=self.scheduler_config.get("step_size", 1000),
+                gamma=self.scheduler_config.get("gamma", 0.1)
+            )
+        else:
+            raise ValueError(f"Unsupported scheduler type: {scheduler_type}")
         
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "interval": "step",
-                "frequency": 1
+                "interval": self.scheduler_config.get("interval", "step"),
+                "frequency": self.scheduler_config.get("frequency", 1)
             }
         }
 
@@ -550,6 +602,71 @@ def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None):
     )
 
 
+def create_strategy(distributed_config: dict):
+    """Create the appropriate training strategy based on configuration."""
+    if not LIGHTNING_AVAILABLE:
+        return None
+    
+    strategy_name = distributed_config.get("strategy", "auto")
+    fsdp_config = distributed_config.get("fsdp", {})
+    
+    if strategy_name == "fsdp" or (strategy_name == "auto" and fsdp_config.get("enabled", False)):
+        # Create FSDP strategy
+        from lightning.pytorch.strategies import FSDPStrategy
+        from torch.distributed.fsdp import ShardingStrategy, BackwardPrefetch
+        
+        # Map string values to FSDP enums
+        sharding_strategy_map = {
+            "FULL_SHARD": ShardingStrategy.FULL_SHARD,
+            "SHARD_GRAD_OP": ShardingStrategy.SHARD_GRAD_OP,
+            "NO_SHARD": ShardingStrategy.NO_SHARD,
+        }
+        
+        backward_prefetch_map = {
+            "BACKWARD_PRE": BackwardPrefetch.BACKWARD_PRE,
+            "BACKWARD_POST": BackwardPrefetch.BACKWARD_POST,
+            "NONE": None,
+        }
+        
+        sharding_strategy = sharding_strategy_map.get(
+            fsdp_config.get("sharding_strategy", "FULL_SHARD"),
+            ShardingStrategy.FULL_SHARD
+        )
+        
+        backward_prefetch = backward_prefetch_map.get(
+            fsdp_config.get("backward_prefetch", "BACKWARD_PRE"),
+            BackwardPrefetch.BACKWARD_PRE
+        )
+        
+        strategy = FSDPStrategy(
+            cpu_offload=fsdp_config.get("cpu_offload", False),
+            sharding_strategy=sharding_strategy,
+            backward_prefetch=backward_prefetch,
+            forward_prefetch=fsdp_config.get("forward_prefetch", False),
+            limit_all_gathers=fsdp_config.get("limit_all_gathers", True),
+            activation_checkpointing=fsdp_config.get("activation_checkpointing", True),
+            use_orig_params=fsdp_config.get("use_orig_params", False),
+        )
+        
+        logging.info(f"Created FSDP strategy with sharding_strategy={sharding_strategy}, "
+                    f"cpu_offload={fsdp_config.get('cpu_offload', False)}")
+        return strategy
+    
+    elif strategy_name == "ddp":
+        # Create DDP strategy
+        from lightning.pytorch.strategies import DDPStrategy
+        strategy = DDPStrategy(
+            sync_batchnorm=distributed_config.get("sync_batchnorm", False)
+        )
+        logging.info("Created DDP strategy")
+        return strategy
+    
+    else:
+        # Use auto strategy (PyTorch Lightning will choose automatically)
+        logging.info("Using auto strategy (PyTorch Lightning will choose automatically)")
+        return "auto"
+
+
 def train_basic_mode(
     stage: str = "stage1",
     vocab_size: int = 1000,
@@ -560,6 +677,7 @@ def train_basic_mode(
     batch_size: int = 4,
     devices: int = 1,
     precision: str = "16-mixed",
+    max_epochs: int = 3,
     **kwargs
 ):
     """Basic training mode with simple datasets."""
@@ -607,7 +725,9 @@ def train_basic_mode(
         model=model,
         stage=stage,
         learning_rate=learning_rate,
-        max_steps=len(train_loader) * max_epochs
+        max_steps=len(train_loader) * max_epochs,
+        optimizer_config=kwargs.get("optimizer_config", {}),
+        scheduler_config=kwargs.get("scheduler_config", {})
     )
     
     # Setup callbacks
@@ -625,11 +745,20 @@ def train_basic_mode(
     # Setup logger
     logger = TensorBoardLogger(log_dir, name=f"basic_{stage}")
     
+    # Create strategy if distributed config is provided
+    distributed_config = kwargs.get("distributed_config", {})
+    strategy = create_strategy(distributed_config) if distributed_config else None
+    
+    # Get num_nodes from distributed config
+    num_nodes = distributed_config.get("num_nodes", 1)
+    
     # Create trainer
     trainer = pl.Trainer(
         max_epochs=10,  # Default 10 epochs for basic mode
         devices=devices,
+        num_nodes=num_nodes,
         precision=precision,
+        strategy=strategy,
         callbacks=callbacks,
         logger=logger,
         gradient_clip_val=1.0,
@@ -751,12 +880,14 @@ def train_production_mode(
     train_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True, num_workers=0, collate_fn=collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=config["batch_size"], shuffle=False, num_workers=0, collate_fn=collate_fn)
     
-    # Create training module
+    # Create training module with optimizer and scheduler configs
     training_module = ModularModelTrainingModule(
         model=model,
         stage=stage,
         learning_rate=config["learning_rate"],
-        max_steps=len(train_loader) * config["max_epochs"]
+        max_steps=len(train_loader) * config["max_epochs"],
+        optimizer_config=config.get("optimizer", {}),
+        scheduler_config=config.get("scheduler", {})
     )
     
     # Setup callbacks
@@ -775,11 +906,21 @@ def train_production_mode(
     log_dir = config.get("log_dir", "outputs/logs")
     logger = TensorBoardLogger(log_dir, name=f"production_{model_config_key}_{stage}")
     
+    # Create strategy based on distributed configuration
+    distributed_config = config.get("distributed", {})
+    strategy = create_strategy(distributed_config)
+    
+    # Get devices and num_nodes from distributed config or fallback to config
+    devices = distributed_config.get("devices", config.get("devices", "auto"))
+    num_nodes = distributed_config.get("num_nodes", 1)
+    
     # Create trainer
     trainer = pl.Trainer(
         max_epochs=config["max_epochs"],
-        devices=config["devices"],
+        devices=devices,
+        num_nodes=num_nodes,
         precision=config["precision"],
+        strategy=strategy,
         callbacks=callbacks,
         logger=logger,
         gradient_clip_val=config.get("max_grad_norm", 1.0),
@@ -862,7 +1003,9 @@ def train_foundation_mode(
         model=model,
         stage=stage,
         learning_rate=learning_rate,
-        max_steps=len(train_loader) * 3  # Default 3 epochs for foundation mode
+        max_steps=len(train_loader) * 3,  # Default 3 epochs for foundation mode
+        optimizer_config=kwargs.get("optimizer_config", {}),
+        scheduler_config=kwargs.get("scheduler_config", {})
     )
     
     # Setup callbacks
@@ -880,11 +1023,20 @@ def train_foundation_mode(
     # Setup logger
     logger = TensorBoardLogger(log_dir, name=f"foundation_{stage}")
     
+    # Create strategy if distributed config is provided
+    distributed_config = kwargs.get("distributed_config", {})
+    strategy = create_strategy(distributed_config) if distributed_config else None
+    
+    # Get num_nodes from distributed config
+    num_nodes = distributed_config.get("num_nodes", 1)
+    
     # Create trainer
     trainer = pl.Trainer(
         max_epochs=3,  # Default 3 epochs for foundation mode
         devices=devices,
+        num_nodes=num_nodes,
         precision=precision,
+        strategy=strategy,
         callbacks=callbacks,
         logger=logger,
         gradient_clip_val=1.0,
