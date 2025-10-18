@@ -1,0 +1,508 @@
+# Unified Configuration for ModularModel
+# This file combines model architectures and training configurations
+
+# Model Architecture Configurations
+model_configs:
+  model_config_32B:
+    decoder_config:
+      hidden_size: 5120
+      pad_token_id: 0
+      hidden_dropout_prob: 0.1
+      attention_probs_dropout_prob: 0.1
+      max_position_embeddings: 40960
+      num_hidden_layers: 64
+      num_attention_heads: 64
+      intermediate_size: 25600
+      num_key_value_heads: 8
+      type_vocab_size: 2
+      hidden_act: "gelu"
+      initializer_range: 0.02
+      RMSNorm_eps: 1e-06
+      use_cache: true
+    pool_type: "attention"
+    hidden_dropout_prob: 0.0
+    mlp_type: "mlp_gated"
+    attention_type: "vanilla"
+
+  model_config_14B:
+    decoder_config:
+      hidden_size: 5120
+      pad_token_id: 0
+      hidden_dropout_prob: 0.1
+      attention_probs_dropout_prob: 0.1
+      max_position_embeddings: 40960
+      num_hidden_layers: 40
+      num_attention_heads: 40
+      intermediate_size: 17408
+      num_key_value_heads: 8
+      type_vocab_size: 2
+      hidden_act: "gelu"
+      initializer_range: 0.02
+      RMSNorm_eps: 1e-06
+      use_cache: true
+    pool_type: "attention"
+    hidden_dropout_prob: 0.0
+    mlp_type: "mlp_gated"
+    attention_type: "vanilla"
+
+  model_config_8B:
+    decoder_config:
+      hidden_size: 4096
+      pad_token_id: 0
+      hidden_dropout_prob: 0.1
+      attention_probs_dropout_prob: 0.1
+      max_position_embeddings: 40960
+      num_hidden_layers: 36
+      num_attention_heads: 32
+      intermediate_size: 12288
+      num_key_value_heads: 8
+      type_vocab_size: 2
+      hidden_act: "gelu"
+      initializer_range: 0.02
+      RMSNorm_eps: 1e-05
+      use_cache: true
+    pool_type: "attention"
+    hidden_dropout_prob: 0.0
+    mlp_type: "mlp_gated"
+    attention_type: "vanilla"
+
+  model_config_4B:
+    decoder_config:
+      attention_bias: false
+      attention_dropout: 0.0
+      hidden_act: "silu"
+      hidden_size: 2560
+      initializer_range: 0.02
+      intermediate_size: 9728
+      max_position_embeddings: 40960
+      max_window_layers: 36
+      num_attention_heads: 32
+      num_hidden_layers: 36
+      num_key_value_heads: 8
+      RMSNorm_eps: 1e-06
+      use_cache: true
+    pool_type: "attention"
+    hidden_dropout_prob: 0.0
+    mlp_type: "mlp_gated"
+    attention_type: "vanilla"
+
+  model_config_1.7B:
+    decoder_config:
+      attention_bias: false
+      attention_dropout: 0.0
+      hidden_act: "silu"
+      hidden_size: 2048
+      initializer_range: 0.02
+      intermediate_size: 6144
+      max_position_embeddings: 40960
+      max_window_layers: 28
+      num_attention_heads: 16
+      num_hidden_layers: 28
+      num_key_value_heads: 8
+      RMSNorm_eps: 1e-06
+      use_cache: true
+    pool_type: "attention"
+    hidden_dropout_prob: 0.0
+    mlp_type: "mlp_gated"
+    attention_type: "vanilla"
+
+  model_config_tiny:
+    decoder_config:
+      hidden_size: 1024
+      pad_token_id: 0
+      hidden_dropout_prob: 0.1
+      attention_probs_dropout_prob: 0.1
+      max_position_embeddings: 512
+      num_hidden_layers: 12
+      num_attention_heads: 16
+      intermediate_size: 1024
+      num_key_value_heads: 8
+      type_vocab_size: 2
+      hidden_act: "gelu"
+      initializer_range: 0.02
+      RMSNorm_eps: 1e-05
+      use_cache: true
+    pool_type: "attention"
+    hidden_dropout_prob: 0.0
+    mlp_type: "mlp_gated"
+    attention_type: "vanilla"
+
+  model_config_micro:
+    decoder_config:
+      hidden_size: 512
+      pad_token_id: 0
+      hidden_dropout_prob: 0.1
+      attention_probs_dropout_prob: 0.1
+      max_position_embeddings: 256
+      num_hidden_layers: 6
+      num_attention_heads: 8
+      intermediate_size: 512
+      num_key_value_heads: 4
+      type_vocab_size: 2
+      hidden_act: "gelu"
+      initializer_range: 0.02
+      RMSNorm_eps: 1e-05
+      use_cache: true
+    pool_type: "attention"
+    hidden_dropout_prob: 0.0
+    mlp_type: "mlp_gated"
+    attention_type: "vanilla"
+
+# Training Stage Configurations
+training_stages:
+  # Stage 0: Foundation Training
+  stage0:
+    model:
+      model_config_key: "model_config_micro"
+      tokenizer_path: "tokenizers/qwen3-coder-30b-a3b-instruct-custom"
+      use_flash_attention: true
+      disable_flash_attention: false
+
+    training:
+      epochs: 3
+      batch_size: 4
+      sequence_length: 2048
+      learning_rate: 1.5e-5
+      max_grad_norm: 2.5
+      gradient_accumulation_steps: 1
+      gradient_checkpointing: false
+      mixed_precision: "bf16"
+    
+    # Dataset configuration
+    data:
+      data_path: ""  # e.g., "data/foundation_data.jsonl"
+      max_samples: null
+
+    checkpoint_dir: "outputs/checkpoints/stage0"
+    model_output_dir: "outputs/models"
+    model_output_name: "stage0_model.pth"
+
+    wandb:
+      use_wandb: false
+      project: "accfiy-stage0"
+      entity: null
+      run_name: null
+      tags: ["stage0", "foundation"]
+      group: null
+      notes: null
+
+    logging:
+      debug: false
+      log_file: null
+      enable_profiling: false
+      profiler_log_dir: "./profiler_logs/stage0"
+      save_steps: 100
+      validation_steps: 100
+
+  # Stage 1: Pre-training
+  stage1:
+    model:
+      model_config_key: "model_config_1.7B"
+      tokenizer_path: "tokenizers/qwen3-coder-30b-a3b-instruct-custom"
+      use_flash_attention: true
+      disable_flash_attention: false
+
+    training:
+      epochs: 2
+      batch_size: 8
+      sequence_length: 2048
+      learning_rate: 1e-6
+      max_grad_norm: 1.5
+      gradient_accumulation_steps: 2
+      gradient_checkpointing: true
+      mixed_precision: "bf16"
+    
+    # Dataset configuration
+    data:
+      # Path to your real dataset (leave empty to use sample data)
+      # Supported formats: .txt, .json, .jsonl files or directories containing these files
+      # For JSON/JSONL: each item should have a 'text' field
+      data_path: "data/example_training_data.jsonl"  # Using example dataset
+      max_samples: null  # Limit number of samples (null = no limit)
+
+    checkpoint_dir: "outputs/checkpoints/stage1"
+    model_output_dir: "outputs/models"
+    model_output_name: "stage1_model.pth"
+
+    wandb:
+      use_wandb: false
+      project: "accfiy-stage1"
+      entity: null
+      run_name: null
+      tags: ["stage1", "pretraining"]
+      group: null
+      notes: null
+
+    logging:
+      debug: false
+      log_file: null
+      enable_profiling: true
+      profiler_log_dir: "./profiler_logs/stage1"
+      save_steps: 1000
+      validation_steps: 1000
+
+  # Stage 2: Fine-tuning
+  stage2:
+    model:
+      model_config_key: "model_config_1.7B"
+      tokenizer_path: "tokenizers/qwen3-coder-30b-a3b-instruct-custom"
+      use_flash_attention: true
+      disable_flash_attention: false
+
+    training:
+      epochs: 2
+      batch_size: 16
+      sequence_length: 1024
+      embed_sequence_length: 4096
+      learning_rate: 5e-6
+      max_grad_norm: 2.5
+      gradient_accumulation_steps: 1
+      gradient_checkpointing: false
+      mixed_precision: "bf16"
+    
+    # Dataset configuration
+    data:
+      data_path: ""  # e.g., "data/fine_tuning_data.jsonl"
+      max_samples: null
+
+    checkpoint_dir: "outputs/checkpoints/stage2"
+    model_output_dir: "outputs/models"
+    model_output_name: "stage2_model.pth"
+
+    wandb:
+      use_wandb: false
+      project: "accfiy-stage2"
+      entity: null
+      run_name: null
+      tags: ["stage2", "finetuning"]
+      group: null
+      notes: null
+
+    logging:
+      debug: false
+      log_file: null
+      enable_profiling: true
+      profiler_log_dir: "./profiler_logs/stage2"
+      save_steps: 1000
+      validation_steps: 1000
+
+  # RL PPO Training
+  rl_ppo:
+    model:
+      model_config_key: "model_config_1.7B"
+      tokenizer_path: "tokenizers/qwen3-coder-30b-a3b-instruct-custom"
+      use_flash_attention: true
+      disable_flash_attention: false
+
+    training:
+      epochs: 3
+      batch_size: 4
+      sequence_length: 2048
+      learning_rate: 1e-5
+      max_grad_norm: 2.5
+      gradient_accumulation_steps: 1
+      gradient_checkpointing: false
+      mixed_precision: "bf16"
+
+    checkpoint_dir: "outputs/checkpoints/rl_ppo"
+    model_output_dir: "outputs/models"
+    model_output_name: "rl_ppo_model.pth"
+
+    wandb:
+      use_wandb: false
+      project: "accfiy-rl-ppo"
+      entity: null
+      run_name: null
+      tags: ["rl", "ppo"]
+      group: null
+      notes: null
+
+    logging:
+      debug: false
+      log_file: null
+      enable_profiling: false
+      profiler_log_dir: "./profiler_logs/rl_ppo"
+      save_steps: 100
+      validation_steps: 100
+
+  # RL GRPO Training
+  rl_grpo:
+    model:
+      model_config_key: "model_config_1.7B"
+      tokenizer_path: "tokenizers/qwen3-coder-30b-a3b-instruct-custom"
+      use_flash_attention: true
+      disable_flash_attention: false
+
+    training:
+      epochs: 3
+      batch_size: 4
+      sequence_length: 2048
+      learning_rate: 1e-5
+      max_grad_norm: 2.5
+      gradient_accumulation_steps: 1
+      gradient_checkpointing: false
+      mixed_precision: "bf16"
+
+    checkpoint_dir: "outputs/checkpoints/rl_grpo"
+    model_output_dir: "outputs/models"
+    model_output_name: "rl_grpo_model.pth"
+
+    wandb:
+      use_wandb: false
+      project: "accfiy-rl-grpo"
+      entity: null
+      run_name: null
+      tags: ["rl", "grpo"]
+      group: null
+      notes: null
+
+    logging:
+      debug: false
+      log_file: null
+      enable_profiling: false
+      profiler_log_dir: "./profiler_logs/rl_grpo"
+      save_steps: 100
+      validation_steps: 100
+
+  # Agent Training
+  agent:
+    model:
+      model_config_key: "model_config_1.7B"
+      tokenizer_path: "tokenizers/qwen3-coder-30b-a3b-instruct-custom"
+      use_flash_attention: true
+      disable_flash_attention: false
+
+    training:
+      epochs: 3
+      batch_size: 8
+      sequence_length: 2048
+      learning_rate: 1e-5
+      max_grad_norm: 2.5
+      gradient_accumulation_steps: 1
+      gradient_checkpointing: false
+      mixed_precision: "bf16"
+
+    checkpoint_dir: "outputs/checkpoints/agent"
+    model_output_dir: "outputs/models"
+    model_output_name: "agent_model.pth"
+
+    wandb:
+      use_wandb: false
+      project: "accfiy-agent"
+      entity: null
+      run_name: null
+      tags: ["agent", "training"]
+      group: null
+      notes: null
+
+    logging:
+      debug: false
+      log_file: null
+      enable_profiling: false
+      profiler_log_dir: "./profiler_logs/agent"
+      save_steps: 100
+      validation_steps: 100
+
+  # Agent Evaluation
+  agent_evaluation:
+    model:
+      model_config_key: "model_config_1.7B"
+      tokenizer_path: "tokenizers/qwen3-coder-30b-a3b-instruct-custom"
+      use_flash_attention: true
+      disable_flash_attention: false
+
+    training:
+      epochs: 1
+      batch_size: 4
+      sequence_length: 2048
+      learning_rate: 1e-5
+      max_grad_norm: 2.5
+      gradient_accumulation_steps: 1
+      gradient_checkpointing: false
+      mixed_precision: "bf16"
+
+    checkpoint_dir: "outputs/checkpoints/agent_evaluation"
+    model_output_dir: "outputs/models"
+    model_output_name: "agent_evaluation_model.pth"
+
+    wandb:
+      use_wandb: false
+      project: "accfiy-agent-evaluation"
+      entity: null
+      run_name: null
+      tags: ["agent", "evaluation"]
+      group: null
+      notes: null
+
+    logging:
+      debug: false
+      log_file: null
+      enable_profiling: false
+      profiler_log_dir: "./profiler_logs/agent_evaluation"
+      save_steps: 100
+      validation_steps: 100
+
+# Global Configuration
+global_config:
+  # Default tokenizer path
+  default_tokenizer_path: "tokenizers/qwen3-coder-30b-a3b-instruct-custom"
+  
+  # Default output directories
+  default_checkpoint_dir: "outputs/checkpoints"
+  default_model_output_dir: "outputs/models"
+  default_log_dir: "outputs/logs"
+  
+  # Default training parameters
+  default_batch_size: 8
+  default_learning_rate: 1e-5
+  default_max_epochs: 3
+  default_mixed_precision: "bf16"
+  
+  # Default wandb settings
+  default_wandb_project: "accfiy"
+  default_wandb_entity: null
+
+# Dataset Configuration for Pretraining
+datasets:
+  # Hugging Face pretraining datasets with percentage allocation
+  pretraining_datasets:
+    # Web datasets (high quality, diverse content)
+    "HuggingFaceFW/fineweb":
+      percentage: 35.0
+      subset: "sample-10BT"                # 10B token subset of fineweb
+    
+    # Code datasets (programming knowledge) - specific language subsets
+    "bigcode/the-stack-v2":
+      percentage: 30.0
+      subsets: ["C", "C++", "Cuda", "Python"]  # Specific programming language subsets
+    
+    # Math and reasoning datasets
+    "HuggingFaceTB/finemath":
+      percentage: 15.0
+      subset: "finemath-3plus"             # Math content subset
+    
+    # Curated content
+    "mlfoundations/dclm-baseline-1.0":
+      percentage: 10.0                     # 187k tokens - Curated content
+    
+    # Synthetic educational content
+    "HuggingFaceTB/cosmopedia":
+      percentage: 10.0
+      subset: "auto_math_text"             # Synthetic textbooks subset
+    
+    # Total: 100.0% (ensures proper allocation)
+  
+  # Dataset processing settings
+  processing:
+    max_tokens_per_sample: 2048            # Maximum tokens per training sample
+    min_tokens_per_sample: 50              # Minimum tokens per training sample
+    overlap_tokens: 100                    # Overlap between consecutive samples for better training
+    shuffle_datasets: true                 # Shuffle datasets before mixing
+    seed: 42                               # Random seed for reproducibility
+    
+  # Output settings
+  output:
+    processed_data_dir: "data/processed"   # Directory for processed datasets
+    cache_dir: "data/cache"                # Directory for dataset cache
+    max_samples_per_dataset: null          # Limit samples per dataset (null = no limit)
+    save_format: "jsonl"                   # Format for saved processed data
