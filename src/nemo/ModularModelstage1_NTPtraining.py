@@ -947,6 +947,7 @@ def train_basic_mode(
         pin_memory=True,
         persistent_workers=True,
         prefetch_factor=2,
+        drop_last=True,  # Drop last incomplete batch for consistent batch sizes
         collate_fn=collate_fn
     )
     val_loader = DataLoader(
@@ -957,6 +958,7 @@ def train_basic_mode(
         pin_memory=True,
         persistent_workers=True,
         prefetch_factor=2,
+        drop_last=True,  # Drop last incomplete batch for consistent batch sizes
         collate_fn=collate_fn
     )
     
@@ -1201,8 +1203,8 @@ def train_production_mode(
     val_dataset = BasicDataset(val_data, stage=stage)
     
     # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True, num_workers=8, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=config["batch_size"], shuffle=False, num_workers=8, collate_fn=collate_fn)
+    train_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True, num_workers=8, drop_last=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=config["batch_size"], shuffle=False, num_workers=8, drop_last=True, collate_fn=collate_fn)
     
     # Create training module with optimizer and scheduler configs
     training_module = ModularModelTrainingModule(
