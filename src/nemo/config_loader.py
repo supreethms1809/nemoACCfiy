@@ -239,6 +239,7 @@ class ConfigLoader:
             "mlp_type": model_config.get("mlp_type", "mlp_gated"),
             
             # Training configuration from run_config
+            "training_backend": training_config.get("training", {}).get("training_backend", "lightning"),
             "learning_rate": float(training_config.get("training", {}).get("learning_rate", 1e-6)),
             "batch_size": int(training_config.get("training", {}).get("batch_size", 8)),
             "sequence_length": training_config.get("training", {}).get("sequence_length", 2048),
@@ -271,6 +272,11 @@ class ConfigLoader:
             # Dataset configuration
             "data_path": training_config.get("data", {}).get("data_path", ""),
             "max_samples": training_config.get("data", {}).get("max_samples", None),
+            
+            # Megatron HuggingFace dataset settings
+            "megatron_use_hf_datasets": training_config.get("data", {}).get("megatron_use_hf_datasets", True),
+            "megatron_hf_dataset_name": training_config.get("data", {}).get("megatron_hf_dataset_name", "mlfoundations/dclm-baseline-1.0"),
+            "megatron_max_samples": training_config.get("data", {}).get("megatron_max_samples", None),
             
             # Flash attention
             "use_flash_attention": training_config.get("model", {}).get("use_flash_attention", True),

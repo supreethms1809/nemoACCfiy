@@ -9,7 +9,10 @@ This script provides a single entry point for all training modes:
 
 Usage with conda:
     conda activate nemo
+    # Lightning backend with HuggingFace datasets
     python train.py --mode production --model_config model_config_tiny --stage stage1 --no_processed_datasets
+    # Megatron backend (automatically uses HuggingFace datasets)
+    python train.py --mode production --training_backend megatron --model_config model_config_tiny --stage stage1
 
 Usage:
     python ModularModelstage1_NTPtraining.py --mode basic --stage stage1
@@ -1498,8 +1501,13 @@ def main():
     
     # Training mode
     parser.add_argument("--mode", type=str, default="production",
-                       choices=["basic", "production", "foundation", "megatron"],
-                       help="Training mode: basic, production, foundation, or megatron")
+                       choices=["basic", "production", "foundation"],
+                       help="Training mode: basic, production, or foundation")
+    
+    # Training backend (for production mode)
+    parser.add_argument("--training_backend", type=str, default=None,
+                       choices=["lightning", "megatron"],
+                       help="Training backend for production mode: lightning (PyTorch Lightning) or megatron (NeMo Megatron). If not specified, reads from config.")
     
     # Common arguments
     parser.add_argument("--stage", type=str, default="stage1",
@@ -1559,12 +1567,12 @@ def main():
                        default="tokenizers/qwen3-coder-30b-a3b-instruct-custom",
                        help="Tokenizer path (foundation mode)")
     
-    # Dataset processing arguments
+    # Dataset processing arguments (only for Lightning backend)
     parser.add_argument("--use_processed_datasets", action="store_true", default=True,
-                       help="Use processed datasets for training (production mode)")
+                       help="Use processed datasets for training (Lightning backend only)")
     
     parser.add_argument("--no_processed_datasets", action="store_true", default=False,
-                       help="Disable processed datasets and use real/sample data")
+                       help="Disable processed datasets and use HuggingFace datasets (Lightning backend only)")
     
     parser.add_argument("--total_samples", type=int, default=10000,
                        help="Total number of samples to process for training")
@@ -1587,17 +1595,30 @@ def main():
         logging.info("🔧 Framework: PyTorch Lightning + Sample Data")
         logging.info("💡 Use case: Quick testing and development")
     elif args.mode == "production":
-        logging.info("📊 Training Method: PyTorch Lightning")
-        logging.info("🔧 Framework: PyTorch Lightning + HuggingFace Datasets")
-        logging.info("💡 Use case: Production training with real datasets")
+        # Get training backend for logging (same logic as in production mode)
+        training_backend = args.training_backend
+        if training_backend is None:
+            if create_nemo_config_from_existing is not None:
+                try:
+                    config = create_nemo_config_from_existing(args.model_config, args.stage)
+                    training_backend = config.get("training_backend", "lightning")
+                except Exception:
+                    training_backend = "lightning"
+            else:
+                training_backend = "lightning"
+        
+        if training_backend == "lightning":
+            logging.info("📊 Training Method: PyTorch Lightning")
+            logging.info("🔧 Framework: PyTorch Lightning + HuggingFace Datasets")
+            logging.info("💡 Use case: Production training with real datasets")
+        elif training_backend == "megatron":
+            logging.info("📊 Training Method: NeMo Megatron")
+            logging.info("🔧 Framework: NeMo Megatron + HuggingFace Datasets")
+            logging.info("💡 Use case: Large-scale, distributed training with optimizations")
     elif args.mode == "foundation":
         logging.info("📊 Training Method: PyTorch Lightning")
         logging.info("🔧 Framework: PyTorch Lightning + NeMo Native Datasets")
         logging.info("💡 Use case: NeMo native dataset training (incomplete)")
-    elif args.mode == "megatron":
-        logging.info("📊 Training Method: NeMo Megatron")
-        logging.info("🔧 Framework: NeMo Megatron + Optimized Data Loading")
-        logging.info("💡 Use case: Large-scale, distributed training with optimizations")
     
     logging.info("="*60)
     logging.info(f"🎯 Starting unified training in {args.mode} mode")
@@ -1617,25 +1638,60 @@ def main():
             )
         
         elif args.mode == "production":
-            # Handle processed datasets flag
-            use_processed_datasets = args.use_processed_datasets and not args.no_processed_datasets
-            
             # Handle resume checkpoint
             resume_from_checkpoint = None
             if not args.no_resume:
                 resume_from_checkpoint = args.resume_from_checkpoint
             
-            trainer, module = train_production_mode(
-                model_config_key=args.model_config,
-                stage=args.stage,
-                devices=args.devices,
-                precision=args.precision,
-                learning_rate=args.learning_rate,
-                batch_size=args.batch_size,
-                resume_from_checkpoint=resume_from_checkpoint,
-                use_processed_datasets=use_processed_datasets,
-                total_samples=args.total_samples
-            )
+            # Get training backend from config if not provided via command line
+            training_backend = args.training_backend
+            if training_backend is None:
+                # Load config to get training_backend
+                if create_nemo_config_from_existing is not None:
+                    try:
+                        config = create_nemo_config_from_existing(args.model_config, args.stage)
+                        training_backend = config.get("training_backend", "lightning")
+                        logging.info(f"📊 Training backend from config: {training_backend}")
+                    except Exception as e:
+                        logging.warning(f"Could not load config for training_backend, using default: {e}")
+                        training_backend = "lightning"
+                else:
+                    training_backend = "lightning"
+            
+            logging.info(f"🎯 Using training backend: {training_backend}")
+            
+            if training_backend == "lightning":
+                # Handle processed datasets flag (only relevant for Lightning backend)
+                use_processed_datasets = args.use_processed_datasets and not args.no_processed_datasets
+                
+                # Use PyTorch Lightning backend
+                trainer, module = train_production_mode(
+                    model_config_key=args.model_config,
+                    stage=args.stage,
+                    devices=args.devices,
+                    precision=args.precision,
+                    learning_rate=args.learning_rate,
+                    batch_size=args.batch_size,
+                    resume_from_checkpoint=resume_from_checkpoint,
+                    use_processed_datasets=use_processed_datasets,
+                    total_samples=args.total_samples
+                )
+            elif training_backend == "megatron":
+                # Use NeMo Megatron backend
+                trainer, module = train_megatron_mode_wrapper(
+                    model_config_key=args.model_config,
+                    stage=args.stage,
+                    data_path=args.data_path,
+                    tokenizer_path=args.tokenizer_path,
+                    max_length=args.max_length,
+                    learning_rate=args.learning_rate,
+                    batch_size=args.batch_size or 8,
+                    devices=args.devices,
+                    precision=args.precision,
+                    resume_from_checkpoint=resume_from_checkpoint,
+                    hf_dataset_name=args.data_path,  # Use data_path as dataset name for HF datasets
+                    max_samples=args.total_samples
+                )
         
         elif args.mode == "foundation":
             trainer, module = train_foundation_mode(
@@ -1649,27 +1705,31 @@ def main():
                 precision=args.precision
             )
         
-        elif args.mode == "megatron":
-            trainer, module = train_megatron_mode_wrapper(
-                model_config_key=args.model_config,
-                stage=args.stage,
-                data_path=args.data_path,
-                tokenizer_path=args.tokenizer_path,
-                max_length=args.max_length,
-                learning_rate=args.learning_rate,
-                batch_size=args.batch_size or 8,
-                devices=args.devices,
-                precision=args.precision,
-                resume_from_checkpoint=resume_from_checkpoint
-            )
         
         logging.info("🎉 Training completed successfully!")
         logging.info("="*60)
         logging.info(f"✅ COMPLETED: {args.mode.upper()} MODE TRAINING")
-        if args.mode in ["basic", "production", "foundation"]:
+        if args.mode == "basic":
             logging.info("📊 Training Method Used: PyTorch Lightning")
-        elif args.mode == "megatron":
-            logging.info("📊 Training Method Used: NeMo Megatron")
+        elif args.mode == "production":
+            # Get training backend for completion logging
+            training_backend = args.training_backend
+            if training_backend is None:
+                if create_nemo_config_from_existing is not None:
+                    try:
+                        config = create_nemo_config_from_existing(args.model_config, args.stage)
+                        training_backend = config.get("training_backend", "lightning")
+                    except Exception:
+                        training_backend = "lightning"
+                else:
+                    training_backend = "lightning"
+            
+            if training_backend == "lightning":
+                logging.info("📊 Training Method Used: PyTorch Lightning")
+            elif training_backend == "megatron":
+                logging.info("📊 Training Method Used: NeMo Megatron")
+        elif args.mode == "foundation":
+            logging.info("📊 Training Method Used: PyTorch Lightning")
         logging.info("="*60)
         
     except Exception as e:

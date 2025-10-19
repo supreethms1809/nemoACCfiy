@@ -164,6 +164,9 @@ training_stages:
       embedder_checkpoint_path: null # Path to embedder checkpoint
 
     training:
+      # Training backend selection (for production mode)
+      training_backend: "lightning"  # Options: "lightning" (PyTorch Lightning) or "megatron" (NeMo Megatron)
+      
       # Training duration - epoch-based approach (automatically converted to steps internally)
       epochs: 1                     # Number of epochs to train
       batch_size: 8
@@ -280,6 +283,9 @@ training_stages:
       disable_flash_attention: false
 
     training:
+      # Training backend selection (for production mode)
+      training_backend: "lightning"  # Options: "lightning" (PyTorch Lightning) or "megatron" (NeMo Megatron)
+      
       epochs: 2
       batch_size: 16
       sequence_length: 1024

@@ -169,6 +169,11 @@ class MegatronConfigLoader:
             "megatron_val_data_file": data_config.get("megatron_val_data_file", "val.bin"),
             "megatron_use_mmap": data_config.get("megatron_use_mmap", True),
             
+            # HuggingFace dataset settings for Megatron
+            "megatron_use_hf_datasets": data_config.get("megatron_use_hf_datasets", True),
+            "megatron_hf_dataset_name": data_config.get("megatron_hf_dataset_name", "mlfoundations/dclm-baseline-1.0"),
+            "megatron_max_samples": data_config.get("megatron_max_samples", None),
+            
             # Distributed training configuration
             "strategy": distributed_config.get("strategy", "auto"),
             "devices": distributed_config.get("devices", "auto"),

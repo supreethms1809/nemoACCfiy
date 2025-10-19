@@ -12,12 +12,17 @@ import logging
 from transformers import AutoTokenizer
 from typing import Dict, Any
 
-# Add src to system path
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src', 'nemo'))
+# Add project root to system path for consistent imports
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
-from ModularModelstage1_NTPtraining import ModularModelTrainingModule, generate_sample_data, BasicDataset
-from nemo_wrapper import create_modular_model_nemo, create_modular_model_from_existing_config
-from config_loader import create_nemo_config_from_existing
+from src.nemo.ModularModelstage1_NTPtraining import ModularModelTrainingModule, generate_sample_data, BasicDataset
+from src.nemo.nemo_wrapper import create_modular_model_nemo, create_modular_model_from_existing_config
+try:
+    from src.nemo.config_loader import create_nemo_config_from_existing
+except ImportError:
+    create_nemo_config_from_existing = None
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -228,7 +233,6 @@ def test_nemo_stage1_training():
         learning_rate=1e-6,
         weight_decay=0.01,
         warmup_steps=1000,
-        max_steps=1000,
         optimizer_config={
             "type": "AdamW",
             "weight_decay": 0.01,
@@ -602,7 +606,6 @@ def test_nemo_stage1_training_comprehensive():
         learning_rate=1e-6,
         weight_decay=0.01,
         warmup_steps=1000,
-        max_steps=1000,
         optimizer_config={
             "type": "AdamW",
             "weight_decay": 0.01,

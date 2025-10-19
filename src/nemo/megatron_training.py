@@ -434,15 +434,18 @@ def train_megatron_mode(
         tokenizer_path=tokenizer_path,
         max_length=max_length,
         stage=stage,
+        use_hf_datasets=True,  # Enable HuggingFace dataset support
         **kwargs
     )
     
-    # Setup datasets
+    # Setup datasets (supports both HF and preprocessed datasets)
     train_loader, val_loader = data_loader.setup_train_val_datasets(
         batch_size=batch_size,
         num_workers=8,
         pin_memory=True,
-        drop_last=True
+        drop_last=True,
+        hf_dataset_name=kwargs.get("hf_dataset_name", "mlfoundations/dclm-baseline-1.0"),
+        max_samples=kwargs.get("max_samples", None)
     )
     
     # Create training module
