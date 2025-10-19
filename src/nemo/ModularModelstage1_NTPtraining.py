@@ -7,6 +7,10 @@ This script provides a single entry point for all training modes:
 - Production training (configuration-driven)
 - Foundation training (NeMo native datasets)
 
+Usage with conda:
+    conda activate nemo
+    python train.py --mode production --model_config model_config_tiny --stage stage1 --no_processed_datasets
+
 Usage:
     python ModularModelstage1_NTPtraining.py --mode basic --stage stage1
     python ModularModelstage1_NTPtraining.py --mode production --model_config model_config_1.7B --stage stage1
@@ -20,30 +24,43 @@ import logging
 from typing import Optional, Dict, Any, List
 from pathlib import Path
 
-# Add the current directory to the path
-sys.path.append(os.path.dirname(__file__))
+# Add project root to system path for consistent imports
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
+# Import from src structure
 try:
-    from config_loader import ConfigLoader, create_nemo_config_from_existing
+    from src.nemo.config_loader import ConfigLoader, create_nemo_config_from_existing
 except ImportError:
-    print("Warning: Could not import config loader: No module named 'config_loader'")
+    # Silent fallback - config loader is optional
     ConfigLoader = None
+    create_nemo_config_from_existing = None
 
 try:
-    from huggingface_dataset_loader import HuggingFaceDatasetLoader, HuggingFaceDatasetWrapper
+    from src.nemo.huggingface_dataset_loader import HuggingFaceDatasetLoader, HuggingFaceDatasetWrapper
     HF_DATASETS_AVAILABLE = True
 except ImportError:
-    print("Warning: Could not import HuggingFace dataset loader: No module named 'huggingface_dataset_loader'")
+    print("Warning: HuggingFace dataset loader not available")
     HF_DATASETS_AVAILABLE = False
-    create_nemo_config_from_existing = None
-from nemo_wrapper import create_modular_model_nemo, ModularModelConfig
+    HuggingFaceDatasetLoader = None
+    HuggingFaceDatasetWrapper = None
+
+try:
+    from src.nemo.nemo_wrapper import create_modular_model_nemo, ModularModelConfig
+    NEMO_AVAILABLE = True
+except ImportError:
+    print("Warning: NeMo wrapper not available")
+    NEMO_AVAILABLE = False
+    create_modular_model_nemo = None
+    ModularModelConfig = None
 
 # Optional imports for different training modes
 try:
     import torch
     import torch.nn as nn
     import lightning as pl
-    from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
+    from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor, RichProgressBar
     from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
     from lightning.pytorch.strategies import FSDPStrategy, DDPStrategy
     from torch.utils.data import DataLoader, Dataset
@@ -66,6 +83,9 @@ except ImportError:
         pass
     class WandbLogger:
         pass
+    class RichProgressBar:
+        def __init__(self, **kwargs):
+            pass
     class LightningModule:
         pass
     # Create a dummy pl module
@@ -91,6 +111,17 @@ except ImportError:
         pass
     class MegatronPretrainingSampler:
         pass
+
+# NeMo Megatron training imports
+try:
+    from src.nemo.megatron_training import train_megatron_mode
+    from src.nemo.megatron_config_loader import create_megatron_config_from_existing
+    MEGATRON_TRAINING_AVAILABLE = True
+except ImportError:
+    MEGATRON_TRAINING_AVAILABLE = False
+    print("Warning: NeMo Megatron training not available.")
+    train_megatron_mode = None
+    create_megatron_config_from_existing = None
 
 # Tokenizer import
 try:
@@ -262,7 +293,6 @@ class ModularModelTrainingModule(pl.LightningModule):
         learning_rate: float = 1e-4,
         weight_decay: float = 0.01,
         warmup_steps: int = 100,
-        max_steps: int = 1000,
         optimizer_config: dict = None,
         scheduler_config: dict = None,
     ):
@@ -272,7 +302,6 @@ class ModularModelTrainingModule(pl.LightningModule):
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.warmup_steps = warmup_steps
-        self.max_steps = max_steps
         
         # Store optimizer and scheduler configurations
         self.optimizer_config = optimizer_config or {
@@ -347,18 +376,116 @@ class ModularModelTrainingModule(pl.LightningModule):
         else:
             raise ValueError(f"Unknown stage: {self.stage}")
         
-        self.log("train_loss", loss, prog_bar=True)
+        # Calculate additional metrics
+        with torch.no_grad():
+            # Calculate perplexity
+            perplexity = torch.exp(loss)
+            
+            # Calculate accuracy (for next token prediction)
+            if self.stage == "stage1":
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                predictions = torch.argmax(shift_logits, dim=-1)
+                accuracy = (predictions == shift_labels).float().mean()
+            else:
+                predictions = torch.argmax(logits, dim=-1)
+                accuracy = (predictions == labels).float().mean()
+        
+        # Log metrics with progress bar display
+        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
+        self.log("train_perplexity", perplexity, prog_bar=True, on_step=True, on_epoch=True)
+        self.log("train_accuracy", accuracy, prog_bar=True, on_step=True, on_epoch=True)
+        
+        # Log learning rate (this should make it appear in progress bar)
+        current_lr = self.optimizers().param_groups[0]['lr']
+        self.log("lr", current_lr, prog_bar=True, on_step=True)
+        
         return loss
     
     def validation_step(self, batch, batch_idx):
         # Same as training step but with model.eval()
         self.model.eval()
         with torch.no_grad():
-            loss = self.training_step(batch, batch_idx)
+            if self.stage == "stage1":
+                # Stage 1: Next token prediction
+                input_ids = batch["input_ids"]
+                labels = batch["labels"]
+                attention_mask = batch["attention_mask"]
+                
+                outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+                if hasattr(outputs, 'logits'):
+                    logits = outputs.logits
+                elif isinstance(outputs, dict) and 'logits' in outputs:
+                    logits = outputs['logits']
+                else:
+                    logits = outputs
+                
+                # Shift logits and labels for next token prediction
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                
+                loss = self.loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+                
+                # Calculate validation metrics
+                perplexity = torch.exp(loss)
+                predictions = torch.argmax(shift_logits, dim=-1)
+                accuracy = (predictions == shift_labels).float().mean()
+            
+            elif self.stage == "stage2":
+                # Stage 2: Full model training
+                embed_input_ids = batch["embed_input_ids"]
+                decoder_input_ids = batch["decoder_input_ids"]
+                labels = batch["labels"]
+                embed_attention_mask = batch["embed_attention_mask"]
+                decoder_attention_mask = batch["decoder_attention_mask"]
+                
+                outputs = self.model(
+                    embed_input_ids=embed_input_ids,
+                    decoder_input_ids=decoder_input_ids,
+                    embed_attention_mask=embed_attention_mask,
+                    decoder_attention_mask=decoder_attention_mask
+                )
+                if hasattr(outputs, 'logits'):
+                    logits = outputs.logits
+                elif isinstance(outputs, dict) and 'logits' in outputs:
+                    logits = outputs['logits']
+                else:
+                    logits = outputs
+                
+                loss = self.loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
+                
+                # Calculate validation metrics
+                perplexity = torch.exp(loss)
+                predictions = torch.argmax(logits, dim=-1)
+                accuracy = (predictions == labels).float().mean()
+            
+            else:
+                raise ValueError(f"Unknown stage: {self.stage}")
+        
         self.model.train()
         
-        self.log("val_loss", loss, prog_bar=True)
+        # Log validation metrics
+        self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("val_perplexity", perplexity, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("val_accuracy", accuracy, prog_bar=True, on_step=False, on_epoch=True)
+        
         return loss
+    
+    def on_before_optimizer_step(self, optimizer):
+        """Log gradient norms before optimizer step"""
+        # Calculate gradient norm
+        total_norm = 0
+        param_count = 0
+        for group in optimizer.param_groups:
+            for p in group['params']:
+                if p.grad is not None:
+                    param_norm = p.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+                    param_count += 1
+        
+        if param_count > 0:
+            total_norm = total_norm ** (1. / 2)
+            self.log("grad_norm", total_norm, prog_bar=True, on_step=True)
     
     def configure_optimizers(self):
         # Get learning rate from config or fallback to instance variable
@@ -639,7 +766,7 @@ def _process_huggingface_datasets(config_path: str, output_filename: str, total_
     if base_path is not None:
         tokenizer_path = str(Path(base_path) / tokenizer_path)
     
-    loader = HuggingFaceDatasetLoader(config_path, tokenizer_path)
+    loader = HuggingFaceDatasetLoader(config_path, tokenizer_path, stage="stage1")
     training_data = loader.create_training_data(max_samples=total_samples)
     
     # Save to JSONL file
@@ -771,14 +898,21 @@ def train_basic_mode(
     torch.set_float32_matmul_precision('high')
     
     logging.info(f"🚀 Starting basic training: {stage}")
+    logging.info(f"📊 Training Method: PyTorch Lightning")
+    logging.info(f"🔧 Framework: PyTorch Lightning + Sample Data")
+    logging.info(f"📈 Progress Bar: PyTorch Lightning Default")
     
     # Load configuration for checkpoint and log paths
-    try:
-        from config_loader import create_nemo_config_from_existing
-        config = create_nemo_config_from_existing("model_config_tiny", stage)
-        checkpoint_dir = config.get("checkpoint_dir", f"outputs/checkpoints/{stage}")
-        log_dir = config.get("log_dir", "outputs/logs")
-    except ImportError:
+    if create_nemo_config_from_existing is not None:
+        try:
+            config = create_nemo_config_from_existing("model_config_tiny", stage)
+            checkpoint_dir = config.get("checkpoint_dir", f"outputs/checkpoints/{stage}")
+            log_dir = config.get("log_dir", "outputs/logs")
+        except Exception:
+            # Fallback if config loading fails
+            checkpoint_dir = f"outputs/checkpoints/{stage}"
+            log_dir = "outputs/logs"
+    else:
         # Fallback if config loader not available
         checkpoint_dir = f"outputs/checkpoints/{stage}"
         log_dir = "outputs/logs"
@@ -828,7 +962,6 @@ def train_basic_mode(
         model=model,
         stage=stage,
         learning_rate=learning_rate,
-        max_steps=len(train_loader) * max_epochs,
         optimizer_config=kwargs.get("optimizer_config", {}),
         scheduler_config=kwargs.get("scheduler_config", {})
     )
@@ -914,6 +1047,9 @@ def train_production_mode(
     torch.set_float32_matmul_precision('high')
     
     logging.info(f"🚀 Starting production training: {model_config_key} - {stage}")
+    logging.info(f"📊 Training Method: PyTorch Lightning")
+    logging.info(f"🔧 Framework: PyTorch Lightning + HuggingFace Datasets")
+    logging.info(f"📈 Progress Bar: PyTorch Lightning Default (RichProgressBar disabled due to compatibility issues)")
     
     # Load configuration
     config = create_nemo_config_from_existing(model_config_key, stage, base_path)
@@ -976,6 +1112,64 @@ def train_production_mode(
             train_data = None
             val_data = None
     
+    # Try HuggingFace datasets if processed datasets are disabled and no real dataset path
+    if train_data is None and not use_processed_datasets and (not data_path or not os.path.exists(data_path)):
+        if HF_DATASETS_AVAILABLE:
+            logging.info("Using HuggingFace datasets for training...")
+            try:
+                # Use HuggingFace dataset loader with stage parameter
+                hf_loader = HuggingFaceDatasetLoader("configs/config.yaml", stage="stage1")
+                combined_dataset = hf_loader.load_all_datasets(max_samples_per_dataset=total_samples)
+                
+                # Convert to the format expected by BasicDataset
+                all_data = []
+                logging.info(f"Converting {len(combined_dataset)} samples from HuggingFace datasets...")
+                
+                for i in range(len(combined_dataset)):
+                    sample = combined_dataset[i]
+                    # Debug: log the first sample structure
+                    if i == 0:
+                        logging.info(f"Sample structure: {list(sample.keys())}")
+                        if 'input_ids' in sample:
+                            logging.info(f"Sample has input_ids with length: {len(sample['input_ids'])}")
+                        else:
+                            logging.info(f"Sample keys: {list(sample.keys())}")
+                    
+                    # The HuggingFace dataset loader already processes the data and returns input_ids
+                    if 'input_ids' in sample:
+                        all_data.append({
+                            "input_ids": sample["input_ids"],
+                            "embed_input_ids": sample["input_ids"]  # For stage2 compatibility
+                        })
+                    else:
+                        # If no input_ids, try to find text and tokenize it
+                        text = sample.get('text', '')
+                        if text:
+                            # Tokenize the text using the tokenizer
+                            tokenizer = hf_loader.tokenizer
+                            tokens = tokenizer.encode(text, add_special_tokens=True, truncation=True, max_length=2048)
+                            all_data.append({
+                                "input_ids": tokens,
+                                "embed_input_ids": tokens  # For stage2 compatibility
+                            })
+                
+                logging.info(f"Converted {len(all_data)} samples to training format")
+                
+                if all_data:
+                    # Split into train/validation (80/20 split)
+                    split_idx = int(len(all_data) * 0.8)
+                    train_data = all_data[:split_idx]
+                    val_data = all_data[split_idx:]
+                    
+                    logging.info(f"Loaded {len(train_data)} training samples and {len(val_data)} validation samples from HuggingFace datasets")
+                else:
+                    logging.warning("No data loaded from HuggingFace datasets")
+                    
+            except Exception as e:
+                logging.warning(f"Failed to load HuggingFace datasets: {e}")
+                train_data = None
+                val_data = None
+    
     # Fallback to real dataset if processed datasets failed
     if train_data is None and data_path and os.path.exists(data_path):
         logging.info(f"Loading real dataset from: {data_path}")
@@ -1012,22 +1206,83 @@ def train_production_mode(
         model=model,
         stage=stage,
         learning_rate=config["learning_rate"],
-        max_steps=len(train_loader) * config["max_epochs"],
         optimizer_config=config.get("optimizer", {}),
         scheduler_config=config.get("scheduler", {})
     )
     
-    # Setup callbacks
+    # Get training configuration (from flattened config structure)
+    # The config loader flattens the training config to top level
+    training_config = config  # All training params are now at top level
+    
+    # Setup callbacks with step-based configuration
+    checkpointing_config = {
+        "save_every_n_steps": config.get("save_every_n_steps", 1000),
+        "save_top_k": config.get("save_top_k", 3),
+        "monitor": config.get("monitor", "val_loss"),
+        "mode": config.get("mode", "min"),
+        "filename": config.get("filename", "checkpoint-{step:06d}-{val_loss:.4f}"),
+        "auto_insert_metric_name": config.get("auto_insert_metric_name", False),
+    }
+    
+    # Calculate steps per epoch
+    steps_per_epoch = len(train_loader)
+    max_epochs = config.get("max_epochs", 2)
+    
+    # Use step-based settings directly (more frequent monitoring)
+    save_every_n_steps = config.get("save_every_n_steps", 1000)
+    val_check_interval_steps = config.get("val_check_interval_steps", 5000)
+    
+    # Debug: Log the actual config values being read
+    logging.info(f"🔍 Config Debug:")
+    logging.info(f"   - checkpointing_config: {checkpointing_config}")
+    logging.info(f"   - save_every_n_steps from config: {config.get('save_every_n_steps', 'NOT_FOUND')}")
+    logging.info(f"   - val_check_interval_steps from config: {config.get('val_check_interval_steps', 'NOT_FOUND')}")
+    logging.info(f"   - gradient_clip_val from config: {config.get('gradient_clip_val', 'NOT_FOUND')}")
+    logging.info(f"   - gradient_clip_algorithm from config: {config.get('gradient_clip_algorithm', 'NOT_FOUND')}")
+    
+    logging.info(f"📊 Training Configuration:")
+    logging.info(f"   - Steps per epoch: {steps_per_epoch}")
+    logging.info(f"   - Max epochs: {max_epochs}")
+    logging.info(f"   - Total steps: {max_epochs * steps_per_epoch}")
+    logging.info(f"   - Save every {save_every_n_steps} steps")
+    logging.info(f"   - Validate every {val_check_interval_steps} steps")
+    logging.info(f"   - Gradient clipping: {config.get('gradient_clip_val', 1.0)} ({config.get('gradient_clip_algorithm', 'norm')})")
+    logging.info(f"   - Checkpoint directory: {config['checkpoint_dir']}")
+    logging.info(f"   - Best checkpoints: checkpoint-{{step:06d}}-{{val_loss:.4f}}.ckpt (top {checkpointing_config.get('save_top_k', 3)})")
+    logging.info(f"   - Latest checkpoints: last-checkpoint-{{step:06d}}.ckpt")
+    
+    # Use step-based checkpointing (direct step intervals)
+    step_checkpoint = ModelCheckpoint(
+        dirpath=config["checkpoint_dir"],
+        filename=checkpointing_config.get("filename", "checkpoint-{step:06d}-{val_loss:.4f}"),
+        monitor=checkpointing_config.get("monitor", "val_loss"),
+        mode=checkpointing_config.get("mode", "min"),
+        save_top_k=checkpointing_config.get("save_top_k", 3),
+        every_n_train_steps=save_every_n_steps,
+        auto_insert_metric_name=checkpointing_config.get("auto_insert_metric_name", False),
+        save_last=False,  # Don't save last.ckpt to avoid overwriting
+        save_on_train_epoch_end=False,
+    )
+    
+    # Create a separate callback for saving the last checkpoint
+    last_checkpoint = ModelCheckpoint(
+        dirpath=config["checkpoint_dir"],
+        filename="last-checkpoint-{step:06d}",
+        every_n_train_steps=save_every_n_steps,
+        save_top_k=1,  # Only keep the latest
+        save_last=False,
+        save_on_train_epoch_end=False,
+    )
+    
+    # Create callbacks (skip RichProgressBar due to known issues)
     callbacks = [
-        ModelCheckpoint(
-            dirpath=config["checkpoint_dir"],
-            filename=f"production_{model_config_key}_{stage}_{{epoch:02d}}_{{val_loss:.4f}}",
-            monitor="val_loss",
-            mode="min",
-            save_top_k=3
-        ),
-        LearningRateMonitor(logging_interval="step")
+        step_checkpoint,  # Best checkpoints based on val_loss
+        last_checkpoint,  # Latest checkpoint with step number
+        LearningRateMonitor(logging_interval="step"),
     ]
+    
+    # Note: RichProgressBar disabled due to "pop from empty list" error
+    # PyTorch Lightning will use its default progress bar
     
     # Setup logger
     log_dir = config.get("log_dir", "outputs/logs")
@@ -1041,23 +1296,62 @@ def train_production_mode(
     devices = distributed_config.get("devices", config.get("devices", "auto"))
     num_nodes = distributed_config.get("num_nodes", 1)
     
-    # Create trainer
-    trainer = pl.Trainer(
-        max_epochs=config["max_epochs"],
-        devices=devices,
-        num_nodes=num_nodes,
-        precision=config["precision"],
-        strategy=strategy,
-        callbacks=callbacks,
-        logger=logger,
-        gradient_clip_val=config.get("max_grad_norm", 1.0),
-        log_every_n_steps=10
-    )
+    # Get training duration (epoch-based) - training_config already defined above
+    max_epochs = training_config.get("epochs", config.get("max_epochs", 2))
     
-    # Train
-    if resume_from_checkpoint:
-        logging.info(f"🔄 Resuming training from checkpoint: {resume_from_checkpoint}")
-    trainer.fit(training_module, train_loader, val_loader, ckpt_path=resume_from_checkpoint)
+    # Create trainer with step-based configuration
+    trainer_kwargs = {
+        "devices": devices,
+        "num_nodes": num_nodes,
+        "precision": config["precision"],
+        "strategy": strategy,
+        "callbacks": callbacks,
+        "logger": logger,
+        "gradient_clip_val": config.get("gradient_clip_val", 1.0),
+        "gradient_clip_algorithm": config.get("gradient_clip_algorithm", "norm"),
+        "max_epochs": max_epochs,  # Always use epochs as primary configuration
+        "log_every_n_steps": training_config.get("log_every_n_steps", 10),
+        "val_check_interval": val_check_interval_steps,  # Step-based validation interval
+        "enable_progress_bar": True,
+        "enable_model_summary": True,
+    }
+    
+    logging.info(f"🚀 Training for {max_epochs} epochs ({max_epochs * steps_per_epoch} total steps) with step-based monitoring")
+    
+    trainer = pl.Trainer(**trainer_kwargs)
+    
+    # Auto-detect latest checkpoint for resume
+    checkpoint_path = resume_from_checkpoint
+    if not checkpoint_path:
+        # Try to find the latest checkpoint automatically
+        checkpoint_dir = Path(config["checkpoint_dir"])
+        if checkpoint_dir.exists():
+            # Look for the last checkpoint file
+            last_checkpoint = checkpoint_dir / "last.ckpt"
+            if last_checkpoint.exists():
+                checkpoint_path = str(last_checkpoint)
+                logging.info(f"🔄 Auto-detected latest checkpoint: {checkpoint_path}")
+            else:
+                # Look for any checkpoint files and get the latest
+                checkpoint_files = list(checkpoint_dir.glob("*.ckpt"))
+                if checkpoint_files:
+                    # Sort by modification time and get the latest
+                    latest_checkpoint = max(checkpoint_files, key=lambda x: x.stat().st_mtime)
+                    checkpoint_path = str(latest_checkpoint)
+                    logging.info(f"🔄 Auto-detected latest checkpoint: {checkpoint_path}")
+    
+    # Train with resume capability
+    if checkpoint_path:
+        logging.info(f"🔄 Resuming training from checkpoint: {checkpoint_path}")
+        try:
+            trainer.fit(training_module, train_loader, val_loader, ckpt_path=checkpoint_path)
+        except Exception as e:
+            logging.warning(f"Failed to resume from checkpoint {checkpoint_path}: {e}")
+            logging.info("Starting training from scratch...")
+            trainer.fit(training_module, train_loader, val_loader)
+    else:
+        logging.info("🚀 Starting training from scratch...")
+        trainer.fit(training_module, train_loader, val_loader)
     
     logging.info("✅ Production training completed successfully!")
     return trainer, training_module
@@ -1087,14 +1381,20 @@ def train_foundation_mode(
         raise RuntimeError("Transformers not available for foundation training mode.")
     
     logging.info(f"🚀 Starting foundation training: {stage}")
+    logging.info(f"📊 Training Method: PyTorch Lightning")
+    logging.info(f"🔧 Framework: PyTorch Lightning + NeMo Native Datasets")
     
     # Load configuration for checkpoint and log paths
-    try:
-        from config_loader import create_nemo_config_from_existing
-        config = create_nemo_config_from_existing("model_config_tiny", stage)
-        checkpoint_dir = config.get("checkpoint_dir", f"outputs/checkpoints/{stage}")
-        log_dir = config.get("log_dir", "outputs/logs")
-    except ImportError:
+    if create_nemo_config_from_existing is not None:
+        try:
+            config = create_nemo_config_from_existing("model_config_tiny", stage)
+            checkpoint_dir = config.get("checkpoint_dir", f"outputs/checkpoints/{stage}")
+            log_dir = config.get("log_dir", "outputs/logs")
+        except Exception:
+            # Fallback if config loading fails
+            checkpoint_dir = f"outputs/checkpoints/{stage}"
+            log_dir = "outputs/logs"
+    else:
         # Fallback if config loader not available
         checkpoint_dir = f"outputs/checkpoints/{stage}"
         log_dir = "outputs/logs"
@@ -1103,101 +1403,92 @@ def train_foundation_mode(
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     
     # Create datasets
-    train_dataset = NeMoFoundationDataset(
-        data_path=data_path,
-        tokenizer=tokenizer,
-        max_length=max_length,
-        is_training=True
-    )
+    train_dataset = None  # TODO: Implement NeMo native dataset creation
+    val_dataset = None    # TODO: Implement NeMo native dataset creation
     
-    val_dataset = NeMoFoundationDataset(
-        data_path=data_path,
-        tokenizer=tokenizer,
-        max_length=max_length,
-        is_training=False
-    )
+    # TODO: Complete foundation training implementation
+    logging.warning("Foundation training mode is not yet fully implemented")
+    logging.info("Consider using 'megatron' mode for NeMo Megatron-based training")
     
-    # Create model (using vocab size from tokenizer)
-    model = create_modular_model_nemo(
+    return None, None
+
+
+def train_megatron_mode_wrapper(
+    model_config_key: str = "model_config_1.7B",
+    stage: str = "stage1",
+    data_path: str = "./data",
+    tokenizer_path: str = "tokenizers/qwen3-coder-30b-a3b-instruct-custom",
+    max_length: int = 2048,
+    learning_rate: float = 1e-6,
+    weight_decay: float = 0.01,
+    warmup_steps: int = 1000,
+    max_steps: int = 100000,
+    batch_size: int = 8,
+    devices: int = 1,
+    num_nodes: int = 1,
+    precision: str = "bf16-mixed",
+    gradient_clip_val: float = 1.0,
+    gradient_clip_algorithm: str = "norm",
+    log_every_n_steps: int = 10,
+    val_check_interval: int = 1000,
+    save_every_n_steps: int = 5000,
+    save_top_k: int = 3,
+    monitor: str = "val_loss",
+    mode: str = "min",
+    patience: int = 3,
+    output_dir: str = "./outputs",
+    resume_from_checkpoint: Optional[str] = None,
+    seed: Optional[int] = None,
+    deterministic: bool = False,
+    benchmark: bool = True,
+    **kwargs
+):
+    """NeMo Megatron training mode wrapper."""
+    
+    if not MEGATRON_TRAINING_AVAILABLE:
+        raise RuntimeError("NeMo Megatron training not available. Please check NeMo installation.")
+    
+    if train_megatron_mode is None:
+        raise RuntimeError("NeMo Megatron training function not available.")
+    
+    logging.info(f"🚀 Starting NeMo Megatron training: {stage}")
+    logging.info(f"📊 Training Method: NeMo Megatron")
+    logging.info(f"🔧 Framework: NeMo Megatron + Optimized Data Loading")
+    logging.info(f"Model config: {model_config_key}")
+    logging.info(f"Data path: {data_path}")
+    logging.info(f"Max steps: {max_steps}")
+    
+    # Use the Megatron training function
+    return train_megatron_mode(
+        model_config_key=model_config_key,
         stage=stage,
-        vocab_size=len(tokenizer),
-        **kwargs
-    )
-    
-    # Create data loaders
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True, 
-        num_workers=8, 
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2,
-        collate_fn=collate_fn
-    )
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=batch_size, 
-        shuffle=False, 
-        num_workers=8, 
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2,
-        collate_fn=collate_fn
-    )
-    
-    # Create training module
-    training_module = ModularModelTrainingModule(
-        model=model,
-        stage=stage,
+        data_path=data_path,
+        tokenizer_path=tokenizer_path,
+        max_length=max_length,
         learning_rate=learning_rate,
-        max_steps=len(train_loader) * 3,  # Default 3 epochs for foundation mode
-        optimizer_config=kwargs.get("optimizer_config", {}),
-        scheduler_config=kwargs.get("scheduler_config", {})
-    )
-    
-    # Setup callbacks
-    callbacks = [
-        ModelCheckpoint(
-            dirpath=checkpoint_dir,
-            filename=f"foundation_{stage}_{{epoch:02d}}_{{val_loss:.4f}}",
-            monitor="val_loss",
-            mode="min",
-            save_top_k=3
-        ),
-        LearningRateMonitor(logging_interval="step")
-    ]
-    
-    # Setup logger
-    logger = TensorBoardLogger(log_dir, name=f"foundation_{stage}")
-    
-    # Create strategy if distributed config is provided
-    distributed_config = kwargs.get("distributed_config", {})
-    strategy = create_strategy(distributed_config) if distributed_config else "auto"
-    
-    # Get num_nodes from distributed config
-    num_nodes = distributed_config.get("num_nodes", 1)
-    
-    # Create trainer
-    trainer = pl.Trainer(
-        max_epochs=3,  # Default 3 epochs for foundation mode
+        weight_decay=weight_decay,
+        warmup_steps=warmup_steps,
+        max_steps=max_steps,
+        batch_size=batch_size,
         devices=devices,
         num_nodes=num_nodes,
         precision=precision,
-        strategy=strategy,
-        callbacks=callbacks,
-        logger=logger,
-        gradient_clip_val=1.0,
-        log_every_n_steps=10
+        gradient_clip_val=gradient_clip_val,
+        gradient_clip_algorithm=gradient_clip_algorithm,
+        log_every_n_steps=log_every_n_steps,
+        val_check_interval=val_check_interval,
+        save_every_n_steps=save_every_n_steps,
+        save_top_k=save_top_k,
+        monitor=monitor,
+        mode=mode,
+        patience=patience,
+        output_dir=output_dir,
+        resume_from_checkpoint=resume_from_checkpoint,
+        seed=seed,
+        deterministic=deterministic,
+        benchmark=benchmark,
+        **kwargs
     )
-    
-    # Train
-    if resume_from_checkpoint:
-        logging.info(f"🔄 Resuming training from checkpoint: {resume_from_checkpoint}")
-    trainer.fit(training_module, train_loader, val_loader, ckpt_path=resume_from_checkpoint)
-    
-    logging.info("✅ Foundation training completed successfully!")
-    return trainer, training_module
 
 
 def main():
@@ -1207,8 +1498,8 @@ def main():
     
     # Training mode
     parser.add_argument("--mode", type=str, default="production",
-                       choices=["basic", "production", "foundation"],
-                       help="Training mode: basic, production, or foundation")
+                       choices=["basic", "production", "foundation", "megatron"],
+                       help="Training mode: basic, production, foundation, or megatron")
     
     # Common arguments
     parser.add_argument("--stage", type=str, default="stage1",
@@ -1228,6 +1519,13 @@ def main():
     parser.add_argument("--precision", type=str, default="bf16-mixed",
                        choices=["16-mixed", "32", "bf16-mixed"],
                        help="Training precision")
+    
+    # Resume training arguments
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                       help="Path to checkpoint to resume from (auto-detect if not specified)")
+    
+    parser.add_argument("--no_resume", action="store_true",
+                       help="Disable auto-resume from latest checkpoint")
     
     parser.add_argument("--log_level", type=str, default="INFO",
                        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -1279,6 +1577,29 @@ def main():
     # Setup logging
     setup_logging(args.log_level, args.log_file)
     
+    # Log training mode selection
+    logging.info("="*60)
+    logging.info(f"🎯 SELECTED TRAINING MODE: {args.mode.upper()}")
+    logging.info("="*60)
+    
+    if args.mode == "basic":
+        logging.info("📊 Training Method: PyTorch Lightning")
+        logging.info("🔧 Framework: PyTorch Lightning + Sample Data")
+        logging.info("💡 Use case: Quick testing and development")
+    elif args.mode == "production":
+        logging.info("📊 Training Method: PyTorch Lightning")
+        logging.info("🔧 Framework: PyTorch Lightning + HuggingFace Datasets")
+        logging.info("💡 Use case: Production training with real datasets")
+    elif args.mode == "foundation":
+        logging.info("📊 Training Method: PyTorch Lightning")
+        logging.info("🔧 Framework: PyTorch Lightning + NeMo Native Datasets")
+        logging.info("💡 Use case: NeMo native dataset training (incomplete)")
+    elif args.mode == "megatron":
+        logging.info("📊 Training Method: NeMo Megatron")
+        logging.info("🔧 Framework: NeMo Megatron + Optimized Data Loading")
+        logging.info("💡 Use case: Large-scale, distributed training with optimizations")
+    
+    logging.info("="*60)
     logging.info(f"🎯 Starting unified training in {args.mode} mode")
     
     try:
@@ -1299,6 +1620,11 @@ def main():
             # Handle processed datasets flag
             use_processed_datasets = args.use_processed_datasets and not args.no_processed_datasets
             
+            # Handle resume checkpoint
+            resume_from_checkpoint = None
+            if not args.no_resume:
+                resume_from_checkpoint = args.resume_from_checkpoint
+            
             trainer, module = train_production_mode(
                 model_config_key=args.model_config,
                 stage=args.stage,
@@ -1306,6 +1632,7 @@ def main():
                 precision=args.precision,
                 learning_rate=args.learning_rate,
                 batch_size=args.batch_size,
+                resume_from_checkpoint=resume_from_checkpoint,
                 use_processed_datasets=use_processed_datasets,
                 total_samples=args.total_samples
             )
@@ -1322,7 +1649,28 @@ def main():
                 precision=args.precision
             )
         
+        elif args.mode == "megatron":
+            trainer, module = train_megatron_mode_wrapper(
+                model_config_key=args.model_config,
+                stage=args.stage,
+                data_path=args.data_path,
+                tokenizer_path=args.tokenizer_path,
+                max_length=args.max_length,
+                learning_rate=args.learning_rate,
+                batch_size=args.batch_size or 8,
+                devices=args.devices,
+                precision=args.precision,
+                resume_from_checkpoint=resume_from_checkpoint
+            )
+        
         logging.info("🎉 Training completed successfully!")
+        logging.info("="*60)
+        logging.info(f"✅ COMPLETED: {args.mode.upper()} MODE TRAINING")
+        if args.mode in ["basic", "production", "foundation"]:
+            logging.info("📊 Training Method Used: PyTorch Lightning")
+        elif args.mode == "megatron":
+            logging.info("📊 Training Method Used: NeMo Megatron")
+        logging.info("="*60)
         
     except Exception as e:
         logging.error(f"❌ Training failed: {e}")

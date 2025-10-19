@@ -249,6 +249,22 @@ class ConfigLoader:
             "mixed_precision": training_config.get("training", {}).get("mixed_precision", "bf16"),
             "precision": training_config.get("training", {}).get("mixed_precision", "bf16"),  # Alias for compatibility
             
+            # Gradient clipping configuration
+            "gradient_clip_val": training_config.get("training", {}).get("gradient_clip_val", 1.0),
+            "gradient_clip_algorithm": training_config.get("training", {}).get("gradient_clip_algorithm", "norm"),
+            
+            # Training monitoring and control
+            "log_every_n_steps": training_config.get("training", {}).get("log_every_n_steps", 10),
+            "val_check_interval_steps": training_config.get("training", {}).get("val_check_interval_steps", 5000),
+            
+            # Checkpointing configuration
+            "save_every_n_steps": training_config.get("training", {}).get("checkpointing", {}).get("save_every_n_steps", 1000),
+            "save_top_k": training_config.get("training", {}).get("checkpointing", {}).get("save_top_k", 3),
+            "monitor": training_config.get("training", {}).get("checkpointing", {}).get("monitor", "val_loss"),
+            "mode": training_config.get("training", {}).get("checkpointing", {}).get("mode", "min"),
+            "filename": training_config.get("training", {}).get("checkpointing", {}).get("filename", "checkpoint-{step:06d}-{val_loss:.4f}"),
+            "auto_insert_metric_name": training_config.get("training", {}).get("checkpointing", {}).get("auto_insert_metric_name", False),
+            
             # Tokenizer configuration
             "tokenizer_path": training_config.get("model", {}).get("tokenizer_path", "tokenizers/qwen3-coder-30b-a3b-instruct-custom"),
             

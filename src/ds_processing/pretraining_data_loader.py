@@ -15,8 +15,10 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Iterator
 import random
 
-# Add src to path
-sys.path.append(str(Path(__file__).parent.parent.parent))
+# Add project root to system path for consistent imports
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 try:
     from transformers import AutoTokenizer
@@ -144,6 +146,9 @@ class PretrainingDataLoader:
                 config = create_nemo_config_from_existing("model_config_tiny", "stage1")
                 tokenizer_path = config.get("tokenizer_path", "tokenizers/qwen3-coder-30b-a3b-instruct-custom")
                 self.load_tokenizer(tokenizer_path)
+            except ImportError:
+                # Fallback to default tokenizer path
+                self.load_tokenizer("tokenizers/qwen3-coder-30b-a3b-instruct-custom")
             except:
                 self.load_tokenizer()  # Use default
         

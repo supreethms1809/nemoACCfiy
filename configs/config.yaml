@@ -164,7 +164,8 @@ training_stages:
       embedder_checkpoint_path: null # Path to embedder checkpoint
 
     training:
-      epochs: 2
+      # Training duration - epoch-based approach (automatically converted to steps internally)
+      epochs: 1                     # Number of epochs to train
       batch_size: 8
       sequence_length: 2048
       learning_rate: 1e-6
@@ -173,13 +174,25 @@ training_stages:
       gradient_checkpointing: true
       mixed_precision: "bf16"
       
+      # Step-based checkpointing and validation (more frequent monitoring)
+      checkpointing:
+        save_every_n_steps: 5000    # Save checkpoint every N steps (more frequent than epochs)
+        save_top_k: 3               # Number of best checkpoints to keep
+        monitor: "val_loss"         # Metric to monitor for best checkpoints
+        mode: "min"                 # Monitor mode (min/max)
+        filename: "checkpoint-{step:06d}-{val_loss:.4f}"  # Checkpoint filename (uses steps internally)
+        auto_insert_metric_name: false  # Don't insert metric name in filename
+        
+        # Resume training settings
+        resume_from_checkpoint: null  # Path to checkpoint to resume from (null = auto-detect)
+        resume_ignore_mismatched_sizes: false  # Ignore size mismatches when resuming
+        
       # Training monitoring and control
-      log_every_n_steps: 10         # Log frequency
-      val_check_interval: 1.0       # Validation frequency
-      save_top_k: 3                 # Number of best checkpoints to keep
-      monitor: "val_loss"           # Metric to monitor
-      mode: "min"                   # Monitor mode (min/max)
-      patience: 5                   # Early stopping patience
+      log_every_n_steps: 10         # Log frequency (in steps)
+      val_check_interval_steps: 5000 # Validation every N steps (more frequent than epochs)
+      
+      # Early stopping
+      patience: 3                   # Early stopping patience (in epochs) - reasonable for epoch-based training
       
       # Gradient optimization
       gradient_clip_val: 1.0        # Gradient clipping value
@@ -404,47 +417,129 @@ distributed_examples:
       activation_checkpointing: true
       use_orig_params: false
 
-# Dataset Configuration for Pretraining
+# Global Dataset Configuration
 datasets:
-  # Hugging Face pretraining datasets with percentage allocation
-  pretraining_datasets:
-    # Web datasets (high quality, diverse content)
-    "HuggingFaceFW/fineweb":
-      percentage: 35.0
-      subset: "sample-10BT"                # 10B token subset of fineweb
+  # Global dataset processing settings (inherited by all stages)
+  global_settings:
+    # Dataset loading strategy (FIXED: now properly handles streaming for all datasets)
+    use_streaming: true                    # Use streaming for efficient loading
+    streaming_fallback: true               # Fallback to full download if streaming fails
+    default_streaming_samples: 1000        # Default samples when streaming without limit
+    cache_datasets: true                   # Cache downloaded datasets locally
     
-    # Code datasets (programming knowledge) - specific language subsets
-    "bigcode/the-stack-v2":
-      percentage: 30.0
-      subsets: ["C", "C++", "Cuda", "Python"]  # Specific programming language subsets
+    # Note: Streaming now works correctly for mlfoundations/dclm-baseline-1.0 and other datasets
     
-    # Math and reasoning datasets
-    "HuggingFaceTB/finemath":
-      percentage: 15.0
-      subset: "finemath-3plus"             # Math content subset
+    # Output settings
+    processed_data_dir: "data/processed"   # Directory for processed datasets
+    cache_dir: "~/.cache/huggingface"      # Use HuggingFace default cache directory
+    save_format: "jsonl"                   # Format for saved processed data
     
-    # Curated content
-    "mlfoundations/dclm-baseline-1.0":
-      percentage: 10.0                     # 187k tokens - Curated content
-    
-    # Synthetic educational content
-    "HuggingFaceTB/cosmopedia":
-      percentage: 10.0
-      subset: "auto_math_text"             # Synthetic textbooks subset
-    
-    # Total: 100.0% (ensures proper allocation)
-  
-  # Dataset processing settings
-  processing:
-    max_tokens_per_sample: 2048            # Maximum tokens per training sample
-    min_tokens_per_sample: 50              # Minimum tokens per training sample
-    overlap_tokens: 100                    # Overlap between consecutive samples for better training
+    # Common processing settings
     shuffle_datasets: true                 # Shuffle datasets before mixing
     seed: 42                               # Random seed for reproducibility
+
+  # Stage 1: Pre-training datasets (Next Token Prediction)
+  stage1_datasets:
+    # Hugging Face pretraining datasets with percentage allocation
+    pretraining_datasets:
+      # High-quality web content dataset
+      "HuggingFaceFW/fineweb":
+        percentage: 60.0                     # Increased from 40.0% (added 20% from bigcode)
+        subset: "sample-10BT"               # 10 billion token sample
+      
+      # Code datasets (programming knowledge) - commented out due to S3 access requirements
+      # "bigcode/the-stack-v2-dedup":
+      #   percentage: 30.0
+      #   subsets: ["C", "C++", "Python", "Cuda"]  # C, C++, Python, CUDA subsets
+      
+      # Math and reasoning datasets
+      "HuggingFaceTB/finemath":
+        percentage: 20.0                     # Increased from 15.0% (added 5% from bigcode)
+        subset: "finemath-3plus"             # Math content subset
+      
+      # Curated content (FIXED: streaming now works correctly)
+      "mlfoundations/dclm-baseline-1.0":
+        percentage: 15.0                     # Increased from 10.0% (added 5% from bigcode)
+        subset: null                         # 187k tokens - Curated content (streaming works)
+      
+      # Synthetic educational content
+      "HuggingFaceTB/cosmopedia":
+        percentage: 5.0                      # Kept same
+        subset: "auto_math_text"             # Synthetic textbooks subset
+      
+      # Total: 100.0% (ensures proper allocation)
     
-  # Output settings
-  output:
-    processed_data_dir: "data/processed"   # Directory for processed datasets
-    cache_dir: "data/cache"                # Directory for dataset cache
-    max_samples_per_dataset: null          # Limit samples per dataset (null = no limit)
-    save_format: "jsonl"                   # Format for saved processed data
+    # Stage 1 specific processing settings
+    processing:
+      max_tokens_per_sample: 2048            # Maximum tokens per training sample
+      min_tokens_per_sample: 50              # Minimum tokens per training sample
+      overlap_tokens: 100                    # Overlap between consecutive samples for better training
+      max_samples_per_dataset: 10000         # Limit samples per dataset for faster testing
+
+  # Stage 2: Fine-tuning datasets (Task-specific training)
+  stage2_datasets:
+    # Fine-tuning datasets for specific tasks
+    finetuning_datasets:
+      # Code completion and generation - commented out due to S3 access requirements
+      # "bigcode/the-stack-v2-dedup":
+      #   percentage: 50.0
+      #   subsets: ["C", "C++", "Python", "Cuda"]  # C, C++, Python, CUDA subsets
+      #   task_type: "code_completion"
+      
+      # Mathematical reasoning
+      "HuggingFaceTB/finemath":
+        percentage: 60.0                     # Increased from 30.0% (added 30% from bigcode)
+        subset: "finemath-3plus"             # Math content subset
+        task_type: "mathematical_reasoning"
+      
+      # General knowledge and reasoning
+      "HuggingFaceFW/fineweb":
+        percentage: 40.0                     # Increased from 20.0% (added 20% from bigcode)
+        subset: "sample-10BT"               # 10 billion token sample
+        task_type: "general_knowledge"
+    
+    # Stage 2 specific processing settings
+    processing:
+      max_tokens_per_sample: 1024            # Shorter sequences for fine-tuning
+      min_tokens_per_sample: 100             # Longer minimum for task-specific content
+      overlap_tokens: 50                     # Less overlap for fine-tuning
+      max_samples_per_dataset: 10000         # Limit for fine-tuning datasets (reduced for testing)
+      task_specific_processing: true         # Enable task-specific data processing
+
+  # Stage 3: Instruction tuning datasets (Conversational AI)
+  stage3_datasets:
+    # Instruction tuning datasets for conversational AI
+    instruction_datasets:
+      # High-quality instruction datasets
+      "HuggingFaceTB/cosmopedia":
+        percentage: 50.0                     # Increased from 40.0% (added 10% from bigcode)
+        subset: "auto_math_text"             # Educational content
+        task_type: "instruction_following"
+      
+      # Code instruction datasets - commented out due to S3 access requirements
+      # "bigcode/the-stack-v2-dedup":
+      #   percentage: 30.0
+      #   subsets: ["C", "C++", "Python", "Cuda"]  # C, C++, Python, CUDA subsets
+      #   task_type: "code_instruction"
+      
+      # General instruction datasets
+      "HuggingFaceFW/fineweb":
+        percentage: 30.0                     # Increased from 20.0% (added 10% from bigcode)
+        subset: "sample-10BT"               # 10 billion token sample
+        task_type: "general_instruction"
+      
+      # Math instruction datasets
+      "HuggingFaceTB/finemath":
+        percentage: 20.0                     # Increased from 10.0% (added 10% from bigcode)
+        subset: "finemath-3plus"             # Math instruction
+        task_type: "math_instruction"
+    
+    # Stage 3 specific processing settings
+    processing:
+      max_tokens_per_sample: 4096            # Longer sequences for conversations
+      min_tokens_per_sample: 200             # Longer minimum for instruction pairs
+      overlap_tokens: 0                      # No overlap for instruction pairs
+      max_samples_per_dataset: 10000         # More samples for instruction tuning (reduced for testing)
+      instruction_format: "alpaca"           # Instruction format (alpaca, sharegpt, etc.)
+      include_system_prompts: true           # Include system prompts
+      conversation_format: true              # Enable conversation formatting

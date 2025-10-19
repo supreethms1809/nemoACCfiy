@@ -17,11 +17,16 @@ from pathlib import Path
 from transformers import AutoTokenizer
 import numpy as np
 
-# Add src to path
-sys.path.append(str(Path(__file__).parent / "src"))
+# Add project root to system path for consistent imports
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 from src.nemo.nemo_wrapper import create_modular_model_nemo
-from src.nemo.config_loader import create_nemo_config_from_existing
+try:
+    from src.nemo.config_loader import create_nemo_config_from_existing
+except ImportError:
+    create_nemo_config_from_existing = None
 
 def calculate_perplexity(model, tokenizer, texts, max_length=512):
     """Calculate perplexity on a set of texts."""

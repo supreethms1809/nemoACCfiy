@@ -6,10 +6,16 @@ including proper NeMo module registration, configuration management, and trainin
 """
 
 import os
+import sys
 import torch
 import torch.nn as nn
 from typing import Optional, Dict, Any, List, Union
 import logging
+
+# Add project root to system path for consistent imports
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 # NeMo imports
 try:
@@ -80,13 +86,11 @@ except ImportError:
 
 # Import your custom models
 import sys
-import os
-# Add src to path for model imports
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+# Model imports are now handled by the project root path setup above
 
 try:
-    from model.embed_decoder_model import ModularModel
-    from model.optimized_models import DecoderOnlyModel, EmbedderOnlyModel, create_optimized_model
+    from src.model.embed_decoder_model import ModularModel
+    from src.model.optimized_models import DecoderOnlyModel, EmbedderOnlyModel, create_optimized_model
 except ImportError as e:
     print(f"Warning: Could not import model components: {e}")
     print("Make sure the model files are in the correct location")
@@ -94,9 +98,9 @@ except ImportError as e:
 
 # Import configuration loader
 try:
-    from config_loader import ConfigLoader, create_nemo_config_from_existing
-except ImportError as e:
-    print(f"Warning: Could not import config loader: {e}")
+    from src.nemo.config_loader import ConfigLoader, create_nemo_config_from_existing
+except ImportError:
+    # Silent fallback - config loader is optional
     ConfigLoader = None
     create_nemo_config_from_existing = None
 
@@ -144,7 +148,6 @@ class ModularModelConfig(Config):
         self.learning_rate = kwargs.get('learning_rate', 1e-4)
         self.weight_decay = kwargs.get('weight_decay', 0.01)
         self.warmup_steps = kwargs.get('warmup_steps', 1000)
-        self.max_steps = kwargs.get('max_steps', 100000)
         
         # Data parameters
         self.train_ds = kwargs.get('train_ds', {})
@@ -645,7 +648,6 @@ def create_modular_model_nemo(
     learning_rate: float = 1e-4,
     weight_decay: float = 0.01,
     warmup_steps: int = 1000,
-    max_steps: int = 100000,
     **kwargs
 ) -> ModularModelNeMoWrapper:
     """
@@ -682,7 +684,6 @@ def create_modular_model_nemo(
         learning_rate: Learning rate
         weight_decay: Weight decay
         warmup_steps: Number of warmup steps
-        max_steps: Maximum number of training steps
         **kwargs: Additional configuration parameters
         
     Returns:
@@ -719,7 +720,6 @@ def create_modular_model_nemo(
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         warmup_steps=warmup_steps,
-        max_steps=max_steps,
         **kwargs
     )
     

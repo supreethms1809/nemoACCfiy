@@ -11,14 +11,16 @@ import sys
 import os
 from typing import Optional
 
-# Add the current directory to the path
-sys.path.append(os.path.dirname(__file__))
+# Add project root to system path for consistent imports
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
-from nemo_wrapper import create_modular_model_nemo, ModularModelConfig, create_modular_model_from_existing_config
+from src.nemo.nemo_wrapper import create_modular_model_nemo, ModularModelConfig, create_modular_model_from_existing_config
 
 # Import unified training functionality
 try:
-    from ModularModelstage1_NTPtraining import train_basic_mode, train_production_mode, train_foundation_mode
+    from src.nemo.ModularModelstage1_NTPtraining import train_basic_mode, train_production_mode, train_foundation_mode
     TRAINING_AVAILABLE = True
     FOUNDATION_TRAINING_AVAILABLE = True
 except ImportError:
