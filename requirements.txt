@@ -1,0 +1,92 @@
+# Core PyTorch and Lightning
+torch>=2.9.0
+torchvision>=0.24.0
+torchaudio>=2.9.0
+lightning>=2.4.0
+pytorch-lightning>=2.5.5
+torchmetrics>=1.8.2
+
+# NeMo and Megatron
+nemo-toolkit>=2.5.0
+megatron-core>=0.14.0
+megatron-energon>=5.2.0
+nemo_run>=0.6.0
+nemo_text_processing>=1.1.0
+
+# HuggingFace Ecosystem
+transformers>=4.53.3
+tokenizers>=0.21.4
+datasets>=4.2.0
+accelerate>=1.10.1
+sentence-transformers>=5.1.1
+
+# Data Processing and Storage
+numpy>=1.26.4
+pandas>=2.3.3
+scipy>=1.15.3
+scikit-learn>=1.7.2
+h5py>=3.15.1
+jsonlines>=4.0.0
+msgpack>=1.1.2
+
+# Configuration and Serialization
+ruamel.yaml>=0.18.15
+jsonschema>=4.25.1
+protobuf>=5.29.5
+
+# Cloud and Storage
+boto3>=1.40.55
+s3fs>=0.4.2
+requests>=2.32.3
+urllib3>=1.26.20
+
+# Logging and Monitoring
+wandb>=0.22.2
+tensorboard>=2.20.0
+tensorboard-data-server>=0.7.2
+rich>=14.2.0
+tqdm>=4.67.1
+
+# Visualization
+matplotlib>=3.10.7
+seaborn>=0.13.2
+plotly>=5.0.0
+
+# Development and Jupyter
+jupyter>=1.0.0
+ipython>=8.37.0
+notebook>=7.0.0
+
+# Additional ML Libraries
+open-clip-torch>=2.24.0
+torchdiffeq>=0.2.5
+torchprofile>=0.0.4
+torchsde>=0.2.6
+torchx>=0.7.0
+
+# Utilities
+grpcio>=1.75.1
+ijson>=3.4.0
+lightning-utilities>=0.15.2
+tqdm-multiprocess>=0.0.11
+accelerated-scan>=0.2.0
+matplotlib-inline>=0.1.7
+django-jsonform>=2.23.2
+jsonschema-specifications>=2025.9.1
+ruamel.yaml.clib>=0.2.14
+packaging>=21.0
+
+# Optional: Additional NeMo components (if needed)
+# nemo-collections-asr>=1.0.0
+# nemo-collections-nlp>=1.0.0
+# nemo-collections-tts>=1.0.0
+# nemo-collections-cv>=1.0.0
+
+# Optional: Additional Megatron components (if needed)
+# megatron-lm>=3.0.0
+# apex>=0.1.0
+
+# Optional: Additional training utilities (if needed)
+# deepspeed>=0.12.0
+# fairscale>=0.4.0
+# flash-attn>=2.0.0
