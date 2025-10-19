@@ -7,7 +7,11 @@ pytorch-lightning>=2.5.5
 torchmetrics>=1.8.2
 
 # NeMo and Megatron
+# Note: cudnn and nccl must be installed via conda-forge channel:
+# conda install --channel conda-forge cudnn nccl
 nemo-toolkit>=2.5.0
+nemo-toolkit[all]
+nemo-toolkit[megatron]
 megatron-core>=0.14.0
 megatron-energon>=5.2.0
 nemo_run>=0.6.0
@@ -33,6 +37,14 @@ msgpack>=1.1.2
 ruamel.yaml>=0.18.15
 jsonschema>=4.25.1
 protobuf>=5.29.5
+OmegaConf
+
+# ONNX for model optimization and deployment
+onnx
+onnxruntime
+
+# Transformer Engine for optimized transformer training
+transformer_engine[pytorch]
 
 # Cloud and Storage
 boto3>=1.40.55

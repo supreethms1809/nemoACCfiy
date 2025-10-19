@@ -15,6 +15,10 @@ dependencies:
   - torchaudio>=2.9.0
   - pytorch-cuda=12.1
 
+  # CUDA dependencies (from conda-forge)
+  - cudnn
+  - nccl
+
   # Core ML libraries
   - numpy>=1.26.4
   - pandas>=2.3.3
@@ -50,6 +54,8 @@ dependencies:
 
     # NeMo and Megatron
     - nemo-toolkit>=2.5.0
+    - nemo-toolkit[all]
+    - nemo-toolkit[megatron]
     - megatron-core>=0.14.0
     - megatron-energon>=5.2.0
     - nemo_run>=0.6.0
@@ -75,6 +81,12 @@ dependencies:
     - torchprofile>=0.0.4
     - torchsde>=0.2.6
     - torchx>=0.7.0
+
+    # Configuration and ONNX
+    - OmegaConf
+    - onnx
+    - onnxruntime
+    - transformer_engine[pytorch]
 
     # Utilities
     - grpcio>=1.75.1
