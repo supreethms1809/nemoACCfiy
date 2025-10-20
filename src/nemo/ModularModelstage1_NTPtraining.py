@@ -1308,7 +1308,7 @@ def train_production_mode(
         last_checkpoint,  # Latest checkpoint with step number
         LearningRateMonitor(logging_interval="step"),
         DeviceStatsMonitor(),
-        RichProgressBar(),
+        # RichProgressBar(),  # Disabled due to "pop from empty list" error
     ]
     
     # Note: RichProgressBar disabled due to "pop from empty list" error
