@@ -63,7 +63,7 @@ try:
     import torch
     import torch.nn as nn
     import lightning as pl
-    from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor, RichProgressBar
+    from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor, RichProgressBar, DeviceStatsMonitor
     from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
     from lightning.pytorch.strategies import FSDPStrategy, DDPStrategy
     from torch.utils.data import DataLoader, Dataset
@@ -1086,7 +1086,7 @@ def train_production_mode(
     data_path = config.get("data_path", None)
     tokenizer_path = config.get("tokenizer_path", "tokenizers/qwen3-coder-30b-a3b-instruct-custom")
     # Read use_processed_datasets from config, fall back to kwargs, then default
-    use_processed_datasets = kwargs.get("use_processed_datasets") if kwargs.get("use_processed_datasets") is not None else config.get("use_processed_datasets", True)
+    use_processed_datasets = kwargs.get("use_processed_datasets") if kwargs.get("use_processed_datasets") is not None else config.get("use_processed_datasets", False)
     # Read max_samples from config, fall back to kwargs, then default
     total_samples = kwargs.get("total_samples") if kwargs.get("total_samples") is not None else config.get("max_samples", 10000)
     
@@ -1307,6 +1307,8 @@ def train_production_mode(
         step_checkpoint,  # Best checkpoints based on val_loss
         last_checkpoint,  # Latest checkpoint with step number
         LearningRateMonitor(logging_interval="step"),
+        DeviceStatsMonitor(),
+        RichProgressBar(),
     ]
     
     # Note: RichProgressBar disabled due to "pop from empty list" error

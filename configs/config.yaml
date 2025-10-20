@@ -169,7 +169,7 @@ training_stages:
       
       # Training duration - epoch-based approach (automatically converted to steps internally)
       epochs: 1                     # Number of epochs to train
-      batch_size: 8
+      batch_size: 128
       sequence_length: 2048
       learning_rate: 1e-6
       max_grad_norm: 1.5
@@ -239,11 +239,11 @@ training_stages:
     data:
       # Use HuggingFace datasets from the datasets section below
       data_path: null  # Set to null to use HuggingFace datasets
-      max_samples: 10000000  # Limit samples for testing (remove for full training)
+      max_samples: 100000  # Limit samples for testing (remove for full training)
       use_processed_datasets: false  # Set to false to use HuggingFace datasets directly
       
       # Data loading performance options
-      num_workers: 8                # Number of DataLoader workers
+      num_workers: 32                # Number of DataLoader workers
       pin_memory: true              # Pin memory for faster GPU transfer
       persistent_workers: true      # Keep workers alive between epochs
       prefetch_factor: 2            # Prefetch batches for better performance
@@ -481,7 +481,7 @@ datasets:
       max_tokens_per_sample: 2048            # Maximum tokens per training sample
       min_tokens_per_sample: 50              # Minimum tokens per training sample
       overlap_tokens: 100                    # Overlap between consecutive samples for better training
-      max_samples_per_dataset: 10000000         # Limit samples per dataset for faster testing
+      max_samples_per_dataset: 100000         # Limit samples per dataset for faster testing
 
   # Stage 2: Fine-tuning datasets (Task-specific training)
   stage2_datasets:
