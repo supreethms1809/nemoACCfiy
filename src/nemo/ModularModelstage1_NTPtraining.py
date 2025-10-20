@@ -1059,9 +1059,9 @@ def train_production_mode(
     # Load configuration
     config = create_nemo_config_from_existing(model_config_key, stage, base_path)
     
-    # Override parameters if provided
+    # Override parameters if provided (but don't override with None values)
     for key, value in kwargs.items():
-        if key in config:
+        if key in config and value is not None:
             config[key] = value
     
     # Set default values for missing keys
@@ -1070,9 +1070,11 @@ def train_production_mode(
     if "precision" not in config:
         config["precision"] = precision or "bf16-mixed"
     if "batch_size" not in config:
-        config["batch_size"] = kwargs.get("batch_size", 4)
+        batch_size_arg = kwargs.get("batch_size", 4)
+        config["batch_size"] = batch_size_arg if batch_size_arg is not None else 4
     if "learning_rate" not in config:
-        config["learning_rate"] = kwargs.get("learning_rate", 1e-5)
+        lr_arg = kwargs.get("learning_rate", 1e-5)
+        config["learning_rate"] = lr_arg if lr_arg is not None else 1e-5
     if "checkpoint_dir" not in config:
         config["checkpoint_dir"] = "outputs/checkpoints"
     
@@ -1083,8 +1085,10 @@ def train_production_mode(
     vocab_size = config["vocab_size"]
     data_path = config.get("data_path", None)
     tokenizer_path = config.get("tokenizer_path", "tokenizers/qwen3-coder-30b-a3b-instruct-custom")
-    use_processed_datasets = kwargs.get("use_processed_datasets", True)
-    total_samples = kwargs.get("total_samples", 10000)
+    # Read use_processed_datasets from config, fall back to kwargs, then default
+    use_processed_datasets = kwargs.get("use_processed_datasets") if kwargs.get("use_processed_datasets") is not None else config.get("use_processed_datasets", True)
+    # Read max_samples from config, fall back to kwargs, then default
+    total_samples = kwargs.get("total_samples") if kwargs.get("total_samples") is not None else config.get("max_samples", 10000)
     
     train_data = None
     val_data = None
@@ -1202,9 +1206,15 @@ def train_production_mode(
     train_dataset = BasicDataset(train_data, stage=stage)
     val_dataset = BasicDataset(val_data, stage=stage)
     
+    # Ensure batch_size is valid
+    batch_size = config.get("batch_size", 4)
+    if batch_size is None or batch_size == 0:
+        batch_size = 4
+        logging.warning(f"Invalid batch_size ({config.get('batch_size')}), using default value of {batch_size}")
+    
     # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True, num_workers=8, drop_last=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=config["batch_size"], shuffle=False, num_workers=8, drop_last=True, collate_fn=collate_fn)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, drop_last=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=8, drop_last=True, collate_fn=collate_fn)
     
     # Create training module with optimizer and scheduler configs
     training_module = ModularModelTrainingModule(
@@ -1236,6 +1246,19 @@ def train_production_mode(
     # Use step-based settings directly (more frequent monitoring)
     save_every_n_steps = config.get("save_every_n_steps", 1000)
     val_check_interval_steps = config.get("val_check_interval_steps", 5000)
+    
+    # Calculate total steps and adjust intervals if needed
+    total_steps = max_epochs * steps_per_epoch
+    
+    # Adjust validation interval if it's greater than total steps
+    if val_check_interval_steps > total_steps:
+        val_check_interval_steps = max(1, total_steps // 4)  # Validate 4 times during training
+        logging.warning(f"Adjusted val_check_interval from {config.get('val_check_interval_steps', 5000)} to {val_check_interval_steps} (total steps: {total_steps})")
+    
+    # Adjust save interval if it's greater than total steps
+    if save_every_n_steps > total_steps:
+        save_every_n_steps = max(1, total_steps // 2)  # Save 2 times during training
+        logging.warning(f"Adjusted save_every_n_steps from {config.get('save_every_n_steps', 1000)} to {save_every_n_steps} (total steps: {total_steps})")
     
     # Debug: Log the actual config values being read
     logging.info(f"🔍 Config Debug:")
@@ -1517,7 +1540,7 @@ def main():
                        help="Training stage")
     
     
-    parser.add_argument("--batch_size", type=int, default=None,
+    parser.add_argument("--batch_size", type=int, default=4,
                        help="Batch size")
     
     parser.add_argument("--learning_rate", type=float, default=None,
@@ -1576,8 +1599,8 @@ def main():
     parser.add_argument("--no_processed_datasets", action="store_true", default=False,
                        help="Disable processed datasets and use HuggingFace datasets (Lightning backend only)")
     
-    parser.add_argument("--total_samples", type=int, default=10000,
-                       help="Total number of samples to process for training")
+    parser.add_argument("--total_samples", type=int, default=None,
+                       help="Total number of samples to process for training (overrides config)")
     
     parser.add_argument("--max_length", type=int, default=2048,
                        help="Maximum sequence length (foundation mode)")
@@ -1664,7 +1687,14 @@ def main():
             
             if training_backend == "lightning":
                 # Handle processed datasets flag (only relevant for Lightning backend)
-                use_processed_datasets = args.use_processed_datasets and not args.no_processed_datasets
+                # Command line arguments override config values
+                if args.no_processed_datasets:
+                    use_processed_datasets = False
+                elif args.use_processed_datasets:
+                    use_processed_datasets = True
+                else:
+                    # Use config value, default to False (use HuggingFace datasets directly)
+                    use_processed_datasets = config.get("use_processed_datasets", False)
                 
                 # Use PyTorch Lightning backend
                 trainer, module = train_production_mode(
