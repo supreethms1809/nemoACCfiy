@@ -154,7 +154,7 @@ training_stages:
   stage1:
     model:
       model_config_key: "model_config_1.7B"
-      tokenizer_path: "tokenizers/qwen3-coder-30b-a3b-instruct-custom"
+      tokenizer_path: "Qwen/Qwen3-Coder-30B-A3B-Instruct"
       use_flash_attention: true
       disable_flash_attention: false
       
@@ -239,7 +239,8 @@ training_stages:
     data:
       # Use HuggingFace datasets from the datasets section below
       data_path: null  # Set to null to use HuggingFace datasets
-      max_samples: 10000  # Limit samples for testing (remove for full training)
+      max_samples: 10000000  # Limit samples for testing (remove for full training)
+      use_processed_datasets: false  # Set to false to use HuggingFace datasets directly
       
       # Data loading performance options
       num_workers: 8                # Number of DataLoader workers
@@ -265,8 +266,8 @@ training_stages:
       log_file: null
       enable_profiling: true
       profiler_log_dir: "./profiler_logs/stage1"
-      save_steps: 1000
-      validation_steps: 1000
+      save_steps: 10000
+      validation_steps: 10000
     
     # Environment and reproducibility
     environment:
@@ -278,7 +279,7 @@ training_stages:
   stage2:
     model:
       model_config_key: "model_config_1.7B"
-      tokenizer_path: "tokenizers/qwen3-coder-30b-a3b-instruct-custom"
+      tokenizer_path: "Qwen/Qwen3-Coder-30B-A3B-Instruct"
       use_flash_attention: true
       disable_flash_attention: false
 
@@ -360,7 +361,7 @@ training_stages:
 # Global Configuration
 global_config:
   # Default tokenizer path
-  default_tokenizer_path: "tokenizers/qwen3-coder-30b-a3b-instruct-custom"
+  default_tokenizer_path: "Qwen/Qwen3-Coder-30B-A3B-Instruct"
   
   # Default output directories
   default_checkpoint_dir: "outputs/checkpoints"
@@ -480,7 +481,7 @@ datasets:
       max_tokens_per_sample: 2048            # Maximum tokens per training sample
       min_tokens_per_sample: 50              # Minimum tokens per training sample
       overlap_tokens: 100                    # Overlap between consecutive samples for better training
-      max_samples_per_dataset: 10000         # Limit samples per dataset for faster testing
+      max_samples_per_dataset: 10000000         # Limit samples per dataset for faster testing
 
   # Stage 2: Fine-tuning datasets (Task-specific training)
   stage2_datasets:
