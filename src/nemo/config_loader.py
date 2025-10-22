@@ -86,7 +86,7 @@ class ConfigLoader:
             self._vocab_size = 151676
             return self._vocab_size
     
-    def load_model_config(self, config_key: str = "model_config_1.7B") -> Dict[str, Any]:
+    def load_model_config(self, config_key: str = "model_config_1.8B") -> Dict[str, Any]:
         """
         Load model configuration from config.yaml.
         
@@ -184,7 +184,7 @@ class ConfigLoader:
             return yaml.safe_load(f)
     
     def create_nemo_model_config(self, 
-                                model_config_key: str = "model_config_1.7B",
+                                model_config_key: str = "model_config_1.8B",
                                 stage: str = "stage1") -> Dict[str, Any]:
         """
         Create a NeMo-compatible model configuration by combining existing configs.
@@ -352,7 +352,7 @@ class ConfigLoader:
         return list(all_configs.keys())
 
 
-def create_nemo_config_from_existing(model_config_key: str = "model_config_1.7B",
+def create_nemo_config_from_existing(model_config_key: str = "model_config_1.8B",
                                    stage: str = "stage1",
                                    base_path: Optional[str] = None) -> Dict[str, Any]:
     """
@@ -378,7 +378,7 @@ if __name__ == "__main__":
     print("Available stages:", loader.list_available_stages())
     
     # Test creating a NeMo config
-    nemo_config = loader.create_nemo_model_config("model_config_1.7B", "stage1")
+    nemo_config = loader.create_nemo_model_config("model_config_1.8B", "stage1")
     print("\nNeMo config keys:", list(nemo_config.keys()))
     print("Vocab size:", nemo_config["vocab_size"])
     print("Hidden size:", nemo_config["hidden_size"])

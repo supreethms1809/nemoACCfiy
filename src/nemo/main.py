@@ -47,7 +47,7 @@ def create_model(
     mlp_type: str = "gated",
     use_flash_attention: bool = True,
     use_existing_config: bool = False,
-    model_config_key: str = "model_config_1.7B",
+    model_config_key: str = "model_config_1.8B",
     base_path: Optional[str] = None,
     **kwargs
 ):
@@ -116,7 +116,7 @@ def train_model(
     patience: int = 5,
     output_dir: str = "./outputs",
     use_existing_config: bool = False,
-    model_config_key: str = "model_config_1.7B",
+    model_config_key: str = "model_config_1.8B",
     base_path: Optional[str] = None,
     resume_from_checkpoint: Optional[str] = None,
     **kwargs
@@ -218,7 +218,7 @@ Examples:
   python main.py foundation --stage stage1 --data_path ./data --max_epochs 3
 
   # Train with existing configuration
-  python main.py foundation --use_existing_config --model_config_key model_config_micro --stage stage1
+  python main.py foundation --use_existing_config --model_config_key model_config_89M --stage stage1
 
   # Test the integration
   python main.py test
@@ -249,7 +249,7 @@ Examples:
     # Configuration options
     create_parser.add_argument('--use_existing_config', action='store_true', 
                               help='Use existing configuration from model_config and run_config')
-    create_parser.add_argument('--model_config_key', type=str, default='model_config_1.7B',
+    create_parser.add_argument('--model_config_key', type=str, default='model_config_1.8B',
                               help='Model configuration key from config.json')
     create_parser.add_argument('--base_path', type=str, default=None,
                               help='Base path to src directory (auto-detected if not provided)')
@@ -279,7 +279,7 @@ Examples:
     # Configuration options for training
     train_parser.add_argument('--use_existing_config', action='store_true', 
                               help='Use existing configuration from model_config and run_config')
-    train_parser.add_argument('--model_config_key', type=str, default='model_config_1.7B',
+    train_parser.add_argument('--model_config_key', type=str, default='model_config_1.8B',
                               help='Model configuration key from config.json')
     train_parser.add_argument('--base_path', type=str, default=None,
                               help='Base path to src directory (auto-detected if not provided)')
@@ -311,7 +311,7 @@ Examples:
     foundation_parser.add_argument('--stage', type=str, default='stage1', choices=['stage1', 'stage2'])
     foundation_parser.add_argument('--use_existing_config', action='store_true', 
                                   help='Use existing configuration from model_config and run_config')
-    foundation_parser.add_argument('--model_config_key', type=str, default='model_config_1.7B',
+    foundation_parser.add_argument('--model_config_key', type=str, default='model_config_1.8B',
                                   help='Model configuration key from config.json')
     foundation_parser.add_argument('--base_path', type=str, default=None,
                                   help='Base path to src directory (auto-detected if not provided)')

@@ -73,11 +73,39 @@ def run_production_test():
         traceback.print_exc()
         return False
 
+def run_padding_test():
+    """Run padding and target correctness test."""
+    print("Running padding and target correctness test...")
+    try:
+        from test_comprehensive import test_nemo_padding_edge_cases
+        from transformers import AutoTokenizer
+        
+        # Create a simple tokenizer for testing
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-Coder-30B-A3B-Instruct")
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        
+        # Create a dummy training module (we only need it for the test signature)
+        class DummyTrainingModule:
+            pass
+        
+        training_module = DummyTrainingModule()
+        
+        return test_nemo_padding_edge_cases(tokenizer, training_module)
+    except ImportError as e:
+        print(f"❌ Failed to import test module: {e}")
+        return False
+    except Exception as e:
+        print(f"❌ Test failed with error: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
 def main():
     """Main test runner function."""
     parser = argparse.ArgumentParser(description="NeMo Training Test Runner")
     parser.add_argument("--test", type=str, default="comprehensive",
-                       choices=["comprehensive", "basic", "fsdp", "production", "all"],
+                       choices=["comprehensive", "basic", "fsdp", "production", "padding", "all"],
                        help="Type of test to run")
     parser.add_argument("--verbose", action="store_true",
                        help="Enable verbose output")
@@ -102,12 +130,15 @@ def main():
         success = run_fsdp_test()
     elif args.test == "production":
         success = run_production_test()
+    elif args.test == "padding":
+        success = run_padding_test()
     elif args.test == "all":
         print("Running all tests...")
         tests = [
             ("Basic Test", run_basic_test),
             ("FSDP Test", run_fsdp_test),
             ("Production Test", run_production_test),
+            ("Padding Test", run_padding_test),
             ("Comprehensive Test", run_comprehensive_test)
         ]
         

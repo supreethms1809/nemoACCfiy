@@ -110,7 +110,7 @@ python fsdp_example.py --fsdp-config large_scale_fsdp --num-nodes 8 --devices 8
 from src.nemo.ModularModelstage1_NTPtraining import train_production_mode
 
 trainer, module = train_production_mode(
-    model_config_key="model_config_1.7B",
+    model_config_key="model_config_1.8B",
     stage="stage1",
     devices=8,  # Will be overridden by config if specified
     precision="bf16-mixed"
@@ -124,7 +124,7 @@ trainer, module = train_production_mode(
 python -m src.nemo.ModularModelstage1_NTPtraining \
     --mode production \
     --stage stage1 \
-    --model-config model_config_1.7B \
+    --model-config model_config_1.8B \
     --devices 8 \
     --precision bf16-mixed
 ```

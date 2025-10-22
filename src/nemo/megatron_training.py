@@ -84,7 +84,7 @@ class MegatronTrainingModule(pl.LightningModule):
     
     def __init__(
         self,
-        model: NeuralModule,
+        model,  # NeuralModule or any model
         stage: str = "stage1",
         learning_rate: float = 1e-6,
         weight_decay: float = 0.01,
@@ -178,9 +178,9 @@ class MegatronTrainingModule(pl.LightningModule):
                     accuracy = torch.tensor(0.0)
         
         # Log metrics
-        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
-        self.log("train_perplexity", perplexity, prog_bar=True, on_step=True, on_epoch=True)
-        self.log("train_accuracy", accuracy, prog_bar=True, on_step=True, on_epoch=True)
+        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train_perplexity", perplexity, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train_accuracy", accuracy, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
         
         # Log learning rate
         current_lr = self.optimizers().param_groups[0]['lr']
@@ -229,9 +229,9 @@ class MegatronTrainingModule(pl.LightningModule):
                     accuracy = torch.tensor(0.0)
         
         # Log validation metrics
-        self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
-        self.log("val_perplexity", perplexity, prog_bar=True, on_step=False, on_epoch=True)
-        self.log("val_accuracy", accuracy, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val_perplexity", perplexity, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val_accuracy", accuracy, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
         
         return loss
     
@@ -320,7 +320,7 @@ def create_megatron_strategy(distributed_config: Dict[str, Any]) -> str:
 
 
 def train_megatron_mode(
-    model_config_key: str = "model_config_1.7B",
+    model_config_key: str = "model_config_1.8B",
     stage: str = "stage1",
     data_path: str = "./data",
     tokenizer_path: str = "tokenizers/qwen3-coder-30b-a3b-instruct-custom",
@@ -537,7 +537,7 @@ def main():
     parser = argparse.ArgumentParser(description="NeMo Megatron Training for ModularModel")
     
     # Model configuration
-    parser.add_argument("--model_config", type=str, default="model_config_1.7B", help="Model configuration key")
+    parser.add_argument("--model_config", type=str, default="model_config_1.8B", help="Model configuration key")
     parser.add_argument("--stage", type=str, default="stage1", choices=["stage1", "stage2", "stage3"], help="Training stage")
     
     # Data configuration

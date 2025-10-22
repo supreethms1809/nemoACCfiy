@@ -27,8 +27,8 @@ from transformers import AutoTokenizer
 
 def main():
     parser = argparse.ArgumentParser(description="NeMo ModularModel Text Generation")
-    parser.add_argument("--model_config", type=str, default="model_config_tiny",
-                       help="Model configuration key (e.g., model_config_tiny, model_config_1.7B)")
+    parser.add_argument("--model_config", type=str, default="model_config_243M",
+                       help="Model configuration key (e.g., model_config_243M, model_config_1.8B)")
     parser.add_argument("--stage", type=str, default="stage1",
                        help="Training stage (stage0, stage1, stage2)")
     parser.add_argument("--checkpoint", type=str, required=True,

@@ -119,7 +119,7 @@ class DatasetProcessor:
             configs.append(DatasetConfig(
                 name=name,
                 percentage=percentage,
-                max_samples=output_config.get("max_samples_per_dataset"),
+                max_samples=None,  # Will be calculated based on total_samples and percentage
                 cache_dir=self.processing_config.cache_dir,
                 subset=subset,
                 subsets=subsets

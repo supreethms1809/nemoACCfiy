@@ -3,7 +3,7 @@
 
 # Model Architecture Configurations
 model_configs:
-  model_config_32B:
+  model_config_32.7B:
     decoder_config:
       hidden_size: 5120
       pad_token_id: 0
@@ -24,7 +24,7 @@ model_configs:
     mlp_type: "mlp_gated"
     attention_type: "vanilla"
 
-  model_config_14B:
+  model_config_15.7B:
     decoder_config:
       hidden_size: 5120
       pad_token_id: 0
@@ -45,7 +45,7 @@ model_configs:
     mlp_type: "mlp_gated"
     attention_type: "vanilla"
 
-  model_config_8B:
+  model_config_8.5B:
     decoder_config:
       hidden_size: 4096
       pad_token_id: 0
@@ -66,7 +66,7 @@ model_configs:
     mlp_type: "mlp_gated"
     attention_type: "vanilla"
 
-  model_config_4B:
+  model_config_4.0B:
     decoder_config:
       attention_bias: false
       attention_dropout: 0.0
@@ -86,7 +86,7 @@ model_configs:
     mlp_type: "mlp_gated"
     attention_type: "vanilla"
 
-  model_config_1.7B:
+  model_config_1.8B:
     decoder_config:
       attention_bias: false
       attention_dropout: 0.0
@@ -106,7 +106,7 @@ model_configs:
     mlp_type: "mlp_gated"
     attention_type: "vanilla"
 
-  model_config_tiny:
+  model_config_243M:
     decoder_config:
       hidden_size: 1024
       pad_token_id: 0
@@ -127,7 +127,7 @@ model_configs:
     mlp_type: "mlp_gated"
     attention_type: "vanilla"
 
-  model_config_micro:
+  model_config_89M:
     decoder_config:
       hidden_size: 512
       pad_token_id: 0
@@ -153,12 +153,12 @@ training_stages:
   # Stage 1: Pre-training
   stage1:
     model:
-      model_config_key: "model_config_1.7B"
+      model_config_key: "model_config_1.8B"
       tokenizer_path: "Qwen/Qwen3-Coder-30B-A3B-Instruct"
       use_flash_attention: true
       disable_flash_attention: false
       
-      # Model architecture options (inherited from model_config_1.7B)
+      # Model architecture options (inherited from model_config_1.8B)
       tie_weights: true             # Tie embedding and LM head weights
       freeze_embedder_decoder: true # Freeze embedder decoder
       embedder_checkpoint_path: null # Path to embedder checkpoint
@@ -167,80 +167,129 @@ training_stages:
       # Training backend selection (for production mode)
       training_backend: "lightning"  # Options: "lightning" (PyTorch Lightning) or "megatron" (NeMo Megatron)
       
-      # Training duration - epoch-based approach (automatically converted to steps internally)
-      epochs: 1                     # Number of epochs to train
-      batch_size: 128
-      sequence_length: 2048
-      learning_rate: 1e-6
-      max_grad_norm: 1.5
-      gradient_accumulation_steps: 2
-      gradient_checkpointing: true
-      mixed_precision: "bf16"
+      # Training duration - optimized for 10M samples with 1.7B model
+      epochs: 1                     # Single epoch for large dataset (10M samples)
+      batch_size: 24               # Optimized batch size to achieve 92GB GPU memory usage
+      sequence_length: 4096         # Increased sequence length to better utilize GPU memory (2x increase)
+      learning_rate: 3e-5           # Higher LR for full model training (was 1e-6)
+      max_grad_norm: 1.0            # Tighter gradient clipping for stability
+      gradient_accumulation_steps: 2 # Reduced accumulation since batch size increased
+      gradient_checkpointing: true   # Essential for memory efficiency
+      mixed_precision: "bf16"       # Use bf16 for GH200 optimization
       
-      # Step-based checkpointing and validation (more frequent monitoring)
+      # Step-based checkpointing and validation (optimized for large dataset)
       checkpointing:
-        save_every_n_steps: 5000    # Save checkpoint every N steps (more frequent than epochs)
-        save_top_k: 3               # Number of best checkpoints to keep
+        save_every_n_steps: 5000    # More frequent saves for large training runs
+        save_top_k: 3               # Keep more checkpoints for large training
         monitor: "val_loss"         # Metric to monitor for best checkpoints
         mode: "min"                 # Monitor mode (min/max)
-        filename: "checkpoint-{step:06d}-{val_loss:.4f}"  # Checkpoint filename (uses steps internally)
+        filename: "checkpoint-{step:06d}-{val_loss:.4f}"  # Checkpoint filename
         auto_insert_metric_name: false  # Don't insert metric name in filename
         
         # Resume training settings
         resume_from_checkpoint: null  # Path to checkpoint to resume from (null = auto-detect)
         resume_ignore_mismatched_sizes: false  # Ignore size mismatches when resuming
         
-      # Training monitoring and control
-      log_every_n_steps: 10         # Log frequency (in steps)
-      val_check_interval_steps: 5000 # Validation every N steps (more frequent than epochs)
+      # Training monitoring and control (optimized for large dataset)
+      log_every_n_steps: 50         # Less frequent logging to reduce I/O overhead
+      val_check_interval_steps: 10000 # More frequent validation for large training
       
-      # Early stopping
-      patience: 3                   # Early stopping patience (in epochs) - reasonable for epoch-based training
+      # Early stopping (disabled for large dataset training)
+      patience: 10                  # Higher patience for large dataset training
       
       # Gradient optimization
       gradient_clip_val: 1.0        # Gradient clipping value
-      gradient_clip_algorithm: "norm"  # Gradient clipping algorithm
+      gradient_clip_algorithm: "value"  # Gradient clipping algorithm (compatible with FSDP)
     
-    # Distributed training configuration
+    # Distributed training configuration (optimized for GH200)
     distributed:
-      strategy: "auto"  # Options: "auto", "ddp", "fsdp", "deepspeed"
+      strategy: "fsdp"  # Use FSDP for large model training on GH200
       num_nodes: 1
       devices: "auto"  # Can be "auto", number, or list of device IDs
       sync_batchnorm: false
       
-      # FSDP specific configuration
+      # FSDP specific configuration (optimized for 1.7B model)
       fsdp:
-        enabled: false
-        cpu_offload: false
-        sharding_strategy: "FULL_SHARD"  # Options: "FULL_SHARD", "SHARD_GRAD_OP", "NO_SHARD"
-        backward_prefetch: "BACKWARD_PRE"  # Options: "BACKWARD_PRE", "BACKWARD_POST", "NONE"
+        enabled: true                # Enable FSDP for memory efficiency
+        cpu_offload: true           # Keep on GPU for GH200's large memory
+        sharding_strategy: "FULL_SHARD"  # Full sharding for maximum memory efficiency
+        backward_prefetch: "BACKWARD_PRE"  # Optimize backward pass
         forward_prefetch: false
         limit_all_gathers: true
         activation_checkpointing: true
         use_orig_params: false
     
-    # Optimizer configuration
+    # Optimizer configuration (optimized for large-scale training)
     optimizer:
       type: "AdamW"
-      weight_decay: 0.01
-      betas: [0.9, 0.999]
-      eps: 1e-8
+      weight_decay: 0.1              # Higher weight decay for regularization
+      betas: [0.9, 0.95]             # Adjusted betas for stability
+      eps: 1e-6                      # Slightly higher eps for numerical stability
     
-    # Learning rate scheduler configuration
+    # Learning rate scheduler configuration (optimized for 10M samples)
     scheduler:
-      type: "LinearLR"
-      start_factor: 0.1
-      end_factor: 1.0
-      warmup_steps: 1000
+      type: "CosineAnnealingLR"      # Cosine annealing for better convergence
+      T_max: 100000                  # Total steps for cosine schedule
+      eta_min: 1e-7                  # Minimum learning rate
+      warmup_steps: 5000             # Longer warmup for large dataset
       interval: "step"
       frequency: 1
     
     # Dataset configuration
     data:
-      # Use HuggingFace datasets from the datasets section below
-      data_path: null  # Set to null to use HuggingFace datasets
-      max_samples: 100000  # Limit samples for testing (remove for full training)
-      use_processed_datasets: false  # Set to false to use HuggingFace datasets directly
+      # Dataset loading strategy
+      use_streaming: true                    # Use streaming for efficient loading
+      streaming_fallback: true               # Fallback to full download if streaming fails
+      cache_datasets: true                   # Cache downloaded datasets locally
+      
+      # Output settings
+      processed_data_dir: "data/processed"   # Directory for processed datasets
+      cache_dir: "~/.cache/huggingface"      # Use HuggingFace default cache directory
+      save_format: "jsonl"                   # Format for saved processed data
+      
+      # Common processing settings
+      shuffle_datasets: true                 # Shuffle datasets before mixing
+      seed: 42                               # Random seed for reproducibility
+      
+      # Memory buffer configuration (optimized for GH200 with 400+ GB RAM)
+      use_memory_buffer: false               # Disable buffer for preprocessing (use efficient streaming)
+      buffer_size_mb: 200000                 # Buffer size in MB (200GB buffer for GH200)
+      buffer_samples: 5000000                # Number of samples to keep in buffer (5M samples)
+      buffer_refill_threshold: 0.1           # Refill buffer when 10% full (more aggressive)
+      enable_memory_mapping: true            # Use memory mapping for large buffers
+      
+      # Stage 1: Pre-training datasets (Next Token Prediction)
+      pretraining_datasets:
+        # Hugging Face pretraining datasets with percentage allocation
+        "HuggingFaceFW/fineweb":
+          percentage: 60.0                     # High-quality web content dataset
+          subset: "sample-10BT"               # 10 billion token sample
+        
+        # Math and reasoning datasets
+        "HuggingFaceTB/finemath":
+          percentage: 20.0                     # Math content subset
+          subset: "finemath-3plus"             # Math content subset
+        
+        # Curated content
+        "mlfoundations/dclm-baseline-1.0":
+          percentage: 15.0                     # Curated content (streaming works)
+          subset: null                         # 187k tokens - Curated content
+        
+        # Synthetic educational content
+        "HuggingFaceTB/cosmopedia":
+          percentage: 5.0                      # Synthetic textbooks subset
+          subset: "auto_math_text"             # Synthetic textbooks subset
+        
+        # Total: 100.0% (ensures proper allocation)
+      
+      # Stage 1 specific processing settings
+      processing:
+        max_tokens_per_sample: 2048            # Maximum tokens per training sample
+        min_tokens_per_sample: 50              # Minimum tokens per training sample
+        overlap_tokens: 100                    # Overlap between consecutive samples for better training
+        total_samples: 10000000                 # Total samples for all datasets combined (code calculates per-dataset based on percentages) - Reduced for faster testing
+        use_processed_datasets: true           # Set to true to use preprocessed datasets (much faster!)
+        save_processed_datasets: true          # Save processed datasets for future use
       
       # Data loading performance options
       num_workers: 32                # Number of DataLoader workers
@@ -248,8 +297,8 @@ training_stages:
       persistent_workers: true      # Keep workers alive between epochs
       prefetch_factor: 2            # Prefetch batches for better performance
 
-    checkpoint_dir: "outputs/checkpoints/stage1"
-    model_output_dir: "outputs/models"
+    checkpoint_dir: "/home/sureshm/nemoACCfiy/outputs/checkpoints/stage1"
+    model_output_dir: "/home/sureshm/nemoACCfiy/outputs/models"
     model_output_name: "stage1_model.pth"
 
     wandb:
@@ -278,7 +327,7 @@ training_stages:
   # Stage 2: Fine-tuning
   stage2:
     model:
-      model_config_key: "model_config_1.7B"
+      model_config_key: "model_config_1.8B"
       tokenizer_path: "Qwen/Qwen3-Coder-30B-A3B-Instruct"
       use_flash_attention: true
       disable_flash_attention: false
@@ -333,11 +382,59 @@ training_stages:
     
     # Dataset configuration
     data:
-      data_path: ""  # e.g., "data/fine_tuning_data.jsonl"
-      max_samples: null
+      # Dataset loading strategy
+      use_streaming: true                    # Use streaming for efficient loading
+      streaming_fallback: true               # Fallback to full download if streaming fails
+      cache_datasets: true                   # Cache downloaded datasets locally
+      
+      # Output settings
+      processed_data_dir: "data/processed"   # Directory for processed datasets
+      cache_dir: "~/.cache/huggingface"      # Use HuggingFace default cache directory
+      save_format: "jsonl"                   # Format for saved processed data
+      
+      # Common processing settings
+      shuffle_datasets: true                 # Shuffle datasets before mixing
+      seed: 42                               # Random seed for reproducibility
+      
+      # Memory buffer configuration (optimized for GH200 with 400+ GB RAM)
+      use_memory_buffer: false               # Disable buffer for preprocessing (use efficient streaming)
+      buffer_size_mb: 200000                 # Buffer size in MB (200GB buffer for GH200)
+      buffer_samples: 5000000                # Number of samples to keep in buffer (5M samples)
+      buffer_refill_threshold: 0.1           # Refill buffer when 10% full (more aggressive)
+      enable_memory_mapping: true            # Use memory mapping for large buffers
+      
+      # Stage 2: Fine-tuning datasets (Task-specific training)
+      finetuning_datasets:
+        # Fine-tuning datasets for specific tasks
+        # Mathematical reasoning
+        "HuggingFaceTB/finemath":
+          percentage: 60.0                     # Math content subset
+          subset: "finemath-3plus"             # Math content subset
+          task_type: "mathematical_reasoning"
+        
+        # General knowledge and reasoning
+        "HuggingFaceFW/fineweb":
+          percentage: 40.0                     # 10 billion token sample
+          subset: "sample-10BT"               # 10 billion token sample
+          task_type: "general_knowledge"
+      
+      # Stage 2 specific processing settings
+      processing:
+        max_tokens_per_sample: 1024            # Shorter sequences for fine-tuning
+        min_tokens_per_sample: 100             # Longer minimum for task-specific content
+        overlap_tokens: 50                     # Less overlap for fine-tuning
+        total_samples: 100000                  # Total samples for all datasets combined (code calculates per-dataset based on percentages)
+        task_specific_processing: true         # Enable task-specific data processing
+        use_processed_datasets: true           # Set to true to use preprocessed datasets (much faster!)
+      
+      # Data loading performance options
+      num_workers: 16                # Number of DataLoader workers (reduced for fine-tuning)
+      pin_memory: true              # Pin memory for faster GPU transfer
+      persistent_workers: true      # Keep workers alive between epochs
+      prefetch_factor: 2            # Prefetch batches for better performance
 
-    checkpoint_dir: "outputs/checkpoints/stage2"
-    model_output_dir: "outputs/models"
+    checkpoint_dir: "/home/sureshm/nemoACCfiy/outputs/checkpoints/stage2"
+    model_output_dir: "/home/sureshm/nemoACCfiy/outputs/models"
     model_output_name: "stage2_model.pth"
 
     wandb:
@@ -384,7 +481,7 @@ distributed_examples:
   single_node_fsdp:
     strategy: "fsdp"
     num_nodes: 1
-    devices: 8  # 8 GPUs on single node
+    devices: 1  # 8 GPUs on single node
     fsdp:
       enabled: true
       cpu_offload: false
@@ -424,129 +521,3 @@ distributed_examples:
       activation_checkpointing: true
       use_orig_params: false
 
-# Global Dataset Configuration
-datasets:
-  # Global dataset processing settings (inherited by all stages)
-  global_settings:
-    # Dataset loading strategy (FIXED: now properly handles streaming for all datasets)
-    use_streaming: true                    # Use streaming for efficient loading
-    streaming_fallback: true               # Fallback to full download if streaming fails
-    default_streaming_samples: 1000        # Default samples when streaming without limit
-    cache_datasets: true                   # Cache downloaded datasets locally
-    
-    # Note: Streaming now works correctly for mlfoundations/dclm-baseline-1.0 and other datasets
-    
-    # Output settings
-    processed_data_dir: "data/processed"   # Directory for processed datasets
-    cache_dir: "~/.cache/huggingface"      # Use HuggingFace default cache directory
-    save_format: "jsonl"                   # Format for saved processed data
-    
-    # Common processing settings
-    shuffle_datasets: true                 # Shuffle datasets before mixing
-    seed: 42                               # Random seed for reproducibility
-
-  # Stage 1: Pre-training datasets (Next Token Prediction)
-  stage1_datasets:
-    # Hugging Face pretraining datasets with percentage allocation
-    pretraining_datasets:
-      # High-quality web content dataset
-      "HuggingFaceFW/fineweb":
-        percentage: 60.0                     # Increased from 40.0% (added 20% from bigcode)
-        subset: "sample-10BT"               # 10 billion token sample
-      
-      # Code datasets (programming knowledge) - commented out due to S3 access requirements
-      # "bigcode/the-stack-v2-dedup":
-      #   percentage: 30.0
-      #   subsets: ["C", "C++", "Python", "Cuda"]  # C, C++, Python, CUDA subsets
-      
-      # Math and reasoning datasets
-      "HuggingFaceTB/finemath":
-        percentage: 20.0                     # Increased from 15.0% (added 5% from bigcode)
-        subset: "finemath-3plus"             # Math content subset
-      
-      # Curated content (FIXED: streaming now works correctly)
-      "mlfoundations/dclm-baseline-1.0":
-        percentage: 15.0                     # Increased from 10.0% (added 5% from bigcode)
-        subset: null                         # 187k tokens - Curated content (streaming works)
-      
-      # Synthetic educational content
-      "HuggingFaceTB/cosmopedia":
-        percentage: 5.0                      # Kept same
-        subset: "auto_math_text"             # Synthetic textbooks subset
-      
-      # Total: 100.0% (ensures proper allocation)
-    
-    # Stage 1 specific processing settings
-    processing:
-      max_tokens_per_sample: 2048            # Maximum tokens per training sample
-      min_tokens_per_sample: 50              # Minimum tokens per training sample
-      overlap_tokens: 100                    # Overlap between consecutive samples for better training
-      max_samples_per_dataset: 100000         # Limit samples per dataset for faster testing
-
-  # Stage 2: Fine-tuning datasets (Task-specific training)
-  stage2_datasets:
-    # Fine-tuning datasets for specific tasks
-    finetuning_datasets:
-      # Code completion and generation - commented out due to S3 access requirements
-      # "bigcode/the-stack-v2-dedup":
-      #   percentage: 50.0
-      #   subsets: ["C", "C++", "Python", "Cuda"]  # C, C++, Python, CUDA subsets
-      #   task_type: "code_completion"
-      
-      # Mathematical reasoning
-      "HuggingFaceTB/finemath":
-        percentage: 60.0                     # Increased from 30.0% (added 30% from bigcode)
-        subset: "finemath-3plus"             # Math content subset
-        task_type: "mathematical_reasoning"
-      
-      # General knowledge and reasoning
-      "HuggingFaceFW/fineweb":
-        percentage: 40.0                     # Increased from 20.0% (added 20% from bigcode)
-        subset: "sample-10BT"               # 10 billion token sample
-        task_type: "general_knowledge"
-    
-    # Stage 2 specific processing settings
-    processing:
-      max_tokens_per_sample: 1024            # Shorter sequences for fine-tuning
-      min_tokens_per_sample: 100             # Longer minimum for task-specific content
-      overlap_tokens: 50                     # Less overlap for fine-tuning
-      max_samples_per_dataset: 10000         # Limit for fine-tuning datasets (reduced for testing)
-      task_specific_processing: true         # Enable task-specific data processing
-
-  # Stage 3: Instruction tuning datasets (Conversational AI)
-  stage3_datasets:
-    # Instruction tuning datasets for conversational AI
-    instruction_datasets:
-      # High-quality instruction datasets
-      "HuggingFaceTB/cosmopedia":
-        percentage: 50.0                     # Increased from 40.0% (added 10% from bigcode)
-        subset: "auto_math_text"             # Educational content
-        task_type: "instruction_following"
-      
-      # Code instruction datasets - commented out due to S3 access requirements
-      # "bigcode/the-stack-v2-dedup":
-      #   percentage: 30.0
-      #   subsets: ["C", "C++", "Python", "Cuda"]  # C, C++, Python, CUDA subsets
-      #   task_type: "code_instruction"
-      
-      # General instruction datasets
-      "HuggingFaceFW/fineweb":
-        percentage: 30.0                     # Increased from 20.0% (added 10% from bigcode)
-        subset: "sample-10BT"               # 10 billion token sample
-        task_type: "general_instruction"
-      
-      # Math instruction datasets
-      "HuggingFaceTB/finemath":
-        percentage: 20.0                     # Increased from 10.0% (added 10% from bigcode)
-        subset: "finemath-3plus"             # Math instruction
-        task_type: "math_instruction"
-    
-    # Stage 3 specific processing settings
-    processing:
-      max_tokens_per_sample: 4096            # Longer sequences for conversations
-      min_tokens_per_sample: 200             # Longer minimum for instruction pairs
-      overlap_tokens: 0                      # No overlap for instruction pairs
-      max_samples_per_dataset: 10000         # More samples for instruction tuning (reduced for testing)
-      instruction_format: "alpaca"           # Instruction format (alpaca, sharegpt, etc.)
-      include_system_prompts: true           # Include system prompts
-      conversation_format: true              # Enable conversation formatting

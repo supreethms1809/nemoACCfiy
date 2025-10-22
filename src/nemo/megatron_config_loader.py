@@ -60,7 +60,7 @@ class MegatronConfigLoader:
     
     def create_megatron_config(
         self,
-        model_config_key: str = "model_config_1.7B",
+        model_config_key: str = "model_config_1.8B",
         stage: str = "stage1",
         **kwargs
     ) -> Dict[str, Any]:
@@ -339,7 +339,7 @@ class MegatronConfigLoader:
 
 
 def create_megatron_config_from_existing(
-    model_config_key: str = "model_config_1.7B",
+    model_config_key: str = "model_config_1.8B",
     stage: str = "stage1",
     config_path: str = "configs/config.yaml",
     **kwargs
@@ -372,7 +372,7 @@ def main():
     
     parser = argparse.ArgumentParser(description="Test Megatron Configuration Loader")
     parser.add_argument("--config", type=str, default="configs/config.yaml", help="Configuration file path")
-    parser.add_argument("--model_config", type=str, default="model_config_1.7B", help="Model configuration key")
+    parser.add_argument("--model_config", type=str, default="model_config_1.8B", help="Model configuration key")
     parser.add_argument("--stage", type=str, default="stage1", help="Training stage")
     
     args = parser.parse_args()

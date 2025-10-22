@@ -17,6 +17,14 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
+# Import the optimized wrapper from optimized_models.py (shared by both NeMo and fallback)
+try:
+    from ..model.optimized_models import DecoderOnlyModel
+    OPTIMIZED_MODEL_AVAILABLE = True
+except ImportError:
+    OPTIMIZED_MODEL_AVAILABLE = False
+    DecoderOnlyModel = None
+
 # NeMo imports
 try:
     from nemo.core.classes import NeuralModule, typecheck, Loss, Exportable
@@ -24,6 +32,80 @@ try:
     from nemo.core.config import Config
     from nemo.utils import logging as nemo_logging
     NEMO_AVAILABLE = True
+    
+    # Define ModularModelNeMo when NeMo is available
+    class ModularModelNeMo(NeuralModule):
+        """NeMo-based implementation of ModularModelNeMo using the actual ModularModel."""
+        
+        def __init__(self, cfg):
+            super().__init__()
+            self.cfg = cfg
+            
+            if OPTIMIZED_MODEL_AVAILABLE and DecoderOnlyModel is not None:
+                # Stage 1 only: Use DecoderOnlyModel (decoder-only training)
+                print(f"✅ [NeMo] Stage 1: Using DecoderOnlyModel wrapper from optimized_models.py")
+                self.model = DecoderOnlyModel(
+                    config=cfg,
+                    vocab_size=cfg.vocab_size
+                )
+            else:
+                # Fallback to simple transformer if DecoderOnlyModel not available
+                self.embedding = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+                self.transformer = nn.TransformerEncoder(
+                    nn.TransformerEncoderLayer(
+                        d_model=cfg.hidden_size,
+                        nhead=cfg.num_attention_heads,
+                        dim_feedforward=cfg.intermediate_size,
+                        dropout=cfg.hidden_dropout_prob,
+                        batch_first=True
+                    ),
+                    num_layers=cfg.num_layers
+                )
+                self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size)
+                self.model = None
+            
+        def forward(self, input_ids, attention_mask=None, labels=None, embed_input_ids=None, embed_attention_mask=None):
+            if self.model is not None:
+                # Use the actual ModularModel
+                # For stage 1 training, embed_input_ids should be None
+                logits = self.model(
+                    input_ids=input_ids,
+                    embed_input_ids=embed_input_ids,
+                    attention_mask=attention_mask,
+                    embed_attention_mask=embed_attention_mask
+                )
+            else:
+                # Fallback implementation
+                x = self.embedding(input_ids)
+                x = self.transformer(x, src_key_padding_mask=attention_mask)
+                logits = self.lm_head(x)
+            
+            if labels is not None:
+                loss_fct = nn.CrossEntropyLoss()
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+                return {"loss": loss, "logits": logits}
+            
+            return {"logits": logits}
+        
+        @property
+        def input_types(self):
+            return {}
+        
+        @property
+        def output_types(self):
+            return {}
+        
+        def named_modules(self, memo=None, prefix='', remove_duplicate=True):
+            """Return all named modules for PyTorch Lightning compatibility."""
+            if self.model is not None:
+                # Use the actual ModularModel modules
+                return self.model.named_modules(memo=memo, prefix=prefix, remove_duplicate=remove_duplicate)
+            else:
+                # Fallback to standard nn.Module implementation
+                return super().named_modules(memo=memo, prefix=prefix, remove_duplicate=remove_duplicate)
+            
 except ImportError:
     print("Warning: NeMo not available, using PyTorch fallback implementation")
     NEMO_AVAILABLE = False
@@ -75,10 +157,79 @@ except ImportError:
         @staticmethod
         def warning(message):
             logging.warning(message)
+    
+    # Fallback ModularModelNeMo class
+    class ModularModelNeMo(nn.Module):
+        """Fallback implementation of ModularModelNeMo when NeMo is not available."""
         
-        @staticmethod
-        def error(message):
-            logging.error(message)
+        def __init__(self, cfg):
+            super().__init__()
+            self.cfg = cfg
+            
+            if OPTIMIZED_MODEL_AVAILABLE and DecoderOnlyModel is not None:
+                # Stage 1 only: Use DecoderOnlyModel (decoder-only training)
+                print(f"✅ [Fallback] Stage 1: Using DecoderOnlyModel wrapper from optimized_models.py")
+                self.model = DecoderOnlyModel(
+                    config=cfg,
+                    vocab_size=cfg.vocab_size
+                )
+            else:
+                # Fallback to simple transformer if DecoderOnlyModel not available
+                self.embedding = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+                self.transformer = nn.TransformerEncoder(
+                    nn.TransformerEncoderLayer(
+                        d_model=cfg.hidden_size,
+                        nhead=cfg.num_attention_heads,
+                        dim_feedforward=cfg.intermediate_size,
+                        dropout=cfg.hidden_dropout_prob,
+                        batch_first=True
+                    ),
+                    num_layers=cfg.num_layers
+                )
+                self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size)
+                self.model = None
+            
+        def forward(self, input_ids, attention_mask=None, labels=None, embed_input_ids=None, embed_attention_mask=None):
+            if self.model is not None:
+                # Use the actual ModularModel
+                # For stage 1 training, embed_input_ids should be None
+                logits = self.model(
+                    input_ids=input_ids,
+                    embed_input_ids=embed_input_ids,
+                    attention_mask=attention_mask,
+                    embed_attention_mask=embed_attention_mask
+                )
+            else:
+                # Fallback implementation
+                x = self.embedding(input_ids)
+                x = self.transformer(x, src_key_padding_mask=attention_mask)
+                logits = self.lm_head(x)
+            
+            if labels is not None:
+                loss_fct = nn.CrossEntropyLoss()
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+                return {"loss": loss, "logits": logits}
+            
+            return {"logits": logits}
+        
+        @property
+        def input_types(self):
+            return {}
+        
+        @property
+        def output_types(self):
+            return {}
+        
+        def named_modules(self, memo=None, prefix='', remove_duplicate=True):
+            """Return all named modules for PyTorch Lightning compatibility."""
+            if self.model is not None:
+                # Use the actual ModularModel modules
+                return self.model.named_modules(memo=memo, prefix=prefix, remove_duplicate=remove_duplicate)
+            else:
+                # Fallback to standard nn.Module implementation
+                return super().named_modules(memo=memo, prefix=prefix, remove_duplicate=remove_duplicate)
         
         @staticmethod
         def debug(message):
@@ -212,8 +363,8 @@ class ModularModelNeMo(NeuralModule, Exportable):
         model_config = {
             'decoder_config': decoder_config,
             'vocab_size': cfg.vocab_size,
-            'pool_type': cfg.pool_type,
-            'num_reasoning_vectors': cfg.num_reasoning_vectors,
+            # 'pool_type': cfg.pool_type,  # Not needed for Stage 1
+            # 'num_reasoning_vectors': cfg.num_reasoning_vectors,  # Not needed for Stage 1
         }
         
         # Initialize the core model based on training stage
@@ -568,6 +719,70 @@ class ModularModelNeMoWrapper(NeuralModule):
         
         self.logger.info(f"Initialized ModularModelNeMoWrapper with config: {cfg}")
     
+    def parameters(self, recurse: bool = True):
+        """Return model parameters for PyTorch Lightning compatibility."""
+        if hasattr(self.modular_model, 'model') and self.modular_model.model is not None:
+            # Use the actual ModularModel parameters
+            return self.modular_model.model.parameters(recurse=recurse)
+        else:
+            # Fallback to modular_model parameters
+            return self.modular_model.parameters(recurse=recurse)
+    
+    def named_parameters(self, prefix: str = '', recurse: bool = True, remove_duplicate: bool = True):
+        """Return named model parameters for PyTorch Lightning compatibility."""
+        if hasattr(self.modular_model, 'model') and self.modular_model.model is not None:
+            # Use the actual ModularModel parameters
+            return self.modular_model.model.named_parameters(prefix=prefix, recurse=recurse, remove_duplicate=remove_duplicate)
+        else:
+            # Fallback to modular_model parameters
+            return self.modular_model.named_parameters(prefix=prefix, recurse=recurse, remove_duplicate=remove_duplicate)
+    
+    def children(self):
+        """Return child modules for PyTorch Lightning compatibility."""
+        if hasattr(self.modular_model, 'model') and self.modular_model.model is not None:
+            # Use the actual ModularModel children
+            return self.modular_model.model.children()
+        else:
+            # Fallback to modular_model children
+            return self.modular_model.children()
+    
+    def named_children(self):
+        """Return named child modules for PyTorch Lightning compatibility."""
+        if hasattr(self.modular_model, 'model') and self.modular_model.model is not None:
+            # Use the actual ModularModel children
+            return self.modular_model.model.named_children()
+        else:
+            # Fallback to modular_model children
+            return self.modular_model.named_children()
+    
+    def modules(self):
+        """Return all modules for PyTorch Lightning compatibility."""
+        if hasattr(self.modular_model, 'model') and self.modular_model.model is not None:
+            # Use the actual ModularModel modules
+            return self.modular_model.model.modules()
+        else:
+            # Fallback to modular_model modules
+            return self.modular_model.modules()
+    
+    def named_modules(self, memo=None, prefix='', remove_duplicate=True):
+        """Return all named modules for PyTorch Lightning compatibility."""
+        if hasattr(self.modular_model, 'model') and self.modular_model.model is not None:
+            # Use the actual ModularModel modules
+            return self.modular_model.model.named_modules(memo=memo, prefix=prefix, remove_duplicate=remove_duplicate)
+        else:
+            # Fallback to modular_model modules
+            return self.modular_model.named_modules(memo=memo, prefix=prefix, remove_duplicate=remove_duplicate)
+    
+    def train(self, mode: bool = True):
+        """Set training mode for PyTorch Lightning compatibility."""
+        super().train(mode)
+        return self.modular_model.train(mode)
+    
+    def eval(self):
+        """Set evaluation mode for PyTorch Lightning compatibility."""
+        super().eval()
+        return self.modular_model.eval()
+    
     @property
     def input_types(self) -> Dict[str, NeuralType]:
         """Delegate to the modular model."""
@@ -726,7 +941,7 @@ def create_modular_model_nemo(
     return ModularModelNeMoWrapper(cfg)
 
 
-def create_modular_model_from_existing_config(model_config_key: str = "model_config_1.7B",
+def create_modular_model_from_existing_config(model_config_key: str = "model_config_1.8B",
                                             stage: str = "stage1",
                                             base_path: Optional[str] = None) -> 'ModularModelNeMoWrapper':
     """
@@ -816,3 +1031,97 @@ if __name__ == "__main__":
     print(f"  Loss: {outputs['loss']}")
     
     print(f"\nNeMo integration successful! 🎉")
+
+
+def create_modular_model_nemo(
+    vocab_size: int = 32000,
+    hidden_size: int = 2048,
+    num_layers: int = 24,
+    num_attention_heads: int = 16,
+    intermediate_size: int = 8192,
+    hidden_dropout_prob: float = 0.1,
+    training_stage: str = "stage1",
+    learning_rate: float = 1e-4,
+    weight_decay: float = 0.01,
+    warmup_steps: int = 1000,
+    **kwargs
+) -> ModularModelNeMoWrapper:
+    """
+    Factory function to create a ModularModel with NeMo integration.
+    
+    Args:
+        vocab_size: Vocabulary size
+        hidden_size: Hidden dimension size
+        num_layers: Number of transformer layers
+        num_attention_heads: Number of attention heads
+        intermediate_size: Feed-forward intermediate size
+        hidden_dropout_prob: Dropout probability
+        training_stage: Training stage (stage1, stage2)
+        learning_rate: Learning rate
+        weight_decay: Weight decay
+        warmup_steps: Number of warmup steps
+        **kwargs: Additional configuration parameters
+        
+    Returns:
+        ModularModelNeMoWrapper instance
+    """
+    cfg = ModularModelConfig(
+        vocab_size=vocab_size,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        num_attention_heads=num_attention_heads,
+        intermediate_size=intermediate_size,
+        hidden_dropout_prob=hidden_dropout_prob,
+        training_stage=training_stage,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        warmup_steps=warmup_steps,
+        **kwargs
+    )
+    
+    return ModularModelNeMoWrapper(cfg)
+
+
+class ModularModelConfig:
+    """Configuration class for ModularModel."""
+    
+    def __init__(self, **kwargs):
+        # Model architecture parameters (Stage 1 - DecoderOnlyModel)
+        self.vocab_size = kwargs.get('vocab_size', 32000)
+        self.hidden_size = kwargs.get('hidden_size', 2048)
+        self.num_layers = kwargs.get('num_layers', 24)
+        self.num_attention_heads = kwargs.get('num_attention_heads', 16)
+        self.num_kv_heads = kwargs.get('num_kv_heads', None)  # For GQA support
+        self.intermediate_size = kwargs.get('intermediate_size', 8192)
+        self.hidden_dropout_prob = kwargs.get('hidden_dropout_prob', 0.1)
+        
+        # Additional model parameters for DecoderOnlyModel compatibility
+        self.max_position_embeddings = kwargs.get('max_position_embeddings', 4096)
+        self.dropout = kwargs.get('dropout', 0.1)
+        self.attention_dropout = kwargs.get('attention_dropout', 0.1)
+        self.layer_norm_epsilon = kwargs.get('layer_norm_epsilon', 1e-6)
+        self.rms_norm_eps = kwargs.get('rms_norm_eps', 1e-6)  # For RMSNorm
+        self.initializer_range = kwargs.get('initializer_range', 0.02)
+        self.use_cache = kwargs.get('use_cache', True)
+        self.tie_weights = kwargs.get('tie_weights', True)
+        self.activation = kwargs.get('activation', 'silu')  # For MLP activation
+        self.rotary_base = kwargs.get('rotary_base', 10000.0)  # For RoPE
+        self.use_flash_attention = kwargs.get('use_flash_attention', True)
+        self.attention_type = kwargs.get('attention_type', 'gqa')
+        self.mlp_type = kwargs.get('mlp_type', 'mlp')
+        
+        # Token-related parameters
+        self.pad_token_id = kwargs.get('pad_token_id', 0)
+        self.eos_token_id = kwargs.get('eos_token_id', 2)
+        self.bos_token_id = kwargs.get('bos_token_id', 1)
+        
+        # Training parameters
+        self.training_stage = kwargs.get('training_stage', 'stage1')
+        self.learning_rate = kwargs.get('learning_rate', 1e-4)
+        self.weight_decay = kwargs.get('weight_decay', 0.01)
+        self.warmup_steps = kwargs.get('warmup_steps', 1000)
+        
+        # Additional parameters
+        for key, value in kwargs.items():
+            if not hasattr(self, key):
+                setattr(self, key, value)

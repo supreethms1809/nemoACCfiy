@@ -4,13 +4,11 @@ Unified Training Entry Point for NeMo ModularModel
 
 This script provides a single entry point for all training modes:
 - Basic training (simple datasets)
-- Production training (configuration-driven) 
-- Foundation training (NeMo native datasets)
+- Production training (configuration-driven)
 
 Usage:
     python train.py --mode basic --stage stage1
-    python train.py --mode production --model_config model_config_1.7B --stage stage1
-    python train.py --mode foundation --data_path ./data --stage stage1
+    python train.py --mode production --model_config model_config_1.8B --stage stage1
 """
 
 import sys

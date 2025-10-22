@@ -250,7 +250,7 @@ def evaluate_syntax_correctness(generated_code):
 
 def main():
     parser = argparse.ArgumentParser(description="Comprehensive NeMo ModularModel Evaluation")
-    parser.add_argument("--model_config", type=str, default="model_config_tiny",
+    parser.add_argument("--model_config", type=str, default="model_config_243M",
                        help="Model configuration key")
     parser.add_argument("--stage", type=str, default="stage1",
                        help="Training stage")

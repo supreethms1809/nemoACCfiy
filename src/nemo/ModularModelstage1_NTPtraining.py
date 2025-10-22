@@ -5,19 +5,17 @@ ModularModel Stage1 NTP Training Script for NeMo
 This script provides a single entry point for all training modes:
 - Basic training (simple datasets)
 - Production training (configuration-driven)
-- Foundation training (NeMo native datasets)
 
 Usage with conda:
     conda activate nemo
     # Lightning backend with HuggingFace datasets
-    python train.py --mode production --model_config model_config_tiny --stage stage1 --no_processed_datasets
+    python train.py --mode production --model_config model_config_243M --stage stage1 --no_processed_datasets
     # Megatron backend (automatically uses HuggingFace datasets)
-    python train.py --mode production --training_backend megatron --model_config model_config_tiny --stage stage1
+    python train.py --mode production --training_backend megatron --model_config model_config_243M --stage stage1
 
 Usage:
     python ModularModelstage1_NTPtraining.py --mode basic --stage stage1
-    python ModularModelstage1_NTPtraining.py --mode production --model_config model_config_1.7B --stage stage1
-    python ModularModelstage1_NTPtraining.py --mode foundation --data_path ./data --stage stage1
+    python ModularModelstage1_NTPtraining.py --mode production --model_config model_config_1.8B --stage stage1
 """
 
 import argparse
@@ -96,7 +94,6 @@ except ImportError:
         class LightningModule:
             pass
 
-# NeMo foundation training imports
 try:
     from nemo.collections.nlp.data.language_modeling.megatron.gpt_dataset import GPTDataset
     from nemo.collections.nlp.data.language_modeling.megatron.indexed_dataset import IndexedDataset, MMapIndexedDataset
@@ -104,7 +101,6 @@ try:
     NEMO_DATASETS_AVAILABLE = True
 except ImportError:
     NEMO_DATASETS_AVAILABLE = False
-    print("Warning: NeMo datasets not available. Foundation training disabled.")
     # Define dummy classes
     class GPTDataset:
         pass
@@ -238,54 +234,6 @@ class BasicDataset(Dataset):
             raise ValueError(f"Unknown stage: {self.stage}")
 
 
-class NeMoFoundationDataset(Dataset):
-    """NeMo foundation dataset wrapper for GPTDataset."""
-    
-    def __init__(
-        self,
-        data_path: str,
-        tokenizer,
-        max_length: int = 2048,
-        use_mmap: bool = True,
-        val_split: float = 0.1,
-        is_training: bool = True
-    ):
-        self.data_path = data_path
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.use_mmap = use_mmap
-        self.is_training = is_training
-        
-        if not NEMO_DATASETS_AVAILABLE:
-            raise ImportError("NeMo datasets not available. Cannot use foundation training mode.")
-        
-        # Initialize NeMo GPTDataset
-        self.gpt_dataset = GPTDataset(
-            indexed_dataset=MMapIndexedDataset if use_mmap else IndexedDataset,
-            tokenizer=tokenizer,
-            max_seq_length=max_length,
-            seed=42
-        )
-        
-        # Calculate split
-        total_samples = len(self.gpt_dataset)
-        val_samples = int(total_samples * val_split)
-        
-        if is_training:
-            self.start_idx = 0
-            self.end_idx = total_samples - val_samples
-        else:
-            self.start_idx = total_samples - val_samples
-            self.end_idx = total_samples
-    
-    def __len__(self):
-        return self.end_idx - self.start_idx
-    
-    def __getitem__(self, idx):
-        actual_idx = self.start_idx + idx
-        return self.gpt_dataset[actual_idx]
-
-
 class ModularModelTrainingModule(pl.LightningModule):
     """PyTorch Lightning module for ModularModel training."""
     
@@ -395,13 +343,20 @@ class ModularModelTrainingModule(pl.LightningModule):
                 accuracy = (predictions == labels).float().mean()
         
         # Log metrics with progress bar display
-        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
-        self.log("train_perplexity", perplexity, prog_bar=True, on_step=True, on_epoch=True)
-        self.log("train_accuracy", accuracy, prog_bar=True, on_step=True, on_epoch=True)
+        if hasattr(self, 'trainer') and self.trainer is not None:
+            self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+            self.log("train_perplexity", perplexity, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+            self.log("train_accuracy", accuracy, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
         
         # Log learning rate (this should make it appear in progress bar)
-        current_lr = self.optimizers().param_groups[0]['lr']
-        self.log("lr", current_lr, prog_bar=True, on_step=True)
+        try:
+            current_lr = self.optimizers().param_groups[0]['lr']
+            self.log("lr", current_lr, prog_bar=True, on_step=True)
+        except RuntimeError:
+            # Handle case when not attached to trainer (e.g., during testing)
+            current_lr = self.learning_rate
+            if hasattr(self, 'trainer') and self.trainer is not None:
+                self.log("lr", current_lr, prog_bar=True, on_step=True)
         
         return loss
     
@@ -468,9 +423,9 @@ class ModularModelTrainingModule(pl.LightningModule):
         self.model.train()
         
         # Log validation metrics
-        self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
-        self.log("val_perplexity", perplexity, prog_bar=True, on_step=False, on_epoch=True)
-        self.log("val_accuracy", accuracy, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val_perplexity", perplexity, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val_accuracy", accuracy, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
         
         return loss
     
@@ -528,10 +483,37 @@ class ModularModelTrainingModule(pl.LightningModule):
                 total_iters=warmup_steps
             )
         elif scheduler_type == "CosineAnnealingLR":
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=warmup_steps
-            )
+            # For cosine annealing, we need to handle warmup separately
+            # Create a warmup scheduler first, then cosine annealing
+            if warmup_steps > 0:
+                # Create warmup scheduler
+                warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                    optimizer,
+                    start_factor=0.1,
+                    end_factor=1.0,
+                    total_iters=warmup_steps
+                )
+                
+                # Create cosine annealing scheduler
+                cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    T_max=self.scheduler_config.get("T_max", 100000) - warmup_steps,
+                    eta_min=self.scheduler_config.get("eta_min", 1e-7)
+                )
+                
+                # Combine warmup and cosine annealing
+                scheduler = torch.optim.lr_scheduler.SequentialLR(
+                    optimizer,
+                    schedulers=[warmup_scheduler, cosine_scheduler],
+                    milestones=[warmup_steps]
+                )
+            else:
+                # No warmup, just cosine annealing
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    T_max=self.scheduler_config.get("T_max", 100000),
+                    eta_min=self.scheduler_config.get("eta_min", 1e-7)
+                )
         elif scheduler_type == "StepLR":
             scheduler = torch.optim.lr_scheduler.StepLR(
                 optimizer,
@@ -729,7 +711,7 @@ def process_datasets_for_training(config_path: str = "configs/config.yaml", outp
         processor = DatasetProcessor(config_path)
         
         # Load tokenizer
-        tokenizer_path = "tokenizers/qwen3-coder-30b-a3b-instruct-custom"
+        tokenizer_path = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
         processor.load_tokenizer(tokenizer_path)
         
         # Process datasets
@@ -765,12 +747,12 @@ def _process_huggingface_datasets(config_path: str, output_filename: str, total_
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Load HuggingFace datasets
-    tokenizer_path = "tokenizers/qwen3-coder-30b-a3b-instruct-custom"
+    tokenizer_path = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
     if base_path is not None:
         tokenizer_path = str(Path(base_path) / tokenizer_path)
     
     loader = HuggingFaceDatasetLoader(config_path, tokenizer_path, stage="stage1")
-    training_data = loader.create_training_data(max_samples=total_samples)
+    training_data = loader.create_training_data(total_samples=total_samples)
     
     # Save to JSONL file
     output_path = output_dir / f"{output_filename}.jsonl"
@@ -833,13 +815,29 @@ def create_strategy(distributed_config: dict):
             BackwardPrefetch.BACKWARD_PRE
         )
         
+        # Handle activation checkpointing with new policy format
+        activation_checkpointing = fsdp_config.get("activation_checkpointing", True)
+        if activation_checkpointing:
+            # Import common transformer layer classes for activation checkpointing
+            import torch.nn as nn
+            # Use new policy format for activation checkpointing
+            # Apply checkpointing to common large layers that benefit from it
+            activation_checkpointing_policy = {
+                nn.TransformerEncoderLayer,
+                nn.TransformerDecoderLayer,
+                nn.MultiheadAttention,
+                nn.Linear,  # Large linear layers
+            }
+        else:
+            activation_checkpointing_policy = None
+        
         strategy = FSDPStrategy(
             cpu_offload=fsdp_config.get("cpu_offload", False),
             sharding_strategy=sharding_strategy,
             backward_prefetch=backward_prefetch,
             forward_prefetch=fsdp_config.get("forward_prefetch", False),
             limit_all_gathers=fsdp_config.get("limit_all_gathers", True),
-            activation_checkpointing=fsdp_config.get("activation_checkpointing", True),
+            activation_checkpointing_policy=activation_checkpointing_policy,
             use_orig_params=fsdp_config.get("use_orig_params", False),
         )
         
@@ -908,7 +906,7 @@ def train_basic_mode(
     # Load configuration for checkpoint and log paths
     if create_nemo_config_from_existing is not None:
         try:
-            config = create_nemo_config_from_existing("model_config_tiny", stage)
+            config = create_nemo_config_from_existing("model_config_243M", stage)
             checkpoint_dir = config.get("checkpoint_dir", f"outputs/checkpoints/{stage}")
             log_dir = config.get("log_dir", "outputs/logs")
         except Exception:
@@ -1016,7 +1014,7 @@ def train_basic_mode(
 
 
 def train_production_mode(
-    model_config_key: str = "model_config_1.7B",
+    model_config_key: str = "model_config_1.8B",
     stage: str = "stage1",
     devices: int = 1,
     precision: str = "bf16-mixed",
@@ -1078,13 +1076,14 @@ def train_production_mode(
     if "checkpoint_dir" not in config:
         config["checkpoint_dir"] = "outputs/checkpoints"
     
-    # Create model
+    # Create model - ensure stage parameter is passed for correct model selection
+    config["training_stage"] = stage  # Add the stage parameter to config
     model = create_modular_model_nemo(**config)
     
     # Load data - prioritize processed datasets, then real data, then sample data
     vocab_size = config["vocab_size"]
     data_path = config.get("data_path", None)
-    tokenizer_path = config.get("tokenizer_path", "tokenizers/qwen3-coder-30b-a3b-instruct-custom")
+    tokenizer_path = config.get("tokenizer_path", "Qwen/Qwen3-Coder-30B-A3B-Instruct")
     # Read use_processed_datasets from config, fall back to kwargs, then default
     use_processed_datasets = kwargs.get("use_processed_datasets") if kwargs.get("use_processed_datasets") is not None else config.get("use_processed_datasets", False)
     # Read max_samples from config, fall back to kwargs, then default
@@ -1096,22 +1095,32 @@ def train_production_mode(
     # Try to use processed datasets first
     if use_processed_datasets:
         try:
-            processed_data_path = f"data/processed/training_data.jsonl"
-            if os.path.exists(processed_data_path):
-                logging.info(f"Loading processed dataset from: {processed_data_path}")
-                all_data = load_processed_dataset(processed_data_path)
+            # Check for HuggingFace format dataset first (from preprocessing script)
+            hf_dataset_path = f"data/{stage}/processed/combined_dataset"
+            if os.path.exists(hf_dataset_path):
+                logging.info(f"Loading preprocessed HuggingFace dataset from: {hf_dataset_path}")
+                from datasets import load_from_disk
+                hf_dataset = load_from_disk(hf_dataset_path)
+                all_data = [{"text": sample["text"], "id": sample["id"]} for sample in hf_dataset]
+                logging.info(f"Loaded {len(all_data)} samples from preprocessed dataset")
             else:
-                logging.info("Processed dataset not found. Processing datasets for training...")
-                processed_data_path = process_datasets_for_training(
-                    config_path="configs/config.yaml",
-                    output_filename="training_data",
-                    total_samples=total_samples,
-                    base_path=base_path
-                )
-                all_data = load_processed_dataset(processed_data_path)
+                # Fallback to old JSONL format
+                processed_data_path = f"data/processed/training_data.jsonl"
+                if os.path.exists(processed_data_path):
+                    logging.info(f"Loading processed dataset from: {processed_data_path}")
+                    all_data = load_processed_dataset(processed_data_path)
+                else:
+                    logging.info("Processed dataset not found. Processing datasets for training...")
+                    processed_data_path = process_datasets_for_training(
+                        config_path="configs/config.yaml",
+                        output_filename="training_data",
+                        total_samples=total_samples,
+                        base_path=base_path
+                    )
+                    all_data = load_processed_dataset(processed_data_path)
             
-            # Split into train/validation (80/20 split)
-            split_idx = int(len(all_data) * 0.8)
+            # Split into train/validation (90/10 split)
+            split_idx = int(len(all_data) * 0.9)
             train_data = all_data[:split_idx]
             val_data = all_data[split_idx:]
             
@@ -1127,40 +1136,35 @@ def train_production_mode(
             logging.info("Using HuggingFace datasets for training...")
             try:
                 # Use HuggingFace dataset loader with stage parameter
-                hf_loader = HuggingFaceDatasetLoader("configs/config.yaml", stage="stage1")
-                combined_dataset = hf_loader.load_all_datasets(max_samples_per_dataset=total_samples)
+                hf_loader = HuggingFaceDatasetLoader("configs/config.yaml", stage=stage)
+                
+                # Use the new streaming create_training_data method for memory efficiency
+                training_samples = hf_loader.create_training_data(total_samples=total_samples)
                 
                 # Convert to the format expected by BasicDataset
                 all_data = []
-                logging.info(f"Converting {len(combined_dataset)} samples from HuggingFace datasets...")
+                logging.info(f"Converting {len(training_samples)} samples from HuggingFace datasets...")
                 
-                for i in range(len(combined_dataset)):
-                    sample = combined_dataset[i]
+                for i, sample in enumerate(training_samples):
                     # Debug: log the first sample structure
                     if i == 0:
                         logging.info(f"Sample structure: {list(sample.keys())}")
-                        if 'input_ids' in sample:
-                            logging.info(f"Sample has input_ids with length: {len(sample['input_ids'])}")
-                        else:
-                            logging.info(f"Sample keys: {list(sample.keys())}")
+                        logging.info(f"Sample keys: {list(sample.keys())}")
                     
-                    # The HuggingFace dataset loader already processes the data and returns input_ids
-                    if 'input_ids' in sample:
+                    # The create_training_data method returns samples with 'text' field
+                    text = sample.get('text', '')
+                    if text:
+                        # Tokenize the text using the tokenizer
+                        tokenizer = hf_loader.tokenizer
+                        tokens = tokenizer.encode(text, add_special_tokens=True, truncation=True, max_length=2048)
                         all_data.append({
-                            "input_ids": sample["input_ids"],
-                            "embed_input_ids": sample["input_ids"]  # For stage2 compatibility
+                            "input_ids": tokens,
+                            "embed_input_ids": tokens  # For stage2 compatibility
                         })
-                    else:
-                        # If no input_ids, try to find text and tokenize it
-                        text = sample.get('text', '')
-                        if text:
-                            # Tokenize the text using the tokenizer
-                            tokenizer = hf_loader.tokenizer
-                            tokens = tokenizer.encode(text, add_special_tokens=True, truncation=True, max_length=2048)
-                            all_data.append({
-                                "input_ids": tokens,
-                                "embed_input_ids": tokens  # For stage2 compatibility
-                            })
+                    
+                    # Log progress for large datasets
+                    if (i + 1) % 10000 == 0:
+                        logging.info(f"Converted {i + 1}/{len(training_samples)} samples...")
                 
                 logging.info(f"Converted {len(all_data)} samples to training format")
                 
@@ -1203,8 +1207,19 @@ def train_production_mode(
         val_data = generate_sample_data(vocab_size, 200)
     
     # Create datasets
-    train_dataset = BasicDataset(train_data, stage=stage)
-    val_dataset = BasicDataset(val_data, stage=stage)
+    # Check if data has 'text' field (preprocessed HF dataset) or 'input_ids' (pre-tokenized)
+    if train_data and len(train_data) > 0 and 'text' in train_data[0] and 'input_ids' not in train_data[0]:
+        # Use HuggingFaceDatasetWrapper for text-based data
+        logging.info("Using HuggingFaceDatasetWrapper for text-based preprocessed data")
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        train_dataset = HuggingFaceDatasetWrapper(train_data, tokenizer, max_length=config.get("sequence_length", 2048))
+        val_dataset = HuggingFaceDatasetWrapper(val_data, tokenizer, max_length=config.get("sequence_length", 2048))
+    else:
+        # Use BasicDataset for pre-tokenized data
+        logging.info("Using BasicDataset for pre-tokenized data")
+        train_dataset = BasicDataset(train_data, stage=stage)
+        val_dataset = BasicDataset(val_data, stage=stage)
     
     # Ensure batch_size is valid
     batch_size = config.get("batch_size", 4)
@@ -1387,67 +1402,11 @@ def train_production_mode(
     return trainer, training_module
 
 
-def train_foundation_mode(
-    stage: str = "stage1",
-    data_path: str = "./data",
-    tokenizer_path: str = "tokenizers/qwen3-coder-30b-a3b-instruct-custom",
-    max_length: int = 2048,
-    learning_rate: float = 1e-5,
-    batch_size: int = 4,
-    devices: int = 1,
-    precision: str = "bf16-mixed",
-    resume_from_checkpoint: Optional[str] = None,
-    **kwargs
-):
-    """Foundation training mode using NeMo native datasets."""
-    
-    if not LIGHTNING_AVAILABLE:
-        raise RuntimeError("PyTorch Lightning not available for foundation training mode.")
-    
-    if not NEMO_DATASETS_AVAILABLE:
-        raise RuntimeError("NeMo datasets not available for foundation training mode.")
-    
-    if not TOKENIZER_AVAILABLE:
-        raise RuntimeError("Transformers not available for foundation training mode.")
-    
-    logging.info(f"🚀 Starting foundation training: {stage}")
-    logging.info(f"📊 Training Method: PyTorch Lightning")
-    logging.info(f"🔧 Framework: PyTorch Lightning + NeMo Native Datasets")
-    
-    # Load configuration for checkpoint and log paths
-    if create_nemo_config_from_existing is not None:
-        try:
-            config = create_nemo_config_from_existing("model_config_tiny", stage)
-            checkpoint_dir = config.get("checkpoint_dir", f"outputs/checkpoints/{stage}")
-            log_dir = config.get("log_dir", "outputs/logs")
-        except Exception:
-            # Fallback if config loading fails
-            checkpoint_dir = f"outputs/checkpoints/{stage}"
-            log_dir = "outputs/logs"
-    else:
-        # Fallback if config loader not available
-        checkpoint_dir = f"outputs/checkpoints/{stage}"
-        log_dir = "outputs/logs"
-    
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    
-    # Create datasets
-    train_dataset = None  # TODO: Implement NeMo native dataset creation
-    val_dataset = None    # TODO: Implement NeMo native dataset creation
-    
-    # TODO: Complete foundation training implementation
-    logging.warning("Foundation training mode is not yet fully implemented")
-    logging.info("Consider using 'megatron' mode for NeMo Megatron-based training")
-    
-    return None, None
-
-
 def train_megatron_mode_wrapper(
-    model_config_key: str = "model_config_1.7B",
+    model_config_key: str = "model_config_1.8B",
     stage: str = "stage1",
     data_path: str = "./data",
-    tokenizer_path: str = "tokenizers/qwen3-coder-30b-a3b-instruct-custom",
+    tokenizer_path: str = "Qwen/Qwen3-Coder-30B-A3B-Instruct",
     max_length: int = 2048,
     learning_rate: float = 1e-6,
     weight_decay: float = 0.01,
@@ -1528,8 +1487,8 @@ def main():
     
     # Training mode
     parser.add_argument("--mode", type=str, default="production",
-                       choices=["basic", "production", "foundation"],
-                       help="Training mode: basic, production, or foundation")
+                       choices=["basic", "production"],
+                       help="Training mode: basic or production")
     
     # Training backend (for production mode)
     parser.add_argument("--training_backend", type=str, default=None,
@@ -1583,16 +1542,9 @@ def main():
                        help="Number of attention heads (basic mode)")
     
     # Production mode arguments
-    parser.add_argument("--model_config", type=str, default="model_config_1.7B",
+    parser.add_argument("--model_config", type=str, default="model_config_1.8B",
                        help="Model configuration key (production mode)")
     
-    # Foundation mode arguments
-    parser.add_argument("--data_path", type=str, default="./data",
-                       help="Data path (foundation mode)")
-    
-    parser.add_argument("--tokenizer_path", type=str, 
-                       default="tokenizers/qwen3-coder-30b-a3b-instruct-custom",
-                       help="Tokenizer path (foundation mode)")
     
     # Dataset processing arguments (only for Lightning backend)
     parser.add_argument("--use_processed_datasets", action="store_true", default=True,
@@ -1604,8 +1556,6 @@ def main():
     parser.add_argument("--total_samples", type=int, default=None,
                        help="Total number of samples to process for training (overrides config)")
     
-    parser.add_argument("--max_length", type=int, default=2048,
-                       help="Maximum sequence length (foundation mode)")
     
     args = parser.parse_args()
     
@@ -1642,10 +1592,6 @@ def main():
             logging.info("📊 Training Method: NeMo Megatron")
             logging.info("🔧 Framework: NeMo Megatron + HuggingFace Datasets")
             logging.info("💡 Use case: Large-scale, distributed training with optimizations")
-    elif args.mode == "foundation":
-        logging.info("📊 Training Method: PyTorch Lightning")
-        logging.info("🔧 Framework: PyTorch Lightning + NeMo Native Datasets")
-        logging.info("💡 Use case: NeMo native dataset training (incomplete)")
     
     logging.info("="*60)
     logging.info(f"🎯 Starting unified training in {args.mode} mode")
@@ -1727,17 +1673,6 @@ def main():
                     max_samples=args.total_samples
                 )
         
-        elif args.mode == "foundation":
-            trainer, module = train_foundation_mode(
-                stage=args.stage,
-                data_path=args.data_path,
-                tokenizer_path=args.tokenizer_path,
-                max_length=args.max_length,
-                learning_rate=args.learning_rate,
-                batch_size=args.batch_size or 4,
-                devices=args.devices,
-                precision=args.precision
-            )
         
         
         logging.info("🎉 Training completed successfully!")
@@ -1762,8 +1697,6 @@ def main():
                 logging.info("📊 Training Method Used: PyTorch Lightning")
             elif training_backend == "megatron":
                 logging.info("📊 Training Method Used: NeMo Megatron")
-        elif args.mode == "foundation":
-            logging.info("📊 Training Method Used: PyTorch Lightning")
         logging.info("="*60)
         
     except Exception as e:

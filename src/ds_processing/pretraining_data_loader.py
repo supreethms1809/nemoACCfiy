@@ -143,7 +143,7 @@ class PretrainingDataLoader:
             # Try to get tokenizer path from config
             try:
                 from src.nemo.config_loader import create_nemo_config_from_existing
-                config = create_nemo_config_from_existing("model_config_tiny", "stage1")
+                config = create_nemo_config_from_existing("model_config_243M", "stage1")
                 tokenizer_path = config.get("tokenizer_path", "tokenizers/qwen3-coder-30b-a3b-instruct-custom")
                 self.load_tokenizer(tokenizer_path)
             except ImportError:

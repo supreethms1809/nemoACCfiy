@@ -55,7 +55,7 @@ def update_config_for_fsdp(config_path: str, fsdp_config_name: str = "multi_node
 
 def run_fsdp_training(
     stage: str = "stage1",
-    model_config: str = "model_config_1.7B",
+    model_config: str = "model_config_1.8B",
     fsdp_config: str = "multi_node_fsdp",
     devices: int = None,
     num_nodes: int = None
@@ -115,7 +115,7 @@ def main():
     parser = argparse.ArgumentParser(description="FSDP Training Example")
     parser.add_argument("--stage", type=str, default="stage1", choices=["stage1", "stage2"],
                        help="Training stage")
-    parser.add_argument("--model-config", type=str, default="model_config_1.7B",
+    parser.add_argument("--model-config", type=str, default="model_config_1.8B",
                        help="Model configuration key")
     parser.add_argument("--fsdp-config", type=str, default="multi_node_fsdp",
                        choices=["single_node_fsdp", "multi_node_fsdp", "multi_node_ddp", "large_scale_fsdp"],

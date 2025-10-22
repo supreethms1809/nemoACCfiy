@@ -8,7 +8,10 @@ according to the configuration defined in config.yaml.
 
 import os
 import logging
-from typing import Dict, List, Optional, Any, Union
+import time
+import threading
+import queue
+from typing import Dict, List, Optional, Any, Union, Iterator
 from pathlib import Path
 import yaml
 import os
@@ -23,6 +26,104 @@ from torch.utils.data import Dataset as TorchDataset
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+class BufferedStreamingDataset:
+    """
+    High-performance buffered streaming dataset for GH200 nodes with large memory.
+    
+    This class implements a large memory buffer that pre-loads samples from streaming
+    datasets, taking advantage of the 400+ GB RAM available on GH200 nodes.
+    
+    Single-threaded implementation that's thread-safe and reliable.
+    """
+    
+    def __init__(self, 
+                 dataset,  # HuggingFace streaming dataset
+                 buffer_size: int = 1000000,
+                 refill_threshold: float = 0.2):
+        """
+        Initialize the buffered streaming dataset.
+        
+        Args:
+            dataset: HuggingFace streaming dataset
+            buffer_size: Maximum number of samples to keep in buffer
+            refill_threshold: Refill buffer when this fraction is consumed
+        """
+        self.dataset = dataset
+        self.buffer_size = buffer_size
+        self.refill_threshold = refill_threshold
+        
+        # Buffer management
+        self.buffer = []
+        self.buffer_lock = threading.Lock()
+        self.dataset_iterator = iter(dataset)
+        self.total_loaded = 0
+        self.total_consumed = 0
+        self.exhausted = False
+        
+        # Pre-fill buffer
+        self._refill_buffer()
+        
+        logger.info(f"Initialized BufferedStreamingDataset with buffer_size={buffer_size}, "
+                   f"refill_threshold={refill_threshold}")
+    
+    def _refill_buffer(self):
+        """Refill the buffer with new samples."""
+        with self.buffer_lock:
+            target_size = int(self.buffer_size * (1 - self.refill_threshold))
+            
+            while len(self.buffer) < target_size and not self.exhausted:
+                try:
+                    sample = next(self.dataset_iterator)
+                    self.buffer.append(sample)
+                    self.total_loaded += 1
+                    
+                    if self.total_loaded % 50000 == 0:
+                        logger.info(f"Loaded {self.total_loaded} samples, "
+                                   f"Buffer size: {len(self.buffer)}")
+                        
+                except StopIteration:
+                    self.exhausted = True
+                    logger.info("Dataset exhausted")
+                    break
+                except Exception as e:
+                    logger.error(f"Error loading sample: {e}")
+                    break
+    
+    def __iter__(self):
+        """Iterate over samples from the buffer."""
+        return self
+    
+    def __next__(self):
+        """Get next sample from buffer."""
+        with self.buffer_lock:
+            # Check if we need to refill buffer
+            if len(self.buffer) <= self.buffer_size * self.refill_threshold and not self.exhausted:
+                # Refill buffer in background (this is still single-threaded but more efficient)
+                self._refill_buffer()
+            
+            # Get sample from buffer
+            if self.buffer:
+                sample = self.buffer.pop(0)
+                self.total_consumed += 1
+                
+                if self.total_consumed % 50000 == 0:
+                    logger.info(f"Consumed {self.total_consumed} samples, "
+                               f"Buffer size: {len(self.buffer)}")
+                
+                return sample
+            else:
+                raise StopIteration("All samples consumed")
+    
+    def __len__(self):
+        """Return approximate number of samples (not exact for streaming)."""
+        return self.total_loaded
+    
+    def close(self):
+        """Clean up resources."""
+        logger.info(f"BufferedStreamingDataset closed. Total loaded: {self.total_loaded}, "
+                   f"Total consumed: {self.total_consumed}")
+
 class HuggingFaceDatasetLoader:
     """
     Loader for HuggingFace datasets with percentage-based allocation.
@@ -31,7 +132,7 @@ class HuggingFaceDatasetLoader:
     the configuration in config.yaml and creates a unified dataset for training.
     """
     
-    def __init__(self, config_path: str, tokenizer_path: str = "tokenizers/qwen3-coder-30b-a3b-instruct-custom", stage: str = "stage1"):
+    def __init__(self, config_path: str, tokenizer_path: str = "tokenizers/qwen3-coder-30b-a3b-instruct-custom", stage: str = "stage1", enable_buffer: bool = None):
         """
         Initialize the HuggingFace dataset loader.
         
@@ -39,10 +140,12 @@ class HuggingFaceDatasetLoader:
             config_path: Path to the config.yaml file
             tokenizer_path: Path to the tokenizer
             stage: Training stage ("stage1", "stage2", "stage3")
+            enable_buffer: Override buffer setting (None = use config, True/False = override)
         """
         self.config_path = Path(config_path)
         self.tokenizer_path = tokenizer_path
         self.stage = stage
+        self.enable_buffer = enable_buffer
         self.tokenizer = None
         self.datasets_config = None
         self.global_settings = None
@@ -143,30 +246,52 @@ class HuggingFaceDatasetLoader:
             with open(self.config_path, 'r') as f:
                 config = yaml.safe_load(f)
             
-            # Extract global settings
-            self.global_settings = config.get('datasets', {}).get('global_settings', {})
-            
-            # Extract stage-specific configuration
-            stage_key = f"{self.stage}_datasets"
-            stage_config = config.get('datasets', {}).get(stage_key, {})
+            # Extract stage-specific configuration from training_stages
+            training_stages = config.get('training_stages', {})
+            stage_config = training_stages.get(self.stage, {})
             
             if not stage_config:
-                logger.warning(f"No {stage_key} configuration found in config")
+                logger.warning(f"No {self.stage} configuration found in training_stages")
                 return
+            
+            # Get data configuration from the stage
+            data_config = stage_config.get('data', {})
+            
+            if not data_config:
+                logger.warning(f"No data configuration found for {self.stage}")
+                return
+            
+            # Extract global settings from data config
+            self.global_settings = {
+                'use_streaming': data_config.get('use_streaming', True),
+                'streaming_fallback': data_config.get('streaming_fallback', True),
+                'cache_datasets': data_config.get('cache_datasets', True),
+                'processed_data_dir': data_config.get('processed_data_dir', 'data/processed'),
+                'cache_dir': data_config.get('cache_dir', '~/.cache/huggingface'),
+                'save_format': data_config.get('save_format', 'jsonl'),
+                'shuffle_datasets': data_config.get('shuffle_datasets', True),
+                'seed': data_config.get('seed', 42),
+                # Memory buffer settings for GH200 optimization
+                'use_memory_buffer': data_config.get('use_memory_buffer', True),
+                'buffer_size_mb': data_config.get('buffer_size_mb', 200000),  # 200GB default for GH200
+                'buffer_samples': data_config.get('buffer_samples', 5000000),  # 5M samples
+                'buffer_refill_threshold': data_config.get('buffer_refill_threshold', 0.1),  # More aggressive
+                'enable_memory_mapping': data_config.get('enable_memory_mapping', True)
+            }
             
             # Get the appropriate dataset type based on stage
             if self.stage == "stage1":
-                self.datasets_config = stage_config.get('pretraining_datasets', {})
+                self.datasets_config = data_config.get('pretraining_datasets', {})
             elif self.stage == "stage2":
-                self.datasets_config = stage_config.get('finetuning_datasets', {})
+                self.datasets_config = data_config.get('finetuning_datasets', {})
             elif self.stage == "stage3":
-                self.datasets_config = stage_config.get('instruction_datasets', {})
+                self.datasets_config = data_config.get('instruction_datasets', {})
             else:
                 logger.error(f"Unknown stage: {self.stage}")
                 return
             
             # Get stage-specific processing settings
-            self.stage_processing = stage_config.get('processing', {})
+            self.stage_processing = data_config.get('processing', {})
             
             if not self.datasets_config:
                 logger.warning(f"No datasets found for {self.stage}")
@@ -233,28 +358,29 @@ class HuggingFaceDatasetLoader:
             
             if subset:
                 logger.info(f"Loading subset: {subset}")
+                start_time = time.time()
                 # Try streaming first to avoid rate limits
                 try:
-                    dataset = load_dataset(dataset_name, subset, split="train", streaming=True, cache_dir=cache_dir)
-                    # Convert streaming dataset to regular dataset with limited samples
-                    if max_samples:
-                        samples = []
-                        for i, sample in enumerate(dataset):
-                            if i >= max_samples:
-                                break
-                            samples.append(sample)
-                        # Create a new dataset from the samples
-                        from datasets import Dataset as HFDataset
-                        dataset = HFDataset.from_list(samples)
-                    else:
-                        # Take first 1000 samples by default for streaming
-                        samples = []
-                        for i, sample in enumerate(dataset):
-                            if i >= 1000:
-                                break
-                            samples.append(sample)
-                        from datasets import Dataset as HFDataset
-                        dataset = HFDataset.from_list(samples)
+                    # Try to load non-streaming first (faster for cached datasets)
+                    try:
+                        dataset = load_dataset(dataset_name, subset, split="train", streaming=False, cache_dir=cache_dir)
+                        # If we have a limit, take only what we need
+                        if max_samples and len(dataset) > max_samples:
+                            # Use random sampling for better data distribution
+                            import random
+                            indices = random.sample(range(len(dataset)), max_samples)
+                            dataset = dataset.select(indices)
+                        elif max_samples and len(dataset) <= max_samples:
+                            logger.info(f"Dataset has {len(dataset)} samples, using all (requested {max_samples})")
+                    except Exception as non_stream_error:
+                        logger.warning(f"Non-streaming failed for {dataset_name}, trying streaming: {non_stream_error}")
+                        # Fallback to streaming with efficient sampling
+                        dataset = load_dataset(dataset_name, subset, split="train", streaming=True, cache_dir=cache_dir)
+                        if max_samples:
+                            # Use take() method for efficient sampling from streaming dataset
+                            dataset = dataset.take(max_samples)
+                        else:
+                            raise ValueError(f"max_samples must be specified for {dataset_name}. This prevents downloading entire datasets.")
                 except Exception as stream_error:
                     logger.warning(f"Streaming failed for {dataset_name}, trying regular load: {stream_error}")
                     dataset = load_dataset(dataset_name, subset, split="train", streaming=False, cache_dir=cache_dir)
@@ -289,24 +415,24 @@ class HuggingFaceDatasetLoader:
                         from datasets import Dataset as HFDataset
                         dataset = HFDataset.from_list(samples)
                     else:
-                        # Take first 1000 samples by default for streaming
-                        samples = []
-                        for i, sample in enumerate(dataset):
-                            if i >= 1000:
-                                break
-                            samples.append(sample)
-                        from datasets import Dataset as HFDataset
-                        dataset = HFDataset.from_list(samples)
+                        # This should not happen with our new approach - we always specify max_samples
+                        raise ValueError(f"max_samples must be specified for {dataset_name}. This prevents downloading entire datasets.")
                 except Exception as stream_error:
                     logger.warning(f"Streaming failed for {dataset_name}, trying regular load: {stream_error}")
                     dataset = load_dataset(dataset_name, split="train", streaming=False, cache_dir=cache_dir)
+                    # Limit samples if specified
+                    if max_samples and len(dataset) > max_samples:
+                        logger.info(f"Limiting dataset to {max_samples} samples")
+                        dataset = dataset.select(range(max_samples))
             
             # Limit samples if specified
             if max_samples and len(dataset) > max_samples:
                 logger.info(f"Limiting dataset to {max_samples} samples")
                 dataset = dataset.select(range(max_samples))
             
-            logger.info(f"Loaded {len(dataset)} samples from {dataset_name}")
+            end_time = time.time()
+            loading_time = end_time - start_time
+            logger.info(f"Loaded {len(dataset)} samples from {dataset_name} in {loading_time:.2f} seconds")
             return dataset
             
         except Exception as e:
@@ -347,34 +473,42 @@ class HuggingFaceDatasetLoader:
                         return dataset.filter(lambda x: False)  # Return empty dataset
             
             # Extract text content with stage-specific processing
-            def extract_text(example):
-                # Handle the-stack dataset format
-                if text_column == "blob_id" and "blob_id" in example and "src_encoding" in example:
-                    # For the-stack datasets, download actual content from S3
-                    blob_id = example["blob_id"]
-                    src_encoding = example.get("src_encoding", "utf-8")
+            def extract_text(examples):
+                # Handle batched processing
+                texts = []
+                for i in range(len(examples[text_column])):
+                    example = {key: examples[key][i] for key in examples.keys()}
                     
-                    # Download actual content from S3
-                    text = self._download_stack_content(blob_id, src_encoding)
-                    
-                    logger.info(f"Downloaded content for the-stack dataset. Blob ID: {blob_id}, Length: {len(text)} chars")
-                else:
-                    text = example[text_column]
-                    if isinstance(text, list):
-                        # If it's a list, join the elements
-                        text = " ".join(str(item) for item in text)
-                    
-                    # Stage-specific text processing
-                    if self.stage == "stage3" and task_type in ["instruction_following", "code_instruction", "math_instruction"]:
-                        # For instruction tuning, we might need to format the text differently
-                        # This is a placeholder for more sophisticated instruction formatting
-                        text = str(text)
+                    # Handle the-stack dataset format
+                    if text_column == "blob_id" and "blob_id" in example and "src_encoding" in example:
+                        # For the-stack datasets, download actual content from S3
+                        blob_id = example["blob_id"]
+                        src_encoding = example.get("src_encoding", "utf-8")
+                        
+                        # Download actual content from S3
+                        text = self._download_stack_content(blob_id, src_encoding)
+                        
+                        logger.info(f"Downloaded content for the-stack dataset. Blob ID: {blob_id}, Length: {len(text)} chars")
                     else:
-                        text = str(text)
+                        text = example[text_column]
+                        if isinstance(text, list):
+                            # If it's a list, join the elements
+                            text = " ".join(str(item) for item in text)
+                        
+                        # Stage-specific text processing
+                        if self.stage == "stage3" and task_type in ["instruction_following", "code_instruction", "math_instruction"]:
+                            # For instruction tuning, we might need to format the text differently
+                            # This is a placeholder for more sophisticated instruction formatting
+                            text = str(text)
+                        else:
+                            text = str(text)
+                    
+                    texts.append(text)
                 
-                return {"text": text}
+                return {"text": texts}
             
-            processed_dataset = dataset.map(extract_text, remove_columns=dataset.column_names)
+            # Use batched processing for better performance
+            processed_dataset = dataset.map(extract_text, remove_columns=dataset.column_names, batched=True, batch_size=1000)
             
             # Get stage-specific filtering criteria
             min_length = self.stage_processing.get('min_tokens_per_sample', 50)
@@ -393,62 +527,118 @@ class HuggingFaceDatasetLoader:
             logger.error(f"Failed to process dataset for {self.stage}: {e}")
             raise
     
-    def load_all_datasets(self, max_samples_per_dataset: Optional[int] = None) -> Dataset:
+    def _check_preprocessed_dataset(self, stage: str) -> Optional[Dataset]:
+        """
+        Check if a preprocessed dataset exists and load it.
+        
+        Args:
+            stage: Training stage
+            
+        Returns:
+            Preprocessed dataset if found, None otherwise
+        """
+        try:
+            from datasets import load_from_disk
+            
+            processed_dir = Path("data") / stage / "processed"
+            dataset_path = processed_dir / "combined_dataset"
+            
+            if dataset_path.exists():
+                logger.info(f"📥 Found preprocessed dataset at {dataset_path}")
+                dataset = load_from_disk(str(dataset_path))
+                logger.info(f"✅ Loaded preprocessed dataset with {len(dataset)} samples")
+                return dataset
+            else:
+                logger.info(f"📭 No preprocessed dataset found at {dataset_path}")
+                return None
+                
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to load preprocessed dataset: {e}")
+            return None
+
+    def load_all_datasets(self, total_samples: Optional[int] = None) -> Dataset:
         """
         Load all datasets according to the stage-specific configuration.
         
         Args:
-            max_samples_per_dataset: Maximum samples per dataset (for testing)
+            total_samples: Total number of samples across all datasets (code calculates per-dataset based on percentages)
             
         Returns:
             Combined dataset
         """
         try:
+            # Check if we should use preprocessed datasets
+            use_processed = self.stage_processing.get('use_processed_datasets', False)
+            
+            if use_processed:
+                logger.info("🔍 Checking for preprocessed datasets...")
+                preprocessed_dataset = self._check_preprocessed_dataset(self.stage)
+                if preprocessed_dataset is not None:
+                    logger.info("✅ Using preprocessed dataset (much faster!)")
+                    return preprocessed_dataset
+                else:
+                    logger.warning("⚠️ Preprocessed dataset not found, falling back to live loading")
+            
             all_datasets = []
             total_percentage = 0
             
             failed_datasets = []
             
-            # Get max samples from stage processing config if not provided
-            if max_samples_per_dataset is None:
-                max_samples_per_dataset = self.stage_processing.get('max_samples_per_dataset')
+            # Get total samples from stage processing config if not provided
+            if total_samples is None:
+                total_samples = self.stage_processing.get('total_samples')
+            
+            if total_samples is None:
+                raise ValueError(f"total_samples must be specified either as parameter or in stage processing config")
+            
+            # Calculate samples per dataset based on percentages
+            dataset_samples = {}
+            for dataset_name, config in self.datasets_config.items():
+                percentage = config.get("percentage", 0)
+                samples = int(total_samples * (percentage / 100.0))
+                dataset_samples[dataset_name] = samples
+                logger.info(f"Allocated {samples} samples ({percentage}%) for {dataset_name}")
             
             for dataset_name, config in self.datasets_config.items():
                 percentage = config.get("percentage", 0)
                 subset = config.get("subset")
                 subsets = config.get("subsets")
                 task_type = config.get("task_type", "general")
+                target_samples = dataset_samples[dataset_name]
                 
-                logger.info(f"Loading {dataset_name} ({percentage}%) for {self.stage} - {task_type}")
+                if target_samples == 0:
+                    logger.info(f"Skipping {dataset_name} (0 samples allocated)")
+                    continue
+                
+                logger.info(f"Loading {dataset_name} ({percentage}%) for {self.stage} - {task_type} (target: {target_samples} samples)")
                 
                 try:
-                    # Load the dataset
+                    # Load the dataset with the exact target sample count (efficient streaming)
                     dataset = self.load_dataset(
                         dataset_name=dataset_name,
                         subset=subset,
                         subsets=subsets,
-                        max_samples=max_samples_per_dataset
+                        max_samples=target_samples  # Load only what we need
                     )
                     
-                    # Process the dataset with stage-specific settings
+                    # Process the dataset with stage-specific settings (optimized)
+                    process_start = time.time()
                     processed_dataset = self.process_dataset(dataset, task_type=task_type)
+                    process_time = time.time() - process_start
+                    logger.info(f"Processed {dataset_name} in {process_time:.2f} seconds")
                     
-                    # Calculate number of samples based on percentage
-                    if max_samples_per_dataset:
-                        # For testing, use a smaller number
-                        num_samples = min(max_samples_per_dataset, len(processed_dataset))
+                    # The dataset should already have the right number of samples
+                    if len(processed_dataset) >= target_samples:
+                        # Take exactly the target number of samples
+                        sampled_dataset = processed_dataset.select(range(target_samples))
                     else:
-                        # For production, use percentage (this is a simplified approach)
-                        # In practice, you might want to implement more sophisticated sampling
-                        num_samples = min(int(len(processed_dataset) * percentage / 100), len(processed_dataset))
+                        # Use all available data if less than target
+                        sampled_dataset = processed_dataset
+                        logger.warning(f"Only {len(processed_dataset)} samples available for {dataset_name}, requested {target_samples}")
                     
-                    if num_samples > 0:
-                        sampled_dataset = processed_dataset.select(range(num_samples))
-                        all_datasets.append(sampled_dataset)
-                        total_percentage += percentage
-                        logger.info(f"Added {num_samples} samples from {dataset_name} for {task_type}")
-                    else:
-                        logger.warning(f"No samples selected from {dataset_name}")
+                    all_datasets.append(sampled_dataset)
+                    total_percentage += percentage
+                    logger.info(f"Added {len(sampled_dataset)} samples from {dataset_name} for {task_type}")
                         
                 except Exception as dataset_error:
                     logger.error(f"Failed to load dataset {dataset_name}: {dataset_error}")
@@ -472,36 +662,369 @@ class HuggingFaceDatasetLoader:
             logger.error(f"Failed to load all datasets for {self.stage}: {e}")
             raise
     
-    def create_training_data(self, max_samples: Optional[int] = None) -> List[Dict[str, Any]]:
+    def create_training_data(self, total_samples: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         Create training data in the format expected by the training pipeline.
         
         Args:
-            max_samples: Maximum number of samples to create
+            total_samples: Total number of samples across all datasets (code calculates per-dataset based on percentages)
+            
+        Returns:
+            List of training samples
+        """
+        try:
+            # Check if we should use streaming approach
+            use_streaming = self.global_settings.get('use_streaming', True)
+            
+            if use_streaming:
+                logger.info("Using streaming approach for memory efficiency")
+                return self._create_training_data_streaming(total_samples)
+            else:
+                logger.info("Using batch loading approach")
+                return self._create_training_data_batch(total_samples)
+            
+        except Exception as e:
+            logger.error(f"Failed to create training data: {e}")
+            raise
+    
+    def _create_training_data_streaming(self, total_samples: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        Create training data using buffered streaming approach optimized for GH200.
+        
+        Args:
+            total_samples: Total number of samples across all datasets
+            
+        Returns:
+            List of training samples
+        """
+        try:
+            # Get total samples from stage processing config if not provided
+            if total_samples is None:
+                total_samples = self.stage_processing.get('total_samples')
+            
+            if total_samples is None:
+                raise ValueError(f"total_samples must be specified either as parameter or in stage processing config")
+            
+            # Check if we should use memory buffer
+            if self.enable_buffer is not None:
+                use_memory_buffer = self.enable_buffer
+            else:
+                use_memory_buffer = self.global_settings.get('use_memory_buffer', False)
+            buffer_samples = self.global_settings.get('buffer_samples', 5000000)
+            buffer_refill_threshold = self.global_settings.get('buffer_refill_threshold', 0.1)
+            
+            if use_memory_buffer:
+                logger.info(f"🚀 Using GH200-optimized buffered streaming with {buffer_samples} sample buffer")
+                return self._create_training_data_buffered_streaming(total_samples, buffer_samples, buffer_refill_threshold)
+            else:
+                logger.info("📊 Using efficient streaming approach")
+                return self._create_training_data_standard_streaming(total_samples)
+            
+        except Exception as e:
+            logger.error(f"Failed to create streaming training data: {e}")
+            raise
+    
+    def _create_training_data_buffered_streaming(self, total_samples: int, buffer_samples: int, refill_threshold: float) -> List[Dict[str, Any]]:
+        """
+        Create training data using buffered streaming optimized for GH200 nodes.
+        
+        Args:
+            total_samples: Total number of samples across all datasets
+            buffer_samples: Number of samples to keep in memory buffer
+            refill_threshold: Refill buffer when this fraction is consumed
+            
+        Returns:
+            List of training samples
+        """
+        try:
+            # Calculate samples per dataset based on percentages
+            dataset_samples = {}
+            for dataset_name, config in self.datasets_config.items():
+                percentage = config.get("percentage", 0)
+                samples = int(total_samples * (percentage / 100.0))
+                dataset_samples[dataset_name] = samples
+                logger.info(f"Allocated {samples} samples ({percentage}%) for {dataset_name}")
+            
+            training_data = []
+            total_processed = 0
+            
+            for dataset_name, config in self.datasets_config.items():
+                percentage = config.get("percentage", 0)
+                subset = config.get("subset")
+                subsets = config.get("subsets")
+                task_type = config.get("task_type", "general")
+                target_samples = dataset_samples[dataset_name]
+                
+                if target_samples == 0:
+                    logger.info(f"Skipping {dataset_name} (0 samples allocated)")
+                    continue
+                
+                logger.info(f"🚀 Buffered streaming {dataset_name} ({percentage}%) for {self.stage} - {task_type} (target: {target_samples} samples)")
+                
+                try:
+                    # Load streaming dataset
+                    cache_dir = self.global_settings.get('cache_dir', '~/.cache/huggingface')
+                    
+                    if subset:
+                        dataset = load_dataset(dataset_name, subset, split="train", streaming=True, cache_dir=cache_dir)
+                    elif subsets:
+                        # For multiple subsets, we'll process them one by one
+                        for sub in subsets:
+                            sub_dataset = load_dataset(dataset_name, sub, split="train", streaming=True, cache_dir=cache_dir)
+                            sub_target = target_samples // len(subsets)
+                            self._process_buffered_streaming_dataset(sub_dataset, training_data, sub_target, task_type, total_processed, buffer_samples, refill_threshold)
+                            total_processed += sub_target
+                        continue
+                    else:
+                        dataset = load_dataset(dataset_name, split="train", streaming=True, cache_dir=cache_dir)
+                    
+                    # Process streaming dataset with buffer
+                    self._process_buffered_streaming_dataset(dataset, training_data, target_samples, task_type, total_processed, buffer_samples, refill_threshold)
+                    total_processed += target_samples
+                    
+                except Exception as dataset_error:
+                    logger.error(f"Failed to load dataset {dataset_name}: {dataset_error}")
+                    continue
+            
+            logger.info(f"✅ Created {len(training_data)} training samples using GH200-optimized buffered streaming")
+            return training_data
+            
+        except Exception as e:
+            logger.error(f"Failed to create buffered streaming training data: {e}")
+            raise
+    
+    def _create_training_data_standard_streaming(self, total_samples: int) -> List[Dict[str, Any]]:
+        """
+        Create training data using standard streaming approach.
+        
+        Args:
+            total_samples: Total number of samples across all datasets
+            
+        Returns:
+            List of training samples
+        """
+        try:
+            # Calculate samples per dataset based on percentages
+            dataset_samples = {}
+            for dataset_name, config in self.datasets_config.items():
+                percentage = config.get("percentage", 0)
+                samples = int(total_samples * (percentage / 100.0))
+                dataset_samples[dataset_name] = samples
+                logger.info(f"Allocated {samples} samples ({percentage}%) for {dataset_name}")
+            
+            training_data = []
+            total_processed = 0
+            
+            for dataset_name, config in self.datasets_config.items():
+                percentage = config.get("percentage", 0)
+                subset = config.get("subset")
+                subsets = config.get("subsets")
+                task_type = config.get("task_type", "general")
+                target_samples = dataset_samples[dataset_name]
+                
+                if target_samples == 0:
+                    logger.info(f"Skipping {dataset_name} (0 samples allocated)")
+                    continue
+                
+                logger.info(f"Streaming {dataset_name} ({percentage}%) for {self.stage} - {task_type} (target: {target_samples} samples)")
+                
+                try:
+                    # Load streaming dataset
+                    cache_dir = self.global_settings.get('cache_dir', '~/.cache/huggingface')
+                    
+                    if subset:
+                        dataset = load_dataset(dataset_name, subset, split="train", streaming=True, cache_dir=cache_dir)
+                    elif subsets:
+                        # For multiple subsets, we'll process them one by one
+                        for sub in subsets:
+                            sub_dataset = load_dataset(dataset_name, sub, split="train", streaming=True, cache_dir=cache_dir)
+                            sub_target = target_samples // len(subsets)
+                            self._process_streaming_dataset(sub_dataset, training_data, sub_target, task_type, total_processed)
+                            total_processed += sub_target
+                        continue
+                    else:
+                        dataset = load_dataset(dataset_name, split="train", streaming=True, cache_dir=cache_dir)
+                    
+                    # Process streaming dataset
+                    self._process_streaming_dataset(dataset, training_data, target_samples, task_type, total_processed)
+                    total_processed += target_samples
+                    
+                except Exception as dataset_error:
+                    logger.error(f"Failed to load dataset {dataset_name}: {dataset_error}")
+                    continue
+            
+            logger.info(f"Created {len(training_data)} training samples using standard streaming approach")
+            return training_data
+            
+        except Exception as e:
+            logger.error(f"Failed to create standard streaming training data: {e}")
+            raise
+    
+    def _process_streaming_dataset(self, dataset, training_data: List, target_samples: int, task_type: str, start_id: int):
+        """
+        Process a streaming dataset and add samples to training_data.
+        
+        Args:
+            dataset: Streaming dataset
+            training_data: List to append samples to
+            target_samples: Number of samples to process
+            task_type: Type of task for processing
+            start_id: Starting ID for samples
+        """
+        processed_count = 0
+        
+        for i, example in enumerate(dataset):
+            if processed_count >= target_samples:
+                break
+            
+            try:
+                # Process the sample
+                processed_sample = self._process_single_sample(example, task_type)
+                if processed_sample:
+                    training_data.append({
+                        "text": processed_sample,
+                        "id": start_id + processed_count
+                    })
+                    processed_count += 1
+                
+                # Log progress (less frequent for better performance)
+                if processed_count % 50000 == 0:
+                    logger.info(f"Processed {processed_count}/{target_samples} samples...")
+                    
+            except Exception as e:
+                logger.warning(f"Failed to process sample {i}: {e}")
+                continue
+        
+        logger.info(f"Processed {processed_count} samples from streaming dataset")
+    
+    def _process_buffered_streaming_dataset(self, dataset, training_data: List, target_samples: int, task_type: str, start_id: int, buffer_samples: int, refill_threshold: float):
+        """
+        Process a streaming dataset using buffered approach optimized for GH200.
+        
+        Args:
+            dataset: Streaming dataset
+            training_data: List to append samples to
+            target_samples: Number of samples to process
+            task_type: Type of task for processing
+            start_id: Starting ID for samples
+            buffer_samples: Number of samples to keep in buffer
+            refill_threshold: Refill buffer when this fraction is consumed
+        """
+        try:
+            # Create buffered streaming dataset
+            buffered_dataset = BufferedStreamingDataset(
+                dataset=dataset,  # Pass the dataset, not iterator
+                buffer_size=buffer_samples,
+                refill_threshold=refill_threshold
+            )
+            
+            processed_count = 0
+            
+            for sample in buffered_dataset:
+                if processed_count >= target_samples:
+                    break
+                
+                try:
+                    # Process the sample
+                    processed_sample = self._process_single_sample(sample, task_type)
+                    if processed_sample:
+                        training_data.append({
+                            "text": processed_sample,
+                            "id": start_id + processed_count
+                        })
+                        processed_count += 1
+                    
+                    # Log progress (less frequent for better performance)
+                    if processed_count % 50000 == 0:
+                        logger.info(f"🚀 Buffered processing: {processed_count}/{target_samples} samples...")
+                        
+                except Exception as e:
+                    logger.warning(f"Failed to process sample: {e}")
+                    continue
+            
+            # Clean up buffered dataset
+            buffered_dataset.close()
+            
+            logger.info(f"✅ Buffered processed {processed_count} samples from streaming dataset")
+            
+        except Exception as e:
+            logger.error(f"Failed to process buffered streaming dataset: {e}")
+            raise
+    
+    def _process_single_sample(self, example: Dict, task_type: str) -> Optional[str]:
+        """
+        Process a single sample from a dataset.
+        
+        Args:
+            example: Single sample from dataset
+            task_type: Type of task
+            
+        Returns:
+            Processed text or None if processing failed
+        """
+        try:
+            # Find text column
+            text_column = None
+            possible_columns = ["text", "content", "body", "article", "passage", "document", "code", "instruction", "response", "src", "source"]
+            
+            for col in possible_columns:
+                if col in example:
+                    text_column = col
+                    break
+            
+            if text_column is None:
+                # Handle the-stack dataset format
+                if "blob_id" in example and "src_encoding" in example:
+                    blob_id = example["blob_id"]
+                    src_encoding = example.get("src_encoding", "utf-8")
+                    text = self._download_stack_content(blob_id, src_encoding)
+                else:
+                    logger.warning(f"No text column found in sample: {list(example.keys())}")
+                    return None
+            else:
+                text = example[text_column]
+                if isinstance(text, list):
+                    text = " ".join(str(item) for item in text)
+                text = str(text)
+            
+            # Apply minimum length filter
+            min_length = self.stage_processing.get('min_tokens_per_sample', 50)
+            if len(text.strip()) < min_length:
+                return None
+            
+            return text
+            
+        except Exception as e:
+            logger.warning(f"Failed to process sample: {e}")
+            return None
+    
+    def _create_training_data_batch(self, total_samples: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        Create training data using batch loading approach (original implementation).
+        
+        Args:
+            total_samples: Total number of samples across all datasets
             
         Returns:
             List of training samples
         """
         try:
             # Load all datasets
-            combined_dataset = self.load_all_datasets(max_samples_per_dataset=max_samples)
+            combined_dataset = self.load_all_datasets(total_samples=total_samples)
             
             # Convert to list of dictionaries
             training_data = []
             for i, example in enumerate(combined_dataset):
-                if max_samples and i >= max_samples:
-                    break
-                    
                 training_data.append({
                     "text": example["text"],
                     "id": i
                 })
             
-            logger.info(f"Created {len(training_data)} training samples")
+            logger.info(f"Created {len(training_data)} training samples using batch approach")
             return training_data
             
         except Exception as e:
-            logger.error(f"Failed to create training data: {e}")
+            logger.error(f"Failed to create batch training data: {e}")
             raise
 
 
@@ -576,7 +1099,7 @@ def load_huggingface_datasets(config_path: str, tokenizer_path: str = "tokenizer
         List of training samples
     """
     loader = HuggingFaceDatasetLoader(config_path, tokenizer_path)
-    return loader.create_training_data(max_samples)
+    return loader.create_training_data(total_samples=max_samples)
 
 
 if __name__ == "__main__":
@@ -589,7 +1112,7 @@ if __name__ == "__main__":
         loader = HuggingFaceDatasetLoader(config_path, tokenizer_path)
         
         # Load a small sample for testing
-        training_data = loader.create_training_data(max_samples=100)
+        training_data = loader.create_training_data(total_samples=100)
         print(f"Loaded {len(training_data)} training samples")
         
         # Test the wrapper

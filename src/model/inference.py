@@ -273,7 +273,7 @@ def main():
                        help="Path to decoder-only model checkpoint (extracted from Stage 1)")
     parser.add_argument("--config-file", type=str, default="src/model_config/config.json",
                        help="Path to model configuration file")
-    parser.add_argument("--model-config-key", type=str, default="model_config_micro",
+    parser.add_argument("--model-config-key", type=str, default="model_config_89M",
                        help="Model configuration key")
     
     # Tokenizer

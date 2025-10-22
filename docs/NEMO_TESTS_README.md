@@ -93,7 +93,7 @@ The tests expect the following configuration structure in `configs/config.yaml`:
 training_stages:
   stage1:
     model:
-      model_config_key: "model_config_1.7B"
+      model_config_key: "model_config_1.8B"
       tokenizer_path: "tokenizers/qwen3-coder-30b-a3b-instruct-custom"
     
     training:
