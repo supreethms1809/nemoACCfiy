@@ -106,6 +106,26 @@ model_configs:
     mlp_type: "mlp_gated"
     attention_type: "vanilla"
 
+  model_config_1B:
+    decoder_config:
+      attention_bias: false
+      attention_dropout: 0.0
+      hidden_act: "silu"
+      hidden_size: 1536
+      initializer_range: 0.02
+      intermediate_size: 3840
+      max_position_embeddings: 40960
+      max_window_layers: 28
+      num_attention_heads: 24
+      num_hidden_layers: 28
+      num_key_value_heads: 8
+      RMSNorm_eps: 1e-06
+      use_cache: true
+    pool_type: "attention"
+    hidden_dropout_prob: 0.0
+    mlp_type: "mlp_gated"
+    attention_type: "vanilla"
+
   model_config_243M:
     decoder_config:
       hidden_size: 1024
@@ -167,13 +187,13 @@ training_stages:
       # Training backend selection (for production mode)
       training_backend: "lightning"  # Options: "lightning" (PyTorch Lightning) or "megatron" (NeMo Megatron)
       
-      # Training duration - optimized for 10M samples with 1.7B model
+      # Training duration - optimized for 10M samples with 1B model
       epochs: 1                     # Single epoch for large dataset (10M samples)
-      batch_size: 24               # Optimized batch size to achieve 92GB GPU memory usage
+      batch_size: 48               # Optimized batch size for 1B model (50% increase from 1.8B model)
       sequence_length: 4096         # Increased sequence length to better utilize GPU memory (2x increase)
-      learning_rate: 3e-5           # Higher LR for full model training (was 1e-6)
-      max_grad_norm: 1.0            # Tighter gradient clipping for stability
-      gradient_accumulation_steps: 2 # Reduced accumulation since batch size increased
+      learning_rate: 4e-5           # Higher LR for 1B model (compensates for smaller effective batch)
+      max_grad_norm: 0.8            # Tighter gradient clipping for 1B model stability
+      gradient_accumulation_steps: 1 # No accumulation needed with larger batch size
       gradient_checkpointing: true   # Essential for memory efficiency
       mixed_precision: "bf16"       # Use bf16 for GH200 optimization
       
@@ -191,14 +211,14 @@ training_stages:
         resume_ignore_mismatched_sizes: false  # Ignore size mismatches when resuming
         
       # Training monitoring and control (optimized for large dataset)
-      log_every_n_steps: 50         # Less frequent logging to reduce I/O overhead
+      log_every_n_steps: 25         # Less frequent logging to reduce I/O overhead
       val_check_interval_steps: 10000 # More frequent validation for large training
       
       # Early stopping (disabled for large dataset training)
       patience: 10                  # Higher patience for large dataset training
       
       # Gradient optimization
-      gradient_clip_val: 1.0        # Gradient clipping value
+      gradient_clip_val: 0.8        # Tighter gradient clipping for 1B model
       gradient_clip_algorithm: "value"  # Gradient clipping algorithm (compatible with FSDP)
     
     # Distributed training configuration (optimized for GH200)
@@ -208,7 +228,7 @@ training_stages:
       devices: "auto"  # Can be "auto", number, or list of device IDs
       sync_batchnorm: false
       
-      # FSDP specific configuration (optimized for 1.7B model)
+      # FSDP specific configuration (optimized for 1B model)
       fsdp:
         enabled: true                # Enable FSDP for memory efficiency
         cpu_offload: true           # Keep on GPU for GH200's large memory
@@ -219,17 +239,17 @@ training_stages:
         activation_checkpointing: true
         use_orig_params: false
     
-    # Optimizer configuration (optimized for large-scale training)
+    # Optimizer configuration (optimized for 1B model)
     optimizer:
       type: "AdamW"
-      weight_decay: 0.1              # Higher weight decay for regularization
-      betas: [0.9, 0.95]             # Adjusted betas for stability
+      weight_decay: 0.05             # Lower weight decay for 1B model
+      betas: [0.9, 0.98]             # More stable betas for 1B model
       eps: 1e-6                      # Slightly higher eps for numerical stability
     
-    # Learning rate scheduler configuration (optimized for 10M samples)
+    # Learning rate scheduler configuration (optimized for 1B model)
     scheduler:
       type: "CosineAnnealingLR"      # Cosine annealing for better convergence
-      T_max: 100000                  # Total steps for cosine schedule
+      T_max: 80000                   # Adjusted total steps for 1B model
       eta_min: 1e-7                  # Minimum learning rate
       warmup_steps: 5000             # Longer warmup for large dataset
       interval: "step"
