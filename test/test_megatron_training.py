@@ -57,7 +57,7 @@ def test_megatron_config_loading():
         
         # Test configuration loading
         config = create_megatron_config_from_existing(
-            model_config_key="model_config_1.7B",
+            model_config_key="model_config_1.8B",
             stage="stage1",
             config_path="configs/config.yaml"
         )
@@ -202,7 +202,7 @@ def main():
     if passed == total:
         logger.info("🎉 All tests passed! NeMo Megatron training is ready to use.")
         logger.info("\nUsage:")
-        logger.info("  python train.py --mode megatron --stage stage1 --model_config model_config_1.7B")
+        logger.info("  python train.py --mode megatron --stage stage1 --model_config model_config_1.8B")
         logger.info("  python src/nemo/ModularModelstage1_NTPtraining.py --mode megatron --stage stage1")
         return 0
     else:

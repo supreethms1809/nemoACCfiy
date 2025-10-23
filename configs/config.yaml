@@ -189,17 +189,17 @@ training_stages:
       
       # Training duration - optimized for 10M samples with 1B model
       epochs: 1                     # Single epoch for large dataset (10M samples)
-      batch_size: 48               # Optimized batch size for 1B model (50% increase from 1.8B model)
-      sequence_length: 4096         # Increased sequence length to better utilize GPU memory (2x increase)
-      learning_rate: 4e-5           # Higher LR for 1B model (compensates for smaller effective batch)
-      max_grad_norm: 0.8            # Tighter gradient clipping for 1B model stability
-      gradient_accumulation_steps: 1 # No accumulation needed with larger batch size
+      batch_size: 4               # Larger batch size for better GPU utilization
+      sequence_length: 2048         # Keep current sequence length for stability
+      learning_rate: 4e-5           # Keep current learning rate
+      max_grad_norm: 0.8            # Keep current gradient clipping
+      gradient_accumulation_steps: 2 # Reduced accumulation for larger batch size
       gradient_checkpointing: true   # Essential for memory efficiency
-      mixed_precision: "bf16"       # Use bf16 for GH200 optimization
+      mixed_precision: "bf16-mixed"       # Use bf16 for GH200 optimization
       
       # Step-based checkpointing and validation (optimized for large dataset)
       checkpointing:
-        save_every_n_steps: 5000    # More frequent saves for large training runs
+        save_every_n_steps: 5000    # Less frequent saves to avoid FSDP issues
         save_top_k: 3               # Keep more checkpoints for large training
         monitor: "val_loss"         # Metric to monitor for best checkpoints
         mode: "min"                 # Monitor mode (min/max)
@@ -208,11 +208,12 @@ training_stages:
         
         # Resume training settings
         resume_from_checkpoint: null  # Path to checkpoint to resume from (null = auto-detect)
-        resume_ignore_mismatched_sizes: false  # Ignore size mismatches when resuming
+        resume_ignore_mismatched_sizes: true  # Ignore size mismatches when resuming
         
       # Training monitoring and control (optimized for large dataset)
       log_every_n_steps: 25         # Less frequent logging to reduce I/O overhead
-      val_check_interval_steps: 10000 # More frequent validation for large training
+
+      val_check_interval_steps: 50000   # Reduce validation frequency to minimize overhead
       
       # Early stopping (disabled for large dataset training)
       patience: 10                  # Higher patience for large dataset training
@@ -231,13 +232,13 @@ training_stages:
       # FSDP specific configuration (optimized for 1B model)
       fsdp:
         enabled: true                # Enable FSDP for memory efficiency
-        cpu_offload: true           # Keep on GPU for GH200's large memory
+        cpu_offload: false          # Disable CPU offload for better performance on GH200
         sharding_strategy: "FULL_SHARD"  # Full sharding for maximum memory efficiency
         backward_prefetch: "BACKWARD_PRE"  # Optimize backward pass
         forward_prefetch: false
         limit_all_gathers: true
-        activation_checkpointing: true
-        use_orig_params: false
+        activation_checkpointing: true   # Re-enable to reduce memory usage
+        use_orig_params: true
     
     # Optimizer configuration (optimized for 1B model)
     optimizer:
@@ -255,28 +256,25 @@ training_stages:
       interval: "step"
       frequency: 1
     
-    # Dataset configuration
+    # Dataset configuration (NeMo HFDatasetDataModule with ds_processing pipeline)
     data:
-      # Dataset loading strategy
-      use_streaming: true                    # Use streaming for efficient loading
-      streaming_fallback: true               # Fallback to full download if streaming fails
-      cache_datasets: true                   # Cache downloaded datasets locally
+      # Processing configuration for ds_processing pipeline
+      processing:
+        max_tokens_per_sample: 16384           # Maximum tokens per document (allows full documents with smart chunking)
+        min_tokens_per_sample: 50              # Minimum tokens per training sample
+        overlap_tokens: 200                    # Overlap between consecutive chunks for better training
+        shuffle_datasets: true                 # Shuffle datasets before mixing
+        seed: 42                               # Random seed for reproducibility
+        total_samples: 10000000                 # Total samples for all datasets combined (code calculates per-dataset based on percentages) - Reduced for faster testing
+        use_processed_datasets: true           # Set to true to use preprocessed datasets (much faster!)
+        save_processed_datasets: true          # Save processed datasets for future use
+        test_size_samples: true               # If true, use only 4096 samples for testing; if false, use full dataset
       
-      # Output settings
-      processed_data_dir: "data/processed"   # Directory for processed datasets
-      cache_dir: "~/.cache/huggingface"      # Use HuggingFace default cache directory
-      save_format: "jsonl"                   # Format for saved processed data
-      
-      # Common processing settings
-      shuffle_datasets: true                 # Shuffle datasets before mixing
-      seed: 42                               # Random seed for reproducibility
-      
-      # Memory buffer configuration (optimized for GH200 with 400+ GB RAM)
-      use_memory_buffer: false               # Disable buffer for preprocessing (use efficient streaming)
-      buffer_size_mb: 200000                 # Buffer size in MB (200GB buffer for GH200)
-      buffer_samples: 5000000                # Number of samples to keep in buffer (5M samples)
-      buffer_refill_threshold: 0.1           # Refill buffer when 10% full (more aggressive)
-      enable_memory_mapping: true            # Use memory mapping for large buffers
+      # Output configuration for ds_processing pipeline
+      output:
+        processed_data_dir: "data/processed"   # Directory for processed HuggingFace datasets
+        cache_dir: "/tmp/hf_cache"             # Use temporary cache directory
+        save_format: "hf"                      # HuggingFace format for processed data
       
       # Stage 1: Pre-training datasets (Next Token Prediction)
       pretraining_datasets:
@@ -302,20 +300,11 @@ training_stages:
         
         # Total: 100.0% (ensures proper allocation)
       
-      # Stage 1 specific processing settings
-      processing:
-        max_tokens_per_sample: 2048            # Maximum tokens per training sample
-        min_tokens_per_sample: 50              # Minimum tokens per training sample
-        overlap_tokens: 100                    # Overlap between consecutive samples for better training
-        total_samples: 10000000                 # Total samples for all datasets combined (code calculates per-dataset based on percentages) - Reduced for faster testing
-        use_processed_datasets: true           # Set to true to use preprocessed datasets (much faster!)
-        save_processed_datasets: true          # Save processed datasets for future use
-      
-      # Data loading performance options
-      num_workers: 32                # Number of DataLoader workers
-      pin_memory: true              # Pin memory for faster GPU transfer
-      persistent_workers: true      # Keep workers alive between epochs
-      prefetch_factor: 2            # Prefetch batches for better performance
+      # Data loading performance options (optimized for GH200 with 72 CPU cores)
+      num_workers: 16               # Reduced workers to minimize overhead and contention
+      pin_memory: true              # Faster GPU transfer
+      persistent_workers: true      # Keep workers alive between batches
+      prefetch_factor: 4            # Reduced prefetch to minimize memory overhead
 
     checkpoint_dir: "/home/sureshm/nemoACCfiy/outputs/checkpoints/stage1"
     model_output_dir: "/home/sureshm/nemoACCfiy/outputs/models"
@@ -400,58 +389,54 @@ training_stages:
       interval: "step"
       frequency: 1
     
-    # Dataset configuration
+    # Dataset configuration (NeMo HFDatasetDataModule with ds_processing pipeline)
     data:
-      # Dataset loading strategy
-      use_streaming: true                    # Use streaming for efficient loading
-      streaming_fallback: true               # Fallback to full download if streaming fails
-      cache_datasets: true                   # Cache downloaded datasets locally
-      
-      # Output settings
-      processed_data_dir: "data/processed"   # Directory for processed datasets
-      cache_dir: "~/.cache/huggingface"      # Use HuggingFace default cache directory
-      save_format: "jsonl"                   # Format for saved processed data
-      
-      # Common processing settings
-      shuffle_datasets: true                 # Shuffle datasets before mixing
-      seed: 42                               # Random seed for reproducibility
-      
-      # Memory buffer configuration (optimized for GH200 with 400+ GB RAM)
-      use_memory_buffer: false               # Disable buffer for preprocessing (use efficient streaming)
-      buffer_size_mb: 200000                 # Buffer size in MB (200GB buffer for GH200)
-      buffer_samples: 5000000                # Number of samples to keep in buffer (5M samples)
-      buffer_refill_threshold: 0.1           # Refill buffer when 10% full (more aggressive)
-      enable_memory_mapping: true            # Use memory mapping for large buffers
-      
-      # Stage 2: Fine-tuning datasets (Task-specific training)
-      finetuning_datasets:
-        # Fine-tuning datasets for specific tasks
-        # Mathematical reasoning
-        "HuggingFaceTB/finemath":
-          percentage: 60.0                     # Math content subset
-          subset: "finemath-3plus"             # Math content subset
-          task_type: "mathematical_reasoning"
-        
-        # General knowledge and reasoning
-        "HuggingFaceFW/fineweb":
-          percentage: 40.0                     # 10 billion token sample
-          subset: "sample-10BT"               # 10 billion token sample
-          task_type: "general_knowledge"
-      
-      # Stage 2 specific processing settings
+      # Processing configuration for ds_processing pipeline
       processing:
-        max_tokens_per_sample: 1024            # Shorter sequences for fine-tuning
-        min_tokens_per_sample: 100             # Longer minimum for task-specific content
-        overlap_tokens: 50                     # Less overlap for fine-tuning
-        total_samples: 100000                  # Total samples for all datasets combined (code calculates per-dataset based on percentages)
-        task_specific_processing: true         # Enable task-specific data processing
+        max_tokens_per_sample: 16384            # Maximum tokens per document (allows full documents with smart chunking)
+        min_tokens_per_sample: 50              # Minimum tokens per training sample
+        overlap_tokens: 200                    # Overlap between consecutive chunks for better training
+        shuffle_datasets: true                 # Shuffle datasets before mixing
+        seed: 42                               # Random seed for reproducibility
+        total_samples: 10000000                 # Total samples for all datasets combined (code calculates per-dataset based on percentages)
         use_processed_datasets: true           # Set to true to use preprocessed datasets (much faster!)
+        save_processed_datasets: true          # Save processed datasets for future use
       
-      # Data loading performance options
-      num_workers: 16                # Number of DataLoader workers (reduced for fine-tuning)
+      # Output configuration for ds_processing pipeline
+      output:
+        processed_data_dir: "data/processed"   # Directory for processed HuggingFace datasets
+        cache_dir: "/tmp/hf_cache"             # Use temporary cache directory
+        save_format: "hf"                      # HuggingFace format for processed data
+      
+      # Stage 2: Fine-tuning datasets
+      pretraining_datasets:
+        # Hugging Face pretraining datasets with percentage allocation
+        "HuggingFaceFW/fineweb":
+          percentage: 60.0                     # High-quality web content dataset
+          subset: "sample-10BT"               # 10 billion token sample
+        
+        # Math and reasoning datasets
+        "HuggingFaceTB/finemath":
+          percentage: 20.0                     # Math content subset
+          subset: "finemath-3plus"             # Math content subset
+        
+        # Curated content
+        "mlfoundations/dclm-baseline-1.0":
+          percentage: 15.0                     # Curated content (streaming works)
+          subset: null                         # 187k tokens - Curated content
+        
+        # Synthetic educational content
+        "HuggingFaceTB/cosmopedia":
+          percentage: 5.0                      # Synthetic textbooks subset
+          subset: "auto_math_text"             # Synthetic textbooks subset
+        
+        # Total: 100.0% (ensures proper allocation)
+      
+      # Data loading performance options (optimized for GH200 with 72 CPU cores)
+      num_workers: 16               # Reduced workers to minimize overhead and contention
       pin_memory: true              # Pin memory for faster GPU transfer
       persistent_workers: true      # Keep workers alive between epochs
-      prefetch_factor: 2            # Prefetch batches for better performance
+      prefetch_factor: 4            # Reduced prefetch to minimize memory overhead
 
     checkpoint_dir: "/home/sureshm/nemoACCfiy/outputs/checkpoints/stage2"
     model_output_dir: "/home/sureshm/nemoACCfiy/outputs/models"

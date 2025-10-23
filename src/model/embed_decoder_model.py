@@ -959,6 +959,58 @@ class LatentPooling(nn.Module):
         else:
             raise NotImplementedError("Supported: mean, max, attention")
 
+class LearnedQueryPooler(nn.Module):
+    """
+    Minimal "learned-query pooler" that uses learned queries to attend to specific token patterns.
+    
+    This replaces simple pooling with cross-attention between learned query vectors and token representations,
+    allowing each reasoning vector to focus on different aspects of the input text.
+    """
+    def __init__(self, hidden_size: int, num_slots: int):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_slots = num_slots
+        
+        # Learned query vectors - each represents a different reasoning aspect
+        self.queries = nn.Parameter(torch.randn(num_slots, hidden_size) * 0.02)
+        
+        # Projection layers for Q, K, V
+        self.proj_q = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.proj_k = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.proj_v = nn.Linear(hidden_size, hidden_size, bias=False)
+
+    def forward(self, token_h, attn_mask=None):
+        """
+        Args:
+            token_h: Token hidden states [B, T, H]
+            attn_mask: Attention mask [B, T] (True for valid tokens, False for padding)
+        Returns:
+            slots: Reasoning vectors [B, N, H]
+        """
+        B, T, H = token_h.shape
+        
+        # Project learned queries to query space
+        Q = self.proj_q(self.queries).unsqueeze(0).expand(B, -1, -1)  # [B, N, H]
+        
+        # Project token hidden states to key and value spaces
+        K = self.proj_k(token_h)  # [B, T, H]
+        V = self.proj_v(token_h)  # [B, T, H]
+
+        # Scaled dot-product attention
+        scores = (Q @ K.transpose(1, 2)) / (H ** 0.5)  # [B, N, T]
+        
+        # Apply attention mask if provided
+        if attn_mask is not None:
+            # attn_mask: [B, T] where True = valid token, False = padding
+            # We need to mask out padding tokens (False values)
+            scores = scores.masked_fill(~attn_mask.unsqueeze(1), float('-inf'))
+        
+        # Compute attention weights and apply to values
+        attn = scores.softmax(dim=-1)  # [B, N, T]
+        slots = attn @ V  # [B, N, H]
+        
+        return slots
+
 class Embedder(nn.Module):
     """
     Embedder that processes tree-structured reasoning/planning text and extracts N reasoning vectors.
@@ -966,21 +1018,26 @@ class Embedder(nn.Module):
     Instead of returning token-level vectors, it extracts N meaningful reasoning components
     from the structured planning tree text.
     """
-    def __init__(self, decoder_config, vocab_size, pool_type='mean', tie_weights=True, num_reasoning_vectors=8):
+    def __init__(self, decoder_config, vocab_size, pool_type='learned_query', tie_weights=True, num_reasoning_vectors=8):
         super().__init__()
         self.decoder_model = LMHeadDecoder(decoder_config, vocab_size, tie_weights=tie_weights)
         hidden_size = decoder_config.hidden_size
-        self.pooler = LatentPooling(pool_type, hidden_size=hidden_size)
         self.num_reasoning_vectors = num_reasoning_vectors
         self.gradient_checkpointing = False
         
-        # Reasoning component extractor - maps hidden states to N reasoning vectors
-        self.reasoning_extractor = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size * 2),
-            nn.ReLU(),
-            nn.Linear(hidden_size * 2, hidden_size * num_reasoning_vectors),
-            nn.Tanh()  # Normalize reasoning vectors
-        )
+        # Use LearnedQueryPooler for better reasoning vector extraction
+        if pool_type == 'learned_query':
+            self.pooler = LearnedQueryPooler(hidden_size, num_reasoning_vectors)
+        else:
+            # Fallback to original pooling methods
+            self.pooler = LatentPooling(pool_type, hidden_size=hidden_size)
+            # Keep the old reasoning extractor for non-learned_query pooling
+            self.reasoning_extractor = nn.Sequential(
+                nn.Linear(hidden_size, hidden_size * 2),
+                nn.ReLU(),
+                nn.Linear(hidden_size * 2, hidden_size * num_reasoning_vectors),
+                nn.Tanh()  # Normalize reasoning vectors
+            )
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory efficiency."""
@@ -998,10 +1055,9 @@ class Embedder(nn.Module):
     def forward(self, embed_input_ids, embed_attention_mask=None):
         # Disable gradient checkpointing for embedder to avoid return format issues
         # The embedder is relatively small compared to the main decoder
-        # Note: Not using attention_mask to avoid mask-related issues
         result = self.decoder_model(
             input_ids=embed_input_ids,
-            attention_mask=None,  # Remove mask usage
+            attention_mask=embed_attention_mask,  # Now properly use attention mask
             return_hidden_states=True,
             is_causal=False,  # Embedder uses bidirectional attention (full context)
         )
@@ -1017,19 +1073,19 @@ class Embedder(nn.Module):
         else:
             raise ValueError(f"Expected tuple return, got {type(result)}")
         
-        # Extract N reasoning vectors from the tree-structured planning text
-        # First pool the hidden states to get a sequence-level representation
-        pooled_hidden = self.pooler(hidden, mask=None)  # (B, hidden)
-        
-        # Extract N reasoning component vectors
-        reasoning_vectors = self.reasoning_extractor(pooled_hidden)  # (B, hidden * num_reasoning_vectors)
-        
-        # Reshape to (B, num_reasoning_vectors, hidden)
-        reasoning_vectors = reasoning_vectors.view(
-            reasoning_vectors.size(0), 
-            self.num_reasoning_vectors, 
-            -1
-        )  # (B, N, hidden)
+        # Extract N reasoning vectors using the appropriate pooling method
+        if isinstance(self.pooler, LearnedQueryPooler):
+            # Use LearnedQueryPooler for better reasoning vector extraction
+            reasoning_vectors = self.pooler(hidden, embed_attention_mask)  # (B, N, H)
+        else:
+            # Fallback to original approach for other pooling methods
+            pooled_hidden = self.pooler(hidden, mask=embed_attention_mask)  # (B, H)
+            reasoning_vectors = self.reasoning_extractor(pooled_hidden)  # (B, H * N)
+            reasoning_vectors = reasoning_vectors.view(
+                reasoning_vectors.size(0), 
+                self.num_reasoning_vectors, 
+                -1
+            )  # (B, N, H)
         
         return reasoning_vectors  # N reasoning vectors per batch
 
@@ -1274,16 +1330,19 @@ class ModularModel(nn.Module):
         
         # Stage 2: Full training with cross-attention
         # (B, N, hidden) - N reasoning vectors from embedder representing different reasoning components
-        reasoning_vectors = self.embedder(embed_input_ids, embed_attention_mask=None)
+        reasoning_vectors = self.embedder(embed_input_ids, embed_attention_mask=embed_attention_mask)
         
         # Use reasoning vectors as encoder hidden states for cross-attention
         # The decoder can attend to different reasoning components
         encoder_hidden_states = reasoning_vectors  # (B, N, hidden)
+        # Create cross-attention mask for all N reasoning vectors
+        cross_attn_mask = torch.ones((reasoning_vectors.size(0), reasoning_vectors.size(1)), 
+                                   dtype=torch.long, device=reasoning_vectors.device)  # (B, N)
         logits = self.decoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
             encoder_hidden_states=encoder_hidden_states,
-            cross_attn_mask=None,
+            cross_attn_mask=cross_attn_mask,
             is_causal=True,  # Decoder is always causal
         )
         return logits
@@ -1317,10 +1376,10 @@ class ModularModel(nn.Module):
         else:
             # Stage 2: full inference with cross-attention
             # 1) Compute the plan embedding once
-            plan_embed = self.embedder(embed_input_ids, embed_attention_mask=None)  # (B,H) - Not using mask
-            # Use a length-1 "encoder" sequence; repeating per step is fine
-            encoder_hidden_states = plan_embed.unsqueeze(1)  # (B,1,H)
-            cross_attn_mask = torch.ones((B, 1), dtype=torch.long, device=device)
+            plan_embed = self.embedder(embed_input_ids, embed_attention_mask=embed_attention_mask)  # (B,N,H) - N reasoning vectors
+            # Keep all N reasoning vectors for cross-attention
+            encoder_hidden_states = plan_embed  # (B,N,H) - Keep all N reasoning vectors
+            cross_attn_mask = torch.ones((B, plan_embed.size(1)), dtype=torch.long, device=device)  # (B,N)
 
         # 2) Prime the cache by running the full prompt once
         if attention_mask is None:

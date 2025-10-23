@@ -133,36 +133,146 @@ except ImportError:
         pass
 
 
-def collate_fn(batch):
-    """Custom collate function to properly batch the data by stacking tensors."""
+def collate_fn(batch, tokenizer=None, max_length=2048):
+    """
+    Custom collate function to handle HuggingFace dataset batching with tokenization.
+    Handles raw text data by tokenizing it on-the-fly.
+    """
     if not batch:
         return {}
     
-    # If batch is a list of dictionaries, stack them
+    # If batch is a list of dictionaries, process them
     if isinstance(batch, list) and len(batch) > 0 and isinstance(batch[0], dict):
-        batched = {}
-        for key in batch[0].keys():
-            tensors = [item[key] for item in batch]
+        # Check if we have pre-tokenized data (input_ids, attention_mask, labels)
+        if 'input_ids' in batch[0] and 'attention_mask' in batch[0] and 'labels' in batch[0]:
+            # Handle pre-tokenized data
+            batched = {}
+            # Only process training-relevant keys (skip 'id' field)
+            training_keys = [key for key in batch[0].keys() if key in ['input_ids', 'attention_mask', 'labels']]
+            
+            # First, determine the target length for all sequences
+            all_lengths = []
+            for item in batch:
+                for key in training_keys:
+                    if key in item:
+                        all_lengths.append(len(item[key]))
+            
+            # Use the maximum length, but don't exceed max_length
+            target_length = min(max(all_lengths), max_length)
+            
+            for key in training_keys:
+                tensors = [item[key] for item in batch]
+                # Convert lists to tensors if needed
+                for i, tensor in enumerate(tensors):
+                    if isinstance(tensor, list):
+                        tensors[i] = torch.tensor(tensor, dtype=torch.long)
+                
+                # Pad/truncate sequences to target_length
+                padded_tensors = []
+                for tensor in tensors:
+                    if len(tensor) > target_length:
+                        # Truncate if too long
+                        padded_tensor = tensor[:target_length]
+                    else:
+                        # Pad if too short
+                        pad_length = target_length - len(tensor)
+                        if key == 'input_ids':
+                            # Pad with 0 (pad token)
+                            padded_tensor = torch.cat([tensor, torch.full((pad_length,), 0, dtype=torch.long)])
+                        elif key == 'attention_mask':
+                            # Pad attention mask with 0s
+                            padded_tensor = torch.cat([tensor, torch.zeros(pad_length, dtype=torch.long)])
+                        elif key == 'labels':
+                            # Pad labels with -100 (ignore index)
+                            padded_tensor = torch.cat([tensor, torch.full((pad_length,), -100, dtype=torch.long)])
+                        else:
+                            padded_tensor = torch.cat([tensor, torch.zeros(pad_length, dtype=torch.long)])
+                    padded_tensors.append(padded_tensor)
+                
+                batched[key] = torch.stack(padded_tensors, dim=0)
+            return batched
+        # Check if we have text that needs tokenization
+        elif 'text' in batch[0] and isinstance(batch[0]['text'], str):
+            # Extract text from batch
+            texts = [item.get('text', '') for item in batch]
+            
+            if tokenizer is not None:
+                # Tokenize the texts
+                tokenized = tokenizer(
+                    texts,
+                    padding=True,
+                    truncation=True,
+                    max_length=max_length,
+                    return_tensors='pt'
+                )
+                
+                # Create labels (shifted input_ids for next token prediction)
+                input_ids = tokenized['input_ids']
+                attention_mask = tokenized['attention_mask']
+                
+                # Create labels by shifting input_ids
+                labels = input_ids.clone()
+                labels[:, :-1] = input_ids[:, 1:]  # Shift right
+                labels[:, -1] = -100  # Ignore last token in loss calculation
+                
+                return {
+                    'input_ids': input_ids,
+                    'attention_mask': attention_mask,
+                    'labels': labels
+                }
+            else:
+                # Fallback: try to stack existing tensors
+                batched = {}
+                for key in batch[0].keys():
+                    tensors = [item[key] for item in batch]
+                    # Convert lists to tensors if needed
+                    for i, tensor in enumerate(tensors):
+                        if isinstance(tensor, list):
+                            tensors[i] = torch.tensor(tensor, dtype=torch.long)
+                    batched[key] = torch.stack(tensors, dim=0)
+                return batched
+        else:
+            # Handle other pre-tokenized data formats
+            batched = {}
+            for key in batch[0].keys():
+                tensors = [item[key] for item in batch]
+                # Convert lists to tensors if needed
+                for i, tensor in enumerate(tensors):
+                    if isinstance(tensor, list):
+                        tensors[i] = torch.tensor(tensor, dtype=torch.long)
             batched[key] = torch.stack(tensors, dim=0)
         return batched
     
     # If batch is already a dictionary, it means the default collate already processed it
-    # but incorrectly (concatenated instead of stacked)
     if isinstance(batch, dict):
-        # The default collate concatenated tensors, we need to reshape them
-        batched = {}
-        for key, tensor in batch.items():
-            # Reshape from (batch_size * seq_len,) to (batch_size, seq_len)
-            # We know the sequence length is 512 from our dataset
-            seq_len = 512
-            batch_size = tensor.size(0) // seq_len
-            if batch_size > 0:
-                batched[key] = tensor.view(batch_size, seq_len)
-            else:
-                # If reshaping fails, add a batch dimension
-                batched[key] = tensor.unsqueeze(0)
-        return batched
+        # Check if we have text that needs tokenization
+        if 'text' in batch and isinstance(batch['text'], list):
+            texts = batch['text']
+            if tokenizer is not None:
+                tokenized = tokenizer(
+                    texts,
+                    padding=True,
+                    truncation=True,
+                    max_length=max_length,
+                    return_tensors='pt'
+                )
+                
+                input_ids = tokenized['input_ids']
+                attention_mask = tokenized['attention_mask']
+                labels = input_ids.clone()
+                labels[:, :-1] = input_ids[:, 1:]
+                labels[:, -1] = -100
+                
+                return {
+                    'input_ids': input_ids,
+                    'attention_mask': attention_mask,
+                    'labels': labels
+                }
+        
+        # If already tokenized, return as is
+        return batch
     
+    # Fallback to default collate
     return batch
 
 
@@ -366,6 +476,10 @@ class ModularModelTrainingModule(pl.LightningModule):
         with torch.no_grad():
             if self.stage == "stage1":
                 # Stage 1: Next token prediction
+                # Debug: log batch keys
+                logging.debug(f"Validation batch keys: {list(batch.keys())}")
+                logging.debug(f"Validation batch shapes: {[(k, v.shape if hasattr(v, 'shape') else type(v)) for k, v in batch.items()]}")
+                
                 input_ids = batch["input_ids"]
                 labels = batch["labels"]
                 attention_mask = batch["attention_mask"]
@@ -1057,24 +1171,41 @@ def train_production_mode(
     # Load configuration
     config = create_nemo_config_from_existing(model_config_key, stage, base_path)
     
-    # Override parameters if provided (but don't override with None values)
+    # Override parameters if provided (but don't override with None values or defaults)
+    # Only override if the value is explicitly provided and different from config
     for key, value in kwargs.items():
         if key in config and value is not None:
+            # Log when overriding config values
+            if config[key] != value:
+                logging.info(f"🔄 Overriding config {key}: {config[key]} → {value}")
             config[key] = value
     
-    # Set default values for missing keys
+    # Set default values for missing keys (only if not provided via command line)
     if "devices" not in config:
-        config["devices"] = devices or 1
+        config["devices"] = devices if devices is not None else 1
     if "precision" not in config:
-        config["precision"] = precision or "bf16-mixed"
+        config["precision"] = precision if precision is not None else "bf16-mixed"
     if "batch_size" not in config:
-        batch_size_arg = kwargs.get("batch_size", 4)
+        batch_size_arg = kwargs.get("batch_size")
         config["batch_size"] = batch_size_arg if batch_size_arg is not None else 4
     if "learning_rate" not in config:
-        lr_arg = kwargs.get("learning_rate", 1e-5)
+        lr_arg = kwargs.get("learning_rate")
         config["learning_rate"] = lr_arg if lr_arg is not None else 1e-5
     if "checkpoint_dir" not in config:
         config["checkpoint_dir"] = "outputs/checkpoints"
+    
+    # Log final configuration values being used
+    logging.info(f"🎯 Final Configuration Values:")
+    logging.info(f"   batch_size: {config.get('batch_size')}")
+    logging.info(f"   learning_rate: {config.get('learning_rate')}")
+    logging.info(f"   devices: {config.get('devices')}")
+    logging.info(f"   precision: {config.get('precision')}")
+    logging.info(f"   sequence_length: {config.get('sequence_length')}")
+    logging.info(f"   gradient_accumulation_steps: {config.get('gradient_accumulation_steps')}")
+    logging.info(f"   num_workers: {config.get('num_workers')}")
+    logging.info(f"   pin_memory: {config.get('pin_memory')}")
+    logging.info(f"   persistent_workers: {config.get('persistent_workers')}")
+    logging.info(f"   prefetch_factor: {config.get('prefetch_factor')}")
     
     # Create model - ensure stage parameter is passed for correct model selection
     config["training_stage"] = stage  # Add the stage parameter to config
@@ -1084,152 +1215,238 @@ def train_production_mode(
     vocab_size = config["vocab_size"]
     data_path = config.get("data_path", None)
     tokenizer_path = config.get("tokenizer_path", "Qwen/Qwen3-Coder-30B-A3B-Instruct")
-    # Read use_processed_datasets from config, fall back to kwargs, then default
-    use_processed_datasets = kwargs.get("use_processed_datasets") if kwargs.get("use_processed_datasets") is not None else config.get("use_processed_datasets", False)
-    # Read max_samples from config, fall back to kwargs, then default
-    total_samples = kwargs.get("total_samples") if kwargs.get("total_samples") is not None else config.get("max_samples", 10000)
+    # Use NeMo HFDatasetDataModule with proper data processing pipeline
+    logging.info("🚀 Using NeMo HFDatasetDataModule with ds_processing pipeline")
     
-    train_data = None
-    val_data = None
+    # Load the processed dataset (already tokenized and chunked by DatasetProcessor)
+    hf_dataset_path = f"data/{stage}/processed/combined_dataset"
     
-    # Try to use processed datasets first
-    if use_processed_datasets:
+    if not os.path.exists(hf_dataset_path):
+        logging.info("HuggingFace dataset not found. Running data processing pipeline...")
+        
+        # Use the ds_processing pipeline to create the dataset
+        from src.ds_processing.dataset_processor import DatasetProcessor
+        
+        # Get total samples from stage-specific data config
+        data_config = config.get("data", {})
+        processing_config = data_config.get("processing", {})
+        total_samples = processing_config.get("total_samples", 10000000)
+        logging.info(f"📊 Using total_samples: {total_samples} from config")
+        
+        # Create a temporary config file for the ds_processing pipeline
+        # The DatasetProcessor expects a specific config structure
+        import tempfile
+        import yaml
+        
+        # Create the config structure that DatasetProcessor expects
+        ds_processing_config = {
+            "datasets": {
+                "processing": config.get("data", {}).get("processing", {}),
+                "output": config.get("data", {}).get("output", {}),
+                "pretraining_datasets": config.get("data", {}).get("pretraining_datasets", {})
+            }
+        }
+        
+        # Write temporary config file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            yaml.dump(ds_processing_config, f)
+            temp_config_path = f.name
+        
         try:
-            # Check for HuggingFace format dataset first (from preprocessing script)
-            hf_dataset_path = f"data/{stage}/processed/combined_dataset"
-            if os.path.exists(hf_dataset_path):
-                logging.info(f"Loading preprocessed HuggingFace dataset from: {hf_dataset_path}")
-                from datasets import load_from_disk
-                hf_dataset = load_from_disk(hf_dataset_path)
-                all_data = [{"text": sample["text"], "id": sample["id"]} for sample in hf_dataset]
-                logging.info(f"Loaded {len(all_data)} samples from preprocessed dataset")
-            else:
-                # Fallback to old JSONL format
-                processed_data_path = f"data/processed/training_data.jsonl"
-                if os.path.exists(processed_data_path):
-                    logging.info(f"Loading processed dataset from: {processed_data_path}")
-                    all_data = load_processed_dataset(processed_data_path)
-                else:
-                    logging.info("Processed dataset not found. Processing datasets for training...")
-                    processed_data_path = process_datasets_for_training(
-                        config_path="configs/config.yaml",
-                        output_filename="training_data",
-                        total_samples=total_samples,
-                        base_path=base_path
-                    )
-                    all_data = load_processed_dataset(processed_data_path)
-            
-            # Split into train/validation (90/10 split)
-            split_idx = int(len(all_data) * 0.9)
-            train_data = all_data[:split_idx]
-            val_data = all_data[split_idx:]
-            
-            logging.info(f"Loaded {len(train_data)} training samples and {len(val_data)} validation samples from processed datasets")
-        except Exception as e:
-            logging.warning(f"Failed to load processed datasets: {e}. Trying real dataset...")
-            train_data = None
-            val_data = None
+            # Process datasets using the ds_processing pipeline
+            processor = DatasetProcessor(temp_config_path)
+            processor.process_all_datasets(
+                total_samples=total_samples,
+                output_filename="combined_dataset"
+            )
+        finally:
+            # Clean up temporary config file
+            os.unlink(temp_config_path)
+        
+        logging.info("✅ Data processing pipeline completed!")
     
-    # Try HuggingFace datasets if processed datasets are disabled and no real dataset path
-    if train_data is None and not use_processed_datasets and (not data_path or not os.path.exists(data_path)):
-        if HF_DATASETS_AVAILABLE:
-            logging.info("Using HuggingFace datasets for training...")
-            try:
-                # Use HuggingFace dataset loader with stage parameter
-                hf_loader = HuggingFaceDatasetLoader("configs/config.yaml", stage=stage)
-                
-                # Use the new streaming create_training_data method for memory efficiency
-                training_samples = hf_loader.create_training_data(total_samples=total_samples)
-                
-                # Convert to the format expected by BasicDataset
-                all_data = []
-                logging.info(f"Converting {len(training_samples)} samples from HuggingFace datasets...")
-                
-                for i, sample in enumerate(training_samples):
-                    # Debug: log the first sample structure
-                    if i == 0:
-                        logging.info(f"Sample structure: {list(sample.keys())}")
-                        logging.info(f"Sample keys: {list(sample.keys())}")
-                    
-                    # The create_training_data method returns samples with 'text' field
-                    text = sample.get('text', '')
-                    if text:
-                        # Tokenize the text using the tokenizer
-                        tokenizer = hf_loader.tokenizer
-                        tokens = tokenizer.encode(text, add_special_tokens=True, truncation=True, max_length=2048)
-                        all_data.append({
-                            "input_ids": tokens,
-                            "embed_input_ids": tokens  # For stage2 compatibility
-                        })
-                    
-                    # Log progress for large datasets
-                    if (i + 1) % 10000 == 0:
-                        logging.info(f"Converted {i + 1}/{len(training_samples)} samples...")
-                
-                logging.info(f"Converted {len(all_data)} samples to training format")
-                
-                if all_data:
-                    # Split into train/validation (80/20 split)
-                    split_idx = int(len(all_data) * 0.8)
-                    train_data = all_data[:split_idx]
-                    val_data = all_data[split_idx:]
-                    
-                    logging.info(f"Loaded {len(train_data)} training samples and {len(val_data)} validation samples from HuggingFace datasets")
-                else:
-                    logging.warning("No data loaded from HuggingFace datasets")
-                    
-            except Exception as e:
-                logging.warning(f"Failed to load HuggingFace datasets: {e}")
-                train_data = None
-                val_data = None
+    # Load the processed HuggingFace dataset and tokenize it completely
+    logging.info(f"📂 Loading processed HuggingFace dataset from: {hf_dataset_path}")
+    from datasets import load_from_disk
+    hf_dataset = load_from_disk(hf_dataset_path)
+    logging.info(f"✅ Loaded processed dataset with {len(hf_dataset)} samples")
+    logging.info(f"📊 Dataset features: {list(hf_dataset.features.keys())}")
     
-    # Fallback to real dataset if processed datasets failed
-    if train_data is None and data_path and os.path.exists(data_path):
-        logging.info(f"Loading real dataset from: {data_path}")
-        try:
-            all_data = load_real_dataset(data_path, tokenizer_path, max_length=config.get("sequence_length", 2048))
-            
-            # Split into train/validation (80/20 split)
-            split_idx = int(len(all_data) * 0.8)
-            train_data = all_data[:split_idx]
-            val_data = all_data[split_idx:]
-            
-            logging.info(f"Loaded {len(train_data)} training samples and {len(val_data)} validation samples from real dataset")
-        except Exception as e:
-            logging.warning(f"Failed to load real dataset: {e}. Using sample data.")
-            train_data = generate_sample_data(vocab_size, 1000)
-            val_data = generate_sample_data(vocab_size, 200)
-    
-    # Final fallback to sample data
-    if train_data is None:
-        logging.info("Using sample data for training.")
-        train_data = generate_sample_data(vocab_size, 1000)
-        val_data = generate_sample_data(vocab_size, 200)
-    
-    # Create datasets
-    # Check if data has 'text' field (preprocessed HF dataset) or 'input_ids' (pre-tokenized)
-    if train_data and len(train_data) > 0 and 'text' in train_data[0] and 'input_ids' not in train_data[0]:
-        # Use HuggingFaceDatasetWrapper for text-based data
-        logging.info("Using HuggingFaceDatasetWrapper for text-based preprocessed data")
+    # Check if dataset is already tokenized (has input_ids)
+    if 'input_ids' in hf_dataset.features:
+        logging.info("🔍 Dataset is already tokenized - using as is")
+        is_tokenized = True
+    else:
+        logging.info("🔄 Dataset contains raw text - tokenizing entire dataset...")
+        logging.info(f"   - Total samples: {len(hf_dataset)}")
+        
+        # Use more workers for tokenization on GH200 (up to 48 workers)
+        tokenization_workers = min(48, config.get('num_workers', 8) * 4)
+        logging.info(f"   - Using {tokenization_workers} workers for tokenization (GH200 optimized)")
+        logging.info(f"   - This may take a few minutes...")
+        
+        # Load tokenizer
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-        train_dataset = HuggingFaceDatasetWrapper(train_data, tokenizer, max_length=config.get("sequence_length", 2048))
-        val_dataset = HuggingFaceDatasetWrapper(val_data, tokenizer, max_length=config.get("sequence_length", 2048))
-    else:
-        # Use BasicDataset for pre-tokenized data
-        logging.info("Using BasicDataset for pre-tokenized data")
-        train_dataset = BasicDataset(train_data, stage=stage)
-        val_dataset = BasicDataset(val_data, stage=stage)
+        
+        # Get sequence length from config
+        seq_length = config.get("sequence_length", 2048)
+        
+        # Define tokenization function
+        def tokenize_function(examples):
+            """Tokenize a batch of examples."""
+            # Tokenize the text
+            tokenized = tokenizer(
+                examples['text'],
+                padding=False,  # We'll pad during collation
+                truncation=True,
+                max_length=seq_length,
+                return_tensors=None  # Return lists, not tensors
+            )
+            
+            # Create labels by shifting input_ids
+            input_ids = tokenized['input_ids']
+            labels = []
+            for ids in input_ids:
+                label = ids[1:] + [-100]  # Shift right and add -100 at the end
+                labels.append(label)
+            
+            return {
+                'input_ids': input_ids,
+                'attention_mask': tokenized['attention_mask'],
+                'labels': labels
+            }
+        
+        # Tokenize the entire dataset
+        hf_dataset = hf_dataset.map(
+            tokenize_function,
+            batched=True,
+            batch_size=2000,  # Larger batches for GH200 efficiency
+            num_proc=tokenization_workers,  # Use optimized number of workers
+            remove_columns=['text'],  # Remove original text column
+            desc='Tokenizing dataset for GH200'
+        )
+        
+        logging.info("✅ Dataset tokenization completed!")
+        logging.info(f"📊 New dataset features: {list(hf_dataset.features.keys())}")
+        is_tokenized = True
     
-    # Ensure batch_size is valid
-    batch_size = config.get("batch_size", 4)
-    if batch_size is None or batch_size == 0:
-        batch_size = 4
-        logging.warning(f"Invalid batch_size ({config.get('batch_size')}), using default value of {batch_size}")
+    # Create PyTorch Lightning DataModule with HuggingFace dataset
+    from lightning.pytorch import LightningDataModule
+    from torch.utils.data import DataLoader
     
-    # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, drop_last=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=8, drop_last=True, collate_fn=collate_fn)
+    # Load tokenizer if not already loaded
+    if 'tokenizer' not in locals():
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+
+    # Create a custom DataModule for HuggingFace datasets
+    class HuggingFaceDataModule(LightningDataModule):
+        def __init__(self, dataset, tokenizer, batch_size=8, seq_length=2048, num_workers=8, pin_memory=True, persistent_workers=True, collate_fn=None, is_tokenized=False, test_size_samples=False):
+            super().__init__()
+            self.dataset = dataset
+            self.tokenizer = tokenizer
+            self.batch_size = batch_size
+            self.seq_length = seq_length
+            self.num_workers = num_workers
+            self.pin_memory = pin_memory
+            self.persistent_workers = persistent_workers
+            self.collate_fn = collate_fn
+            self.is_tokenized = is_tokenized
+            self.test_size_samples = test_size_samples
+            
+            # Split dataset into train/val
+            if self.test_size_samples:
+                total_size = 4096  # Use small test size
+                logging.info(f"🧪 Using test size samples: {total_size}")
+            else:
+                total_size = len(dataset)  # Use full dataset
+                logging.info(f"📊 Using full dataset size: {total_size}")
+            
+            train_size = int(0.9 * total_size)
+            val_size = total_size - train_size
+            
+            self.train_dataset = dataset.select(range(train_size))
+            self.val_dataset = dataset.select(range(train_size, train_size + val_size))
+        
+        def train_dataloader(self):
+            logging.info(f"🔍 Creating train DataLoader with:")
+            logging.info(f"   - batch_size: {self.batch_size}")
+            logging.info(f"   - num_workers: {self.num_workers}")
+            logging.info(f"   - pin_memory: {self.pin_memory}")
+            logging.info(f"   - persistent_workers: {self.persistent_workers}")
+            logging.info(f"   - dataset size: {len(self.train_dataset)}")
+            logging.info(f"   - is_tokenized: {self.is_tokenized}")
+            
+            if self.is_tokenized:
+                # For pre-tokenized data, use a simple collate function
+                def simple_collate_fn(batch):
+                    return collate_fn(batch, tokenizer=None, max_length=self.seq_length)
+                collate_fn_to_use = simple_collate_fn
+            else:
+                # For raw text data, use tokenization collate function
+                def tokenize_collate_fn(batch):
+                    return collate_fn(batch, tokenizer=self.tokenizer, max_length=self.seq_length)
+                collate_fn_to_use = tokenize_collate_fn
+            
+            return DataLoader(
+                self.train_dataset,
+                batch_size=self.batch_size,
+                shuffle=True,
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory,
+                persistent_workers=self.persistent_workers if self.num_workers > 0 else False,
+                collate_fn=collate_fn_to_use
+            )
+        
+        def val_dataloader(self):
+            if self.is_tokenized:
+                # For pre-tokenized data, use a simple collate function
+                def simple_collate_fn(batch):
+                    return collate_fn(batch, tokenizer=None, max_length=self.seq_length)
+                collate_fn_to_use = simple_collate_fn
+            else:
+                # For raw text data, use tokenization collate function
+                def tokenize_collate_fn(batch):
+                    return collate_fn(batch, tokenizer=self.tokenizer, max_length=self.seq_length)
+                collate_fn_to_use = tokenize_collate_fn
+            
+            return DataLoader(
+                self.val_dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory,
+                persistent_workers=self.persistent_workers if self.num_workers > 0 else False,
+                collate_fn=collate_fn_to_use
+            )
+
+    # Create the custom DataModule (always tokenized now)
+    data_module = HuggingFaceDataModule(
+        dataset=hf_dataset,
+        tokenizer=tokenizer,
+        batch_size=config.get("batch_size", 8),
+        seq_length=config.get("sequence_length", 2048),
+        num_workers=config.get("num_workers", 8),
+        pin_memory=config.get("pin_memory", True),
+        persistent_workers=config.get("persistent_workers", True),
+        collate_fn=collate_fn,
+        is_tokenized=True,
+        test_size_samples=config.get("data", {}).get("processing", {}).get("test_size_samples", False)
+        )
+
+    # Get the data loaders from the custom data module
+    train_loader = data_module.train_dataloader()
+    val_loader = data_module.val_dataloader()
+
+    logging.info("✅ Created custom HuggingFace DataModule with fully tokenized dataset")
+    logging.info("🚀 Dataset is completely tokenized - maximum training performance!")
+    logging.info("⚡ No tokenization overhead during training - optimal GPU utilization!")
+    
+    logging.info("✅ Using PyTorch Lightning DataModule with HuggingFace dataset integration!")
+
+    # DataLoaders are already created by custom DataModule
+    logging.info("✅ Using custom HuggingFace DataModule - DataLoaders already created and optimized!")
     
     # Create training module with optimizer and scheduler configs
     training_module = ModularModelTrainingModule(
@@ -1265,8 +1482,12 @@ def train_production_mode(
     # Calculate total steps and adjust intervals if needed
     total_steps = max_epochs * steps_per_epoch
     
-    # Adjust validation interval if it's greater than total steps
-    if val_check_interval_steps > total_steps:
+    # Handle validation interval (0 means disable validation)
+    if val_check_interval_steps == 0:
+        # Disable validation by setting to a very large number
+        val_check_interval_steps = float('inf')
+        logging.info("Validation disabled (val_check_interval_steps = 0)")
+    elif val_check_interval_steps > total_steps:
         val_check_interval_steps = max(1, total_steps // 4)  # Validate 4 times during training
         logging.warning(f"Adjusted val_check_interval from {config.get('val_check_interval_steps', 5000)} to {val_check_interval_steps} (total steps: {total_steps})")
     
@@ -1288,7 +1509,10 @@ def train_production_mode(
     logging.info(f"   - Max epochs: {max_epochs}")
     logging.info(f"   - Total steps: {max_epochs * steps_per_epoch}")
     logging.info(f"   - Save every {save_every_n_steps} steps")
-    logging.info(f"   - Validate every {val_check_interval_steps} steps")
+    if val_check_interval_steps == float('inf'):
+        logging.info(f"   - Validation: DISABLED")
+    else:
+        logging.info(f"   - Validate every {val_check_interval_steps} steps")
     logging.info(f"   - Gradient clipping: {config.get('gradient_clip_val', 1.0)} ({config.get('gradient_clip_algorithm', 'norm')})")
     logging.info(f"   - Checkpoint directory: {config['checkpoint_dir']}")
     logging.info(f"   - Best checkpoints: checkpoint-{{step:06d}}-{{val_loss:.4f}}.ckpt (top {checkpointing_config.get('save_top_k', 3)})")
@@ -1345,6 +1569,25 @@ def train_production_mode(
     max_epochs = training_config.get("epochs", config.get("max_epochs", 2))
     
     # Create trainer with step-based configuration
+    # Create Lightning profiler for performance analysis
+    from lightning.pytorch.profilers import PyTorchProfiler
+    profiler = PyTorchProfiler(
+        dirpath="./profiler_logs",
+        filename="training_profile",
+        export_to_chrome=True,
+        row_limit=100,
+        sort_by_key="cuda_time_total",
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler('./profiler_logs')
+    )
+    
     trainer_kwargs = {
         "devices": devices,
         "num_nodes": num_nodes,
@@ -1352,6 +1595,7 @@ def train_production_mode(
         "strategy": strategy,
         "callbacks": callbacks,
         "logger": logger,
+        "profiler": profiler,
         "gradient_clip_val": config.get("gradient_clip_val", 1.0),
         "gradient_clip_algorithm": config.get("gradient_clip_algorithm", "norm"),
         "max_epochs": max_epochs,  # Always use epochs as primary configuration
@@ -1386,6 +1630,24 @@ def train_production_mode(
                     logging.info(f"🔄 Auto-detected latest checkpoint: {checkpoint_path}")
     
     # Train with resume capability
+    # Only include validation dataloader if validation is enabled
+    if val_check_interval_steps == float('inf'):
+        # Validation disabled - don't pass val_loader
+        logging.info("🚀 Starting training without validation...")
+        if checkpoint_path:
+            logging.info(f"🔄 Resuming training from checkpoint: {checkpoint_path}")
+            try:
+                trainer.fit(training_module, train_loader, ckpt_path=checkpoint_path)
+            except Exception as e:
+                logging.warning(f"Failed to resume from checkpoint {checkpoint_path}: {e}")
+                logging.info("Starting training from scratch...")
+                trainer.fit(training_module, train_loader)
+        else:
+            logging.info("🚀 Starting training from scratch...")
+            trainer.fit(training_module, train_loader)
+    else:
+        # Validation enabled - include val_loader
+        logging.info("🚀 Starting training with validation...")
     if checkpoint_path:
         logging.info(f"🔄 Resuming training from checkpoint: {checkpoint_path}")
         try:
@@ -1501,18 +1763,18 @@ def main():
                        help="Training stage")
     
     
-    parser.add_argument("--batch_size", type=int, default=4,
-                       help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=None,
+                       help="Batch size (uses config value if not specified)")
     
     parser.add_argument("--learning_rate", type=float, default=None,
                        help="Learning rate")
     
-    parser.add_argument("--devices", type=int, default=1,
-                       help="Number of devices")
+    parser.add_argument("--devices", type=int, default=None,
+                       help="Number of devices (uses config value if not specified)")
     
-    parser.add_argument("--precision", type=str, default="bf16-mixed",
+    parser.add_argument("--precision", type=str, default=None,
                        choices=["16-mixed", "32", "bf16-mixed"],
-                       help="Training precision")
+                       help="Training precision (uses config value if not specified)")
     
     # Resume training arguments
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
@@ -1645,33 +1907,55 @@ def main():
                     use_processed_datasets = config.get("use_processed_datasets", False)
                 
                 # Use PyTorch Lightning backend
-                trainer, module = train_production_mode(
-                    model_config_key=args.model_config,
-                    stage=args.stage,
-                    devices=args.devices,
-                    precision=args.precision,
-                    learning_rate=args.learning_rate,
-                    batch_size=args.batch_size,
-                    resume_from_checkpoint=resume_from_checkpoint,
-                    use_processed_datasets=use_processed_datasets,
-                    total_samples=args.total_samples
-                )
+                # Only pass arguments that are explicitly provided (not None)
+                train_kwargs = {
+                    "model_config_key": args.model_config,
+                    "stage": args.stage,
+                    "resume_from_checkpoint": resume_from_checkpoint,
+                    "use_processed_datasets": use_processed_datasets,
+                }
+                
+                # Only add arguments that are explicitly provided
+                if args.devices is not None:
+                    train_kwargs["devices"] = args.devices
+                if args.precision is not None:
+                    train_kwargs["precision"] = args.precision
+                if args.learning_rate is not None:
+                    train_kwargs["learning_rate"] = args.learning_rate
+                if args.batch_size is not None:
+                    train_kwargs["batch_size"] = args.batch_size
+                if args.total_samples is not None:
+                    train_kwargs["total_samples"] = args.total_samples
+                
+                trainer, module = train_production_mode(**train_kwargs)
             elif training_backend == "megatron":
                 # Use NeMo Megatron backend
-                trainer, module = train_megatron_mode_wrapper(
-                    model_config_key=args.model_config,
-                    stage=args.stage,
-                    data_path=args.data_path,
-                    tokenizer_path=args.tokenizer_path,
-                    max_length=args.max_length,
-                    learning_rate=args.learning_rate,
-                    batch_size=args.batch_size or 8,
-                    devices=args.devices,
-                    precision=args.precision,
-                    resume_from_checkpoint=resume_from_checkpoint,
-                    hf_dataset_name=args.data_path,  # Use data_path as dataset name for HF datasets
-                    max_samples=args.total_samples
-                )
+                # Only pass arguments that are explicitly provided (not None)
+                megatron_kwargs = {
+                    "model_config_key": args.model_config,
+                    "stage": args.stage,
+                    "resume_from_checkpoint": resume_from_checkpoint,
+                }
+                
+                # Only add arguments that are explicitly provided
+                if args.data_path is not None:
+                    megatron_kwargs["data_path"] = args.data_path
+                if args.tokenizer_path is not None:
+                    megatron_kwargs["tokenizer_path"] = args.tokenizer_path
+                if args.max_length is not None:
+                    megatron_kwargs["max_length"] = args.max_length
+                if args.learning_rate is not None:
+                    megatron_kwargs["learning_rate"] = args.learning_rate
+                if args.batch_size is not None:
+                    megatron_kwargs["batch_size"] = args.batch_size
+                if args.devices is not None:
+                    megatron_kwargs["devices"] = args.devices
+                if args.precision is not None:
+                    megatron_kwargs["precision"] = args.precision
+                if args.total_samples is not None:
+                    megatron_kwargs["max_samples"] = args.total_samples
+                
+                trainer, module = train_megatron_mode_wrapper(**megatron_kwargs)
         
         
         

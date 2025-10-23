@@ -445,6 +445,12 @@ class DatasetProcessor:
             samples_list = list(samples)
             with open(output_path, 'w', encoding='utf-8') as f:
                 json.dump(samples_list, f, ensure_ascii=False, indent=2)
+        elif self.processing_config.save_format == "hf":
+            # Save as HuggingFace dataset format
+            samples_list = list(samples)
+            hf_dataset = Dataset.from_list(samples_list)
+            hf_dataset.save_to_disk(output_path)
+            self.logger.info(f"✅ Saved HuggingFace dataset with {len(hf_dataset)} samples to: {output_path}")
         else:
             raise ValueError(f"Unsupported save format: {self.processing_config.save_format}")
         

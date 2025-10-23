@@ -273,6 +273,19 @@ class ConfigLoader:
             "data_path": training_config.get("data", {}).get("data_path", ""),
             "max_samples": training_config.get("data", {}).get("max_samples", None),
             
+            # Data loading performance parameters
+            "num_workers": training_config.get("data", {}).get("num_workers", 4),
+            "pin_memory": training_config.get("data", {}).get("pin_memory", True),
+            "persistent_workers": training_config.get("data", {}).get("persistent_workers", True),
+            "prefetch_factor": training_config.get("data", {}).get("prefetch_factor", 2),
+            
+            # Additional data configuration
+            "use_processed_datasets": training_config.get("data", {}).get("processing", {}).get("use_processed_datasets", False),
+            "total_samples": training_config.get("data", {}).get("processing", {}).get("total_samples", None),
+            
+            # Include the entire data section for training script compatibility
+            "data": training_config.get("data", {}),
+            
             # Megatron HuggingFace dataset settings
             "megatron_use_hf_datasets": training_config.get("data", {}).get("megatron_use_hf_datasets", True),
             "megatron_hf_dataset_name": training_config.get("data", {}).get("megatron_hf_dataset_name", "mlfoundations/dclm-baseline-1.0"),
