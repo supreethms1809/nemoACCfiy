@@ -587,13 +587,13 @@ class ModularModelTrainingModule(pl.LightningModule):
         
         # Create scheduler based on configuration
         scheduler_type = self.scheduler_config.get("type", "LinearLR")
-        warmup_steps = self.scheduler_config.get("warmup_steps", self.warmup_steps)
+        warmup_steps = int(self.scheduler_config.get("warmup_steps", self.warmup_steps))
         
         if scheduler_type == "LinearLR":
             scheduler = torch.optim.lr_scheduler.LinearLR(
                 optimizer,
-                start_factor=self.scheduler_config.get("start_factor", 0.1),
-                end_factor=self.scheduler_config.get("end_factor", 1.0),
+                start_factor=float(self.scheduler_config.get("start_factor", 0.1)),
+                end_factor=float(self.scheduler_config.get("end_factor", 1.0)),
                 total_iters=warmup_steps
             )
         elif scheduler_type == "CosineAnnealingLR":
@@ -603,16 +603,16 @@ class ModularModelTrainingModule(pl.LightningModule):
                 # Create warmup scheduler
                 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
                     optimizer,
-                    start_factor=0.1,
-                    end_factor=1.0,
+                    start_factor=float(self.scheduler_config.get("start_factor", 0.1)),
+                    end_factor=float(self.scheduler_config.get("end_factor", 1.0)),
                     total_iters=warmup_steps
                 )
                 
                 # Create cosine annealing scheduler
                 cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                     optimizer,
-                    T_max=self.scheduler_config.get("T_max", 100000) - warmup_steps,
-                    eta_min=self.scheduler_config.get("eta_min", 1e-7)
+                    T_max=int(self.scheduler_config.get("T_max", 100000)) - warmup_steps,
+                    eta_min=float(self.scheduler_config.get("eta_min", 1e-7))
                 )
                 
                 # Combine warmup and cosine annealing
@@ -625,14 +625,14 @@ class ModularModelTrainingModule(pl.LightningModule):
                 # No warmup, just cosine annealing
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                     optimizer,
-                    T_max=self.scheduler_config.get("T_max", 100000),
-                    eta_min=self.scheduler_config.get("eta_min", 1e-7)
+                    T_max=int(self.scheduler_config.get("T_max", 100000)),
+                    eta_min=float(self.scheduler_config.get("eta_min", 1e-7))
                 )
         elif scheduler_type == "StepLR":
             scheduler = torch.optim.lr_scheduler.StepLR(
                 optimizer,
-                step_size=self.scheduler_config.get("step_size", 1000),
-                gamma=self.scheduler_config.get("gamma", 0.1)
+                step_size=int(self.scheduler_config.get("step_size", 1000)),
+                gamma=float(self.scheduler_config.get("gamma", 0.1))
             )
         else:
             raise ValueError(f"Unsupported scheduler type: {scheduler_type}")
@@ -1579,7 +1579,7 @@ def train_production_mode(
     # Use step-based checkpointing (direct step intervals)
     step_checkpoint = ModelCheckpoint(
         dirpath=config["checkpoint_dir"],
-        filename=checkpointing_config.get("filename", "checkpoint-{step:06d}-{val_loss:.4f}"),
+        filename="checkpoint-{step:06d}",  # Removed val_loss to avoid type errors when val hasn't run
         monitor=checkpointing_config.get("monitor", "val_loss"),
         mode=checkpointing_config.get("mode", "min"),
         save_top_k=checkpointing_config.get("save_top_k", 3),
