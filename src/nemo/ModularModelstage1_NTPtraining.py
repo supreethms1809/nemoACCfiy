@@ -899,6 +899,44 @@ def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None):
     )
 
 
+def setup_config_file(config_path: str):
+    """Setup configuration from specified config file path."""
+    import shutil
+    
+    # Handle different input formats
+    if config_path == "basic" or config_path == "config.yaml":
+        # Use existing config.yaml without copying
+        logging.info("✅ Using existing config.yaml configuration!")
+        return
+    
+    # Determine the actual config file path
+    if config_path.startswith("configs/"):
+        # Full path provided
+        config_file = config_path
+    elif config_path.endswith(".yaml") or config_path.endswith(".yml"):
+        # Just filename provided
+        config_file = f"configs/{config_path}"
+    else:
+        # Assume it's a config name without extension
+        config_file = f"configs/{config_path}.yaml"
+    
+    # Extract config name for logging
+    config_name = os.path.basename(config_file).replace('.yaml', '').replace('.yml', '')
+    
+    logging.info(f"🚀 Setting up {config_name} configuration...")
+    
+    # Check if config exists
+    if not os.path.exists(config_file):
+        logging.error(f"❌ Config file not found: {config_file}")
+        logging.error(f"💡 Make sure the file exists or provide the correct path")
+        return
+    
+    # Copy config to active config
+    logging.info(f"📝 Copying {config_name} config to active config...")
+    shutil.copy(config_file, 'configs/config.yaml')
+    logging.info(f"✅ {config_name.capitalize()} configuration ready!")
+
+
 def create_strategy(distributed_config: dict):
     """Create the appropriate training strategy based on configuration."""
     if not LIGHTNING_AVAILABLE:
@@ -1777,6 +1815,10 @@ def main():
                        choices=["lightning", "megatron"],
                        help="Training backend for production mode: lightning (PyTorch Lightning) or megatron (NeMo Megatron). If not specified, reads from config.")
     
+    # Config file argument
+    parser.add_argument("--config", type=str, default="config_production.yaml",
+                       help="Config file path (e.g., config_production.yaml, configs/my_config.yaml, or full path)")
+    
     # Common arguments
     parser.add_argument("--stage", type=str, default="stage1",
                        choices=["stage0", "stage1", "stage2"],
@@ -1843,6 +1885,10 @@ def main():
     
     # Setup logging
     setup_logging(args.log_level, args.log_file)
+    
+    # Setup configuration file if specified
+    if hasattr(args, 'config') and args.config:
+        setup_config_file(args.config)
     
     # Log training mode selection
     logging.info("="*60)
