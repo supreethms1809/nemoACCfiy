@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 class TokenizerManager:
     """Manages tokenizer downloading, customization, and caching."""
     
-    def __init__(self, cache_dir: str = "tokenizers", base_model: str = "Qwen/Qwen3-Coder-480B-A35B-Instruct"):
+    def __init__(self, cache_dir: str = "tokenizers", base_model: str = "Qwen/Qwen3-Coder-30B-A3B-Instruct"):
         """
         Initialize the tokenizer manager.
         

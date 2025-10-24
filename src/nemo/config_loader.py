@@ -47,43 +47,49 @@ class ConfigLoader:
         self._tokenizer = None
         self._vocab_size = None
     
-    def get_vocab_size(self, tokenizer_path: str = "tokenizers/qwen3-coder-30b-a3b-instruct-custom") -> int:
+    def get_vocab_size(self, tokenizer_path: str = "Qwen/Qwen3-Coder-30B-A3B-Instruct") -> int:
         """
-        Get vocabulary size dynamically from tokenizer.
+        Get vocabulary size dynamically from tokenizer using smart loading.
+        
+        Smart loading logic:
+        1. First run: Downloads from HuggingFace, adds custom tokens, saves locally
+        2. Subsequent runs: Uses local tokenizer for faster loading
+        3. Fallback: If local tokenizer is corrupted/missing, re-downloads
         
         Args:
-            tokenizer_path: Path to the tokenizer (local or HuggingFace model name)
+            tokenizer_path: Expected local path for the tokenizer
             
         Returns:
             Vocabulary size
         """
         if not TOKENIZER_AVAILABLE:
-            print("Warning: transformers not available, using default vocab_size: 151676")
-            return 151676
+            print("Warning: transformers not available, using default vocab_size: 151677")
+            return 151677
         
         # Check if we have a cached vocab size
         if self._vocab_size is not None:
             return self._vocab_size
         
         try:
-            # Try local tokenizer first
-            local_path = self.base_path / tokenizer_path
-            if local_path.exists():
-                self._tokenizer = AutoTokenizer.from_pretrained(str(local_path))
-                print(f"✅ Loaded local tokenizer from: {local_path}")
-            else:
-                # Fallback to HuggingFace model
-                self._tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-Coder-30B-A3B-Instruct")
-                print(f"✅ Loaded tokenizer from HuggingFace: Qwen/Qwen3-Coder-30B-A3B-Instruct")
+            # Use smart tokenizer loading system
+            from src.utils.tokenizer_manager import get_tokenizer_with_caching
+            
+            print(f"🔄 Loading tokenizer with smart caching system...")
+            self._tokenizer = get_tokenizer_with_caching(
+                tokenizer_path=tokenizer_path,
+                custom_tokens=None,  # Use default special tokens
+                force_download=False,
+                cache_dir="tokenizers"
+            )
             
             self._vocab_size = len(self._tokenizer)
             print(f"📊 Dynamic vocab_size: {self._vocab_size}")
             return self._vocab_size
             
         except Exception as e:
-            print(f"❌ Error loading tokenizer: {e}")
-            print("Using default vocab_size: 151676")
-            self._vocab_size = 151676
+            print(f"❌ Error loading tokenizer with smart system: {e}")
+            print("Using default vocab_size: 151677")
+            self._vocab_size = 151677
             return self._vocab_size
     
     def load_model_config(self, config_key: str = "model_config_1.8B") -> Dict[str, Any]:

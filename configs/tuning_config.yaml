@@ -1,0 +1,420 @@
+distributed_examples:
+  large_scale_fsdp:
+    devices: 8
+    fsdp:
+      activation_checkpointing: true
+      backward_prefetch: BACKWARD_PRE
+      cpu_offload: true
+      enabled: true
+      forward_prefetch: true
+      limit_all_gathers: true
+      sharding_strategy: FULL_SHARD
+      use_orig_params: false
+    num_nodes: 8
+    strategy: fsdp
+  multi_node_ddp:
+    devices: 8
+    num_nodes: 4
+    strategy: ddp
+    sync_batchnorm: true
+  multi_node_fsdp:
+    devices: 8
+    fsdp:
+      activation_checkpointing: true
+      cpu_offload: true
+      enabled: true
+      sharding_strategy: FULL_SHARD
+    num_nodes: 4
+    strategy: fsdp
+  single_node_fsdp:
+    devices: 1
+    fsdp:
+      activation_checkpointing: true
+      cpu_offload: false
+      enabled: true
+      sharding_strategy: FULL_SHARD
+    num_nodes: 1
+    strategy: fsdp
+global_config:
+  default_batch_size: 8
+  default_checkpoint_dir: outputs/checkpoints
+  default_learning_rate: 1e-5
+  default_log_dir: outputs/logs
+  default_max_epochs: 3
+  default_mixed_precision: bf16
+  default_model_output_dir: outputs/models
+  default_tokenizer_path: Qwen/Qwen3-Coder-30B-A3B-Instruct
+  default_wandb_entity: null
+  default_wandb_project: accfiy
+model_configs:
+  model_config_1.8B:
+    attention_type: vanilla
+    decoder_config:
+      RMSNorm_eps: 1e-06
+      attention_bias: false
+      attention_dropout: 0.0
+      hidden_act: silu
+      hidden_size: 2048
+      initializer_range: 0.02
+      intermediate_size: 6144
+      max_position_embeddings: 40960
+      max_window_layers: 28
+      num_attention_heads: 16
+      num_hidden_layers: 28
+      num_key_value_heads: 8
+      use_cache: true
+    hidden_dropout_prob: 0.0
+    mlp_type: mlp_gated
+    pool_type: attention
+  model_config_15.7B:
+    attention_type: vanilla
+    decoder_config:
+      RMSNorm_eps: 1e-06
+      attention_probs_dropout_prob: 0.1
+      hidden_act: gelu
+      hidden_dropout_prob: 0.1
+      hidden_size: 5120
+      initializer_range: 0.02
+      intermediate_size: 17408
+      max_position_embeddings: 40960
+      num_attention_heads: 40
+      num_hidden_layers: 40
+      num_key_value_heads: 8
+      pad_token_id: 0
+      type_vocab_size: 2
+      use_cache: true
+    hidden_dropout_prob: 0.0
+    mlp_type: mlp_gated
+    pool_type: attention
+  model_config_1B:
+    attention_type: vanilla
+    decoder_config:
+      RMSNorm_eps: 1e-06
+      attention_bias: false
+      attention_dropout: 0.0
+      hidden_act: silu
+      hidden_size: 1536
+      initializer_range: 0.02
+      intermediate_size: 3840
+      max_position_embeddings: 40960
+      max_window_layers: 28
+      num_attention_heads: 24
+      num_hidden_layers: 28
+      num_key_value_heads: 8
+      use_cache: true
+    hidden_dropout_prob: 0.0
+    mlp_type: mlp_gated
+    pool_type: attention
+  model_config_243M:
+    attention_type: vanilla
+    decoder_config:
+      RMSNorm_eps: 1e-05
+      attention_probs_dropout_prob: 0.1
+      hidden_act: gelu
+      hidden_dropout_prob: 0.1
+      hidden_size: 1024
+      initializer_range: 0.02
+      intermediate_size: 1024
+      max_position_embeddings: 512
+      num_attention_heads: 16
+      num_hidden_layers: 12
+      num_key_value_heads: 8
+      pad_token_id: 0
+      type_vocab_size: 2
+      use_cache: true
+    hidden_dropout_prob: 0.0
+    mlp_type: mlp_gated
+    pool_type: attention
+  model_config_32.7B:
+    attention_type: vanilla
+    decoder_config:
+      RMSNorm_eps: 1e-06
+      attention_probs_dropout_prob: 0.1
+      hidden_act: gelu
+      hidden_dropout_prob: 0.1
+      hidden_size: 5120
+      initializer_range: 0.02
+      intermediate_size: 25600
+      max_position_embeddings: 40960
+      num_attention_heads: 64
+      num_hidden_layers: 64
+      num_key_value_heads: 8
+      pad_token_id: 0
+      type_vocab_size: 2
+      use_cache: true
+    hidden_dropout_prob: 0.0
+    mlp_type: mlp_gated
+    pool_type: attention
+  model_config_4.0B:
+    attention_type: vanilla
+    decoder_config:
+      RMSNorm_eps: 1e-06
+      attention_bias: false
+      attention_dropout: 0.0
+      hidden_act: silu
+      hidden_size: 2560
+      initializer_range: 0.02
+      intermediate_size: 9728
+      max_position_embeddings: 40960
+      max_window_layers: 36
+      num_attention_heads: 32
+      num_hidden_layers: 36
+      num_key_value_heads: 8
+      use_cache: true
+    hidden_dropout_prob: 0.0
+    mlp_type: mlp_gated
+    pool_type: attention
+  model_config_8.5B:
+    attention_type: vanilla
+    decoder_config:
+      RMSNorm_eps: 1e-05
+      attention_probs_dropout_prob: 0.1
+      hidden_act: gelu
+      hidden_dropout_prob: 0.1
+      hidden_size: 4096
+      initializer_range: 0.02
+      intermediate_size: 12288
+      max_position_embeddings: 40960
+      num_attention_heads: 32
+      num_hidden_layers: 36
+      num_key_value_heads: 8
+      pad_token_id: 0
+      type_vocab_size: 2
+      use_cache: true
+    hidden_dropout_prob: 0.0
+    mlp_type: mlp_gated
+    pool_type: attention
+  model_config_89M:
+    attention_type: vanilla
+    decoder_config:
+      RMSNorm_eps: 1e-05
+      attention_probs_dropout_prob: 0.1
+      hidden_act: gelu
+      hidden_dropout_prob: 0.1
+      hidden_size: 512
+      initializer_range: 0.02
+      intermediate_size: 512
+      max_position_embeddings: 256
+      num_attention_heads: 8
+      num_hidden_layers: 6
+      num_key_value_heads: 4
+      pad_token_id: 0
+      type_vocab_size: 2
+      use_cache: true
+    hidden_dropout_prob: 0.0
+    mlp_type: mlp_gated
+    pool_type: attention
+training_stages:
+  stage1:
+    checkpoint_dir: /home/sureshm/nemoACCfiy/outputs/checkpoints/stage1
+    data:
+      num_workers: 16
+      output:
+        cache_dir: /tmp/hf_cache
+        processed_data_dir: data/processed
+        save_format: hf
+      persistent_workers: true
+      pin_memory: true
+      prefetch_factor: 4
+      pretraining_datasets:
+        HuggingFaceFW/fineweb:
+          percentage: 60.0
+          subset: sample-10BT
+        HuggingFaceTB/cosmopedia:
+          percentage: 5.0
+          subset: auto_math_text
+        HuggingFaceTB/finemath:
+          percentage: 20.0
+          subset: finemath-3plus
+        mlfoundations/dclm-baseline-1.0:
+          percentage: 15.0
+          subset: null
+      processing:
+        max_tokens_per_sample: 16384
+        min_tokens_per_sample: 50
+        overlap_tokens: 200
+        save_processed_datasets: true
+        seed: 42
+        shuffle_datasets: true
+        test_size_samples: true
+        total_samples: 10000000
+        use_processed_datasets: true
+    distributed:
+      devices: auto
+      fsdp:
+        activation_checkpointing: true
+        backward_prefetch: BACKWARD_PRE
+        cpu_offload: false
+        enabled: true
+        forward_prefetch: true
+        limit_all_gathers: true
+        sharding_strategy: FULL_SHARD
+        use_orig_params: true
+      num_nodes: 1
+      strategy: fsdp
+      sync_batchnorm: false
+    environment:
+      benchmark: true
+      deterministic: false
+      seed: 42
+    logging:
+      debug: false
+      enable_profiling: true
+      log_file: null
+      profiler_log_dir: ./profiler_logs/stage1
+      save_steps: 10000
+      validation_steps: 10000
+    model:
+      disable_flash_attention: false
+      embedder_checkpoint_path: null
+      freeze_embedder_decoder: true
+      model_config_key: model_config_1.8B
+      tie_weights: true
+      tokenizer_path: Qwen/Qwen3-Coder-30B-A3B-Instruct
+      use_flash_attention: true
+    model_output_dir: /home/sureshm/nemoACCfiy/outputs/models
+    model_output_name: stage1_model.pth
+    optimizer:
+      betas:
+      - 0.9
+      - 0.98
+      eps: 1e-6
+      type: AdamW
+      weight_decay: 0.05
+    scheduler:
+      T_max: 80000
+      eta_min: 1e-7
+      frequency: 1
+      interval: step
+      type: CosineAnnealingLR
+      warmup_steps: 5000
+    training:
+      batch_size: 2
+      checkpointing:
+        auto_insert_metric_name: false
+        filename: checkpoint-{step:06d}-{val_loss:.4f}
+        mode: min
+        monitor: val_loss
+        resume_from_checkpoint: null
+        resume_ignore_mismatched_sizes: true
+        save_every_n_steps: 5000
+        save_top_k: 3
+      epochs: 1
+      gradient_accumulation_steps: 4
+      gradient_checkpointing: true
+      gradient_clip_algorithm: value
+      gradient_clip_val: 0.8
+      learning_rate: 4e-5
+      log_every_n_steps: 25
+      max_grad_norm: 0.8
+      mixed_precision: bf16-mixed
+      patience: 10
+      sequence_length: 1024
+      training_backend: lightning
+      val_check_interval_steps: 50000
+    wandb:
+      entity: null
+      group: null
+      notes: null
+      project: accfiy-stage1
+      run_name: null
+      tags:
+      - stage1
+      - pretraining
+      use_wandb: false
+  stage2:
+    checkpoint_dir: /home/sureshm/nemoACCfiy/outputs/checkpoints/stage2
+    data:
+      num_workers: 16
+      output:
+        cache_dir: /tmp/hf_cache
+        processed_data_dir: data/processed
+        save_format: hf
+      persistent_workers: true
+      pin_memory: true
+      prefetch_factor: 4
+      pretraining_datasets:
+        HuggingFaceFW/fineweb:
+          percentage: 60.0
+          subset: sample-10BT
+        HuggingFaceTB/cosmopedia:
+          percentage: 5.0
+          subset: auto_math_text
+        HuggingFaceTB/finemath:
+          percentage: 20.0
+          subset: finemath-3plus
+        mlfoundations/dclm-baseline-1.0:
+          percentage: 15.0
+          subset: null
+      processing:
+        max_tokens_per_sample: 16384
+        min_tokens_per_sample: 50
+        overlap_tokens: 200
+        save_processed_datasets: true
+        seed: 42
+        shuffle_datasets: true
+        total_samples: 10000000
+        use_processed_datasets: true
+    distributed:
+      devices: auto
+      fsdp:
+        activation_checkpointing: true
+        backward_prefetch: BACKWARD_PRE
+        cpu_offload: false
+        enabled: false
+        forward_prefetch: false
+        limit_all_gathers: true
+        sharding_strategy: FULL_SHARD
+        use_orig_params: false
+      num_nodes: 1
+      strategy: auto
+      sync_batchnorm: false
+    logging:
+      debug: false
+      enable_profiling: true
+      log_file: null
+      profiler_log_dir: ./profiler_logs/stage2
+      save_steps: 1000
+      validation_steps: 1000
+    model:
+      disable_flash_attention: false
+      model_config_key: model_config_1.8B
+      tokenizer_path: Qwen/Qwen3-Coder-30B-A3B-Instruct
+      use_flash_attention: true
+    model_output_dir: /home/sureshm/nemoACCfiy/outputs/models
+    model_output_name: stage2_model.pth
+    optimizer:
+      betas:
+      - 0.9
+      - 0.999
+      eps: 1e-8
+      type: AdamW
+      weight_decay: 0.01
+    scheduler:
+      end_factor: 1.0
+      frequency: 1
+      interval: step
+      start_factor: 0.1
+      type: LinearLR
+      warmup_steps: 1000
+    training:
+      batch_size: 16
+      embed_sequence_length: 4096
+      epochs: 2
+      gradient_accumulation_steps: 1
+      gradient_checkpointing: false
+      learning_rate: 5e-6
+      max_grad_norm: 2.5
+      mixed_precision: bf16
+      sequence_length: 1024
+      training_backend: lightning
+    wandb:
+      entity: null
+      group: null
+      notes: null
+      project: accfiy-stage2
+      run_name: null
+      tags:
+      - stage2
+      - finetuning
+      use_wandb: false

@@ -1278,12 +1278,19 @@ def train_production_mode(
     logging.info(f"✅ Loaded processed dataset with {len(hf_dataset)} samples")
     logging.info(f"📊 Dataset features: {list(hf_dataset.features.keys())}")
     
+    # Check if we should use test size samples
+    test_size_samples = config.get("data", {}).get("processing", {}).get("test_size_samples", False)
+    if test_size_samples:
+        # Use only 4096 samples for testing/tuning
+        hf_dataset = hf_dataset.select(range(4096))
+        logging.info(f"🧪 Using test size samples: {len(hf_dataset)}")
+    
     # Check if dataset is already tokenized (has input_ids)
     if 'input_ids' in hf_dataset.features:
         logging.info("🔍 Dataset is already tokenized - using as is")
         is_tokenized = True
     else:
-        logging.info("🔄 Dataset contains raw text - tokenizing entire dataset...")
+        logging.info("🔄 Dataset contains raw text - tokenizing dataset...")
         logging.info(f"   - Total samples: {len(hf_dataset)}")
         
         # Use more workers for tokenization on GH200 (up to 48 workers)
@@ -1372,12 +1379,9 @@ def train_production_mode(
             self.test_size_samples = test_size_samples
             
             # Split dataset into train/val
-            if self.test_size_samples:
-                total_size = 4096  # Use small test size
-                logging.info(f"🧪 Using test size samples: {total_size}")
-            else:
-                total_size = len(dataset)  # Use full dataset
-                logging.info(f"📊 Using full dataset size: {total_size}")
+            # Note: test_size_samples is already applied before tokenization
+            total_size = len(dataset)  # Use actual dataset size
+            logging.info(f"📊 Using dataset size: {total_size}")
             
             train_size = int(0.9 * total_size)
             val_size = total_size - train_size
