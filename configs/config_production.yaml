@@ -189,11 +189,11 @@ training_stages:
       
       # Training duration - optimized for 10M samples with 1B model
       epochs: 1                     # Single epoch for large dataset (10M samples)
-      batch_size: 12             # Increased back to 4 with reduced sequence length
+      batch_size: 16                # Increased to compensate for reduced gradient accumulation
       sequence_length: 1024         # Reduced from 2048 to reduce memory usage
       learning_rate: 4e-5           # Keep current learning rate
       max_grad_norm: 0.8            # Keep current gradient clipping
-      gradient_accumulation_steps: 4 # Reduced back to 2 with larger batch size
+      gradient_accumulation_steps: 2 # Reduced from 4 to minimize overhead
       gradient_checkpointing: true   # Essential for memory efficiency
       mixed_precision: "bf16-mixed"       # Use bf16 for GH200 optimization
       
@@ -211,7 +211,7 @@ training_stages:
         resume_ignore_mismatched_sizes: true  # Ignore size mismatches when resuming
         
       # Training monitoring and control (optimized for large dataset)
-      log_every_n_steps: 25         # Less frequent logging to reduce I/O overhead
+      log_every_n_steps: 100        # Reduced logging frequency to minimize overhead
 
       val_check_interval_steps: 50000   # Reduce validation frequency to minimize overhead
       
@@ -268,7 +268,7 @@ training_stages:
         total_samples: 10000000                 # Total samples for all datasets combined (code calculates per-dataset based on percentages) - Reduced for faster testing
         use_processed_datasets: true           # Set to true to use preprocessed datasets (much faster!)
         save_processed_datasets: true          # Save processed datasets for future use
-        test_size_samples: true               # If true, use only 4096 samples for testing; if false, use full dataset
+        test_size_samples: false               # If true, use only 4096 samples for testing; if false, use full dataset
       
       # Output configuration for ds_processing pipeline
       output:
@@ -301,10 +301,10 @@ training_stages:
         # Total: 100.0% (ensures proper allocation)
       
       # Data loading performance options (optimized for GH200 with 72 CPU cores)
-      num_workers: 16               # Reduced workers to minimize overhead and contention
+      num_workers: 8                # Reduced from 16 to minimize overhead and contention
       pin_memory: true              # Faster GPU transfer
       persistent_workers: true      # Keep workers alive between batches
-      prefetch_factor: 4            # Reduced prefetch to minimize memory overhead
+      prefetch_factor: 2            # Reduced from 4 to minimize memory overhead
 
     checkpoint_dir: "/home/sureshm/nemoACCfiy/outputs/checkpoints/stage1"
     model_output_dir: "/home/sureshm/nemoACCfiy/outputs/models"
@@ -433,10 +433,10 @@ training_stages:
         # Total: 100.0% (ensures proper allocation)
       
       # Data loading performance options (optimized for GH200 with 72 CPU cores)
-      num_workers: 16               # Reduced workers to minimize overhead and contention
+      num_workers: 8                # Reduced from 16 to minimize overhead and contention
       pin_memory: true              # Pin memory for faster GPU transfer
       persistent_workers: true      # Keep workers alive between epochs
-      prefetch_factor: 4            # Reduced prefetch to minimize memory overhead
+      prefetch_factor: 2            # Reduced from 4 to minimize memory overhead
 
     checkpoint_dir: "/home/sureshm/nemoACCfiy/outputs/checkpoints/stage2"
     model_output_dir: "/home/sureshm/nemoACCfiy/outputs/models"
