@@ -63,11 +63,15 @@ def prepare_text_data(
         logger.info(f"Output path {output_path} already exists. Use --overwrite to replace.")
         return
     
-    # Load tokenizer
-    logger.info(f"Loading tokenizer from {tokenizer_path}")
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    # Load tokenizer with caching support
+    logger.info(f"Loading tokenizer with caching support...")
+    from src.utils.tokenizer_manager import get_tokenizer_with_caching
+    tokenizer = get_tokenizer_with_caching(
+        tokenizer_path=tokenizer_path,
+        custom_tokens=None,  # Use default special tokens
+        force_download=False,
+        cache_dir="tokenizers"
+    )
     
     # Collect input files
     input_files = []

@@ -671,8 +671,14 @@ def load_real_dataset(data_path: str, tokenizer_path: str, max_samples: int = No
     import os
     from transformers import AutoTokenizer
     
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    # Load tokenizer with caching support
+    from src.utils.tokenizer_manager import get_tokenizer_with_caching
+    tokenizer = get_tokenizer_with_caching(
+        tokenizer_path=tokenizer_path,
+        custom_tokens=None,  # Use default special tokens
+        force_download=False,
+        cache_dir="tokenizers"
+    )
     
     data = []
     sample_count = 0
@@ -1285,9 +1291,14 @@ def train_production_mode(
         logging.info(f"   - Using {tokenization_workers} workers for tokenization (GH200 optimized)")
         logging.info(f"   - This may take a few minutes...")
         
-        # Load tokenizer
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        # Load tokenizer with caching support
+        from src.utils.tokenizer_manager import get_tokenizer_with_caching
+        tokenizer = get_tokenizer_with_caching(
+            tokenizer_path=tokenizer_path,
+            custom_tokens=None,  # Use default special tokens
+            force_download=False,
+            cache_dir="tokenizers"
+        )
         
         # Get sequence length from config
         seq_length = config.get("sequence_length", 2048)
@@ -1337,8 +1348,13 @@ def train_production_mode(
     
     # Load tokenizer if not already loaded
     if 'tokenizer' not in locals():
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        from src.utils.tokenizer_manager import get_tokenizer_with_caching
+        tokenizer = get_tokenizer_with_caching(
+            tokenizer_path=tokenizer_path,
+            custom_tokens=None,  # Use default special tokens
+            force_download=False,
+            cache_dir="tokenizers"
+        )
 
     # Create a custom DataModule for HuggingFace datasets
     class HuggingFaceDataModule(LightningDataModule):

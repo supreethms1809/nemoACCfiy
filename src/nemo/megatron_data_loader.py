@@ -96,10 +96,14 @@ class MegatronDataLoader:
         self.stage = stage
         self.use_hf_datasets = use_hf_datasets
         
-        # Load tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+        # Load tokenizer with caching support
+        from src.utils.tokenizer_manager import get_tokenizer_with_caching
+        self.tokenizer = get_tokenizer_with_caching(
+            tokenizer_path=tokenizer_path,
+            custom_tokens=None,  # Use default special tokens
+            force_download=False,
+            cache_dir="tokenizers"
+        )
         
         # Initialize datasets
         self.train_dataset = None

@@ -304,20 +304,20 @@ class HuggingFaceDatasetLoader:
             raise
     
     def _load_tokenizer(self):
-        """Load the tokenizer."""
+        """Load the tokenizer with caching support."""
         try:
-            # Try local tokenizer first
-            if os.path.exists(self.tokenizer_path):
-                self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_path)
-                logger.info(f"Loaded local tokenizer from: {self.tokenizer_path}")
-            else:
-                # Fallback to HuggingFace Hub
-                self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-Coder-480B-A35B-Instruct")
-                logger.info(f"Loaded tokenizer from HuggingFace Hub: Qwen/Qwen3-Coder-480B-A35B-Instruct")
+            # Import tokenizer manager
+            from src.utils.tokenizer_manager import get_tokenizer_with_caching
             
-            # Set pad token if not set
-            if self.tokenizer.pad_token is None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
+            # Use the caching system
+            logger.info(f"Loading tokenizer with caching support...")
+            self.tokenizer = get_tokenizer_with_caching(
+                tokenizer_path=self.tokenizer_path,
+                custom_tokens=None,  # Use default special tokens
+                force_download=False,
+                cache_dir="tokenizers"
+            )
+            logger.info(f"✅ Tokenizer loaded with vocab size: {len(self.tokenizer)}")
                 
         except Exception as e:
             logger.error(f"Failed to load tokenizer: {e}")

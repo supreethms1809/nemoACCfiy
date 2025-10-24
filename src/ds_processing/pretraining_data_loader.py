@@ -45,13 +45,27 @@ class PretrainingDataLoader:
             return yaml.safe_load(f)
     
     def load_tokenizer(self, tokenizer_path: str = "tokenizers/qwen3-coder-30b-a3b-instruct-custom"):
-        """Load the tokenizer."""
+        """Load the tokenizer with caching support."""
         if not TOKENIZER_AVAILABLE:
             raise RuntimeError("transformers not available")
         
-        self.logger.info(f"Loading tokenizer from: {tokenizer_path}")
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-        self.logger.info(f"✅ Tokenizer loaded with vocab size: {len(self.tokenizer)}")
+        try:
+            # Import tokenizer manager
+            from src.utils.tokenizer_manager import get_tokenizer_with_caching
+            
+            # Use the caching system
+            self.logger.info(f"Loading tokenizer with caching support...")
+            self.tokenizer = get_tokenizer_with_caching(
+                tokenizer_path=tokenizer_path,
+                custom_tokens=None,  # Use default special tokens
+                force_download=False,
+                cache_dir="tokenizers"
+            )
+            self.logger.info(f"✅ Tokenizer loaded with vocab size: {len(self.tokenizer)}")
+                
+        except Exception as e:
+            self.logger.error(f"Failed to load tokenizer: {e}")
+            raise
     
     def load_processed_data(self, data_path: str) -> List[Dict[str, Any]]:
         """Load processed data from file."""

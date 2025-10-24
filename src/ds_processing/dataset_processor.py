@@ -135,13 +135,27 @@ class DatasetProcessor:
         Path(self.processing_config.cache_dir).mkdir(parents=True, exist_ok=True)
     
     def load_tokenizer(self, tokenizer_path: str = "tokenizers/qwen3-coder-30b-a3b-instruct-custom"):
-        """Load the tokenizer for text processing."""
+        """Load the tokenizer for text processing with caching support."""
         if not DATASETS_AVAILABLE:
             raise RuntimeError("datasets and transformers not available")
         
-        self.logger.info(f"Loading tokenizer from: {tokenizer_path}")
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-        self.logger.info(f"✅ Tokenizer loaded with vocab size: {len(self.tokenizer)}")
+        try:
+            # Import tokenizer manager
+            from src.utils.tokenizer_manager import get_tokenizer_with_caching
+            
+            # Use the caching system
+            self.logger.info(f"Loading tokenizer with caching support...")
+            self.tokenizer = get_tokenizer_with_caching(
+                tokenizer_path=tokenizer_path,
+                custom_tokens=None,  # Use default special tokens
+                force_download=False,
+                cache_dir="tokenizers"
+            )
+            self.logger.info(f"✅ Tokenizer loaded with vocab size: {len(self.tokenizer)}")
+                
+        except Exception as e:
+            self.logger.error(f"Failed to load tokenizer: {e}")
+            raise
     
     def load_dataset(self, dataset_config: DatasetConfig) -> Iterator[Dict[str, Any]]:
         """Load a single dataset."""
