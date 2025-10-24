@@ -1,0 +1,528 @@
+# Unified Configuration for ModularModel
+# This file combines model architectures and training configurations
+
+# Model Architecture Configurations
+model_configs:
+  model_config_32.7B:
+    decoder_config:
+      hidden_size: 5120
+      pad_token_id: 0
+      hidden_dropout_prob: 0.1
+      attention_probs_dropout_prob: 0.1
+      max_position_embeddings: 40960
+      num_hidden_layers: 64
+      num_attention_heads: 64
+      intermediate_size: 25600
+      num_key_value_heads: 8
+      type_vocab_size: 2
+      hidden_act: "gelu"
+      initializer_range: 0.02
+      RMSNorm_eps: 1e-06
+      use_cache: true
+    pool_type: "attention"
+    hidden_dropout_prob: 0.0
+    mlp_type: "mlp_gated"
+    attention_type: "vanilla"
+
+  model_config_15.7B:
+    decoder_config:
+      hidden_size: 5120
+      pad_token_id: 0
+      hidden_dropout_prob: 0.1
+      attention_probs_dropout_prob: 0.1
+      max_position_embeddings: 40960
+      num_hidden_layers: 40
+      num_attention_heads: 40
+      intermediate_size: 17408
+      num_key_value_heads: 8
+      type_vocab_size: 2
+      hidden_act: "gelu"
+      initializer_range: 0.02
+      RMSNorm_eps: 1e-06
+      use_cache: true
+    pool_type: "attention"
+    hidden_dropout_prob: 0.0
+    mlp_type: "mlp_gated"
+    attention_type: "vanilla"
+
+  model_config_8.5B:
+    decoder_config:
+      hidden_size: 4096
+      pad_token_id: 0
+      hidden_dropout_prob: 0.1
+      attention_probs_dropout_prob: 0.1
+      max_position_embeddings: 40960
+      num_hidden_layers: 36
+      num_attention_heads: 32
+      intermediate_size: 12288
+      num_key_value_heads: 8
+      type_vocab_size: 2
+      hidden_act: "gelu"
+      initializer_range: 0.02
+      RMSNorm_eps: 1e-05
+      use_cache: true
+    pool_type: "attention"
+    hidden_dropout_prob: 0.0
+    mlp_type: "mlp_gated"
+    attention_type: "vanilla"
+
+  model_config_4.0B:
+    decoder_config:
+      attention_bias: false
+      attention_dropout: 0.0
+      hidden_act: "silu"
+      hidden_size: 2560
+      initializer_range: 0.02
+      intermediate_size: 9728
+      max_position_embeddings: 40960
+      max_window_layers: 36
+      num_attention_heads: 32
+      num_hidden_layers: 36
+      num_key_value_heads: 8
+      RMSNorm_eps: 1e-06
+      use_cache: true
+    pool_type: "attention"
+    hidden_dropout_prob: 0.0
+    mlp_type: "mlp_gated"
+    attention_type: "vanilla"
+
+  model_config_1.8B:
+    decoder_config:
+      attention_bias: false
+      attention_dropout: 0.0
+      hidden_act: "silu"
+      hidden_size: 2048
+      initializer_range: 0.02
+      intermediate_size: 6144
+      max_position_embeddings: 40960
+      max_window_layers: 28
+      num_attention_heads: 16
+      num_hidden_layers: 28
+      num_key_value_heads: 8
+      RMSNorm_eps: 1e-06
+      use_cache: true
+    pool_type: "attention"
+    hidden_dropout_prob: 0.0
+    mlp_type: "mlp_gated"
+    attention_type: "vanilla"
+
+  model_config_1B:
+    decoder_config:
+      attention_bias: false
+      attention_dropout: 0.0
+      hidden_act: "silu"
+      hidden_size: 1536
+      initializer_range: 0.02
+      intermediate_size: 3840
+      max_position_embeddings: 40960
+      max_window_layers: 28
+      num_attention_heads: 24
+      num_hidden_layers: 28
+      num_key_value_heads: 8
+      RMSNorm_eps: 1e-06
+      use_cache: true
+    pool_type: "attention"
+    hidden_dropout_prob: 0.0
+    mlp_type: "mlp_gated"
+    attention_type: "vanilla"
+
+  model_config_243M:
+    decoder_config:
+      hidden_size: 1024
+      pad_token_id: 0
+      hidden_dropout_prob: 0.1
+      attention_probs_dropout_prob: 0.1
+      max_position_embeddings: 512
+      num_hidden_layers: 12
+      num_attention_heads: 16
+      intermediate_size: 1024
+      num_key_value_heads: 8
+      type_vocab_size: 2
+      hidden_act: "gelu"
+      initializer_range: 0.02
+      RMSNorm_eps: 1e-05
+      use_cache: true
+    pool_type: "attention"
+    hidden_dropout_prob: 0.0
+    mlp_type: "mlp_gated"
+    attention_type: "vanilla"
+
+  model_config_89M:
+    decoder_config:
+      hidden_size: 512
+      pad_token_id: 0
+      hidden_dropout_prob: 0.1
+      attention_probs_dropout_prob: 0.1
+      max_position_embeddings: 256
+      num_hidden_layers: 6
+      num_attention_heads: 8
+      intermediate_size: 512
+      num_key_value_heads: 4
+      type_vocab_size: 2
+      hidden_act: "gelu"
+      initializer_range: 0.02
+      RMSNorm_eps: 1e-05
+      use_cache: true
+    pool_type: "attention"
+    hidden_dropout_prob: 0.0
+    mlp_type: "mlp_gated"
+    attention_type: "vanilla"
+
+# Training Stage Configurations
+training_stages:
+  # Stage 1: Pre-training
+  stage1:
+    model:
+      model_config_key: "model_config_1.8B"
+      tokenizer_path: "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+      use_flash_attention: true
+      disable_flash_attention: false
+      
+      # Model architecture options (inherited from model_config_1.8B)
+      tie_weights: true             # Tie embedding and LM head weights
+      freeze_embedder_decoder: true # Freeze embedder decoder
+      embedder_checkpoint_path: null # Path to embedder checkpoint
+
+    training:
+      # Training backend selection (for production mode)
+      training_backend: "lightning"  # Options: "lightning" (PyTorch Lightning) or "megatron" (NeMo Megatron)
+      
+      # Training duration - optimized for 8 A10 GPUs (25GB each)
+      epochs: 1                     # Single epoch for large dataset (10M samples)
+      batch_size: 8                 # Optimized for A10 25GB memory
+      sequence_length: 2048         # Increased for A10 GPUs with more memory
+      learning_rate: 4e-5           # Keep current learning rate
+      max_grad_norm: 0.8            # Keep current gradient clipping
+      gradient_accumulation_steps: 4 # Increased for better gradient stability
+      gradient_checkpointing: true   # Essential for memory efficiency
+      mixed_precision: "bf16-mixed"       # Use bf16 for GH200 optimization
+      
+      # Step-based checkpointing and validation (optimized for 8 A10 GPUs)
+      checkpointing:
+        save_every_n_steps: 2000    # More frequent saves for 8 A10 GPUs
+        save_top_k: 3               # Keep more checkpoints for large training
+        monitor: "val_loss"         # Metric to monitor for best checkpoints
+        mode: "min"                 # Monitor mode (min/max)
+        filename: "checkpoint-{step:06d}-{val_loss:.4f}"  # Checkpoint filename
+        auto_insert_metric_name: false  # Don't insert metric name in filename
+        
+        # Resume training settings
+        resume_from_checkpoint: null  # Path to checkpoint to resume from (null = auto-detect)
+        resume_ignore_mismatched_sizes: true  # Ignore size mismatches when resuming
+        
+      # Training monitoring and control (optimized for 8 A10 GPUs)
+      log_every_n_steps: 50         # Balanced logging frequency for 8 GPUs
+
+      val_check_interval_steps: 10000   # Validation frequency for 8 A10 GPUs
+      
+      # Early stopping (disabled for large dataset training)
+      patience: 10                  # Higher patience for large dataset training
+      
+      # Gradient optimization
+      gradient_clip_val: 0.8        # Tighter gradient clipping for 1B model
+      gradient_clip_algorithm: "value"  # Gradient clipping algorithm (compatible with FSDP)
+    
+    # Distributed training configuration (optimized for 8 A10 GPUs)
+    distributed:
+      strategy: "fsdp"  # Use FSDP for large model training on 8 A10 GPUs
+      num_nodes: 1
+      devices: 8        # 8 A10 GPUs on single node
+      sync_batchnorm: false
+      
+      # FSDP specific configuration (optimized for 8 A10 GPUs)
+      fsdp:
+        enabled: true                # Enable FSDP for memory efficiency
+        cpu_offload: false           # Disable CPU offload for A10 GPUs
+        sharding_strategy: "FULL_SHARD"  # Full sharding for maximum memory efficiency
+        backward_prefetch: "BACKWARD_PRE"  # Optimize backward pass
+        forward_prefetch: true       # Enable forward prefetch for better performance
+        limit_all_gathers: true      # Reduce communication overhead
+        activation_checkpointing: true   # Enable to reduce memory usage
+        use_orig_params: true
+    
+    # Optimizer configuration (optimized for 1B model)
+    optimizer:
+      type: "AdamW"
+      weight_decay: 0.05             # Lower weight decay for 1B model
+      betas: [0.9, 0.98]             # More stable betas for 1B model
+      eps: 1e-6                      # Slightly higher eps for numerical stability
+    
+    # Learning rate scheduler configuration (optimized for 8 A10 GPUs)
+    scheduler:
+      type: "CosineAnnealingLR"      # Cosine annealing for better convergence
+      T_max: 40000                   # Adjusted total steps for 8 A10 GPUs
+      eta_min: 1e-7                  # Minimum learning rate
+      warmup_steps: 2000             # Warmup steps for 8 A10 GPUs
+      interval: "step"
+      frequency: 1
+    
+    # Dataset configuration (NeMo HFDatasetDataModule with ds_processing pipeline)
+    data:
+      # Processing configuration for ds_processing pipeline
+      processing:
+        max_tokens_per_sample: 16384           # Maximum tokens per document (allows full documents with smart chunking)
+        min_tokens_per_sample: 50              # Minimum tokens per training sample
+        overlap_tokens: 200                    # Overlap between consecutive chunks for better training
+        shuffle_datasets: true                 # Shuffle datasets before mixing
+        seed: 42                               # Random seed for reproducibility
+        total_samples: 10000000                 # Total samples for all datasets combined (code calculates per-dataset based on percentages) - Reduced for faster testing
+        use_processed_datasets: true           # Set to true to use preprocessed datasets (much faster!)
+        save_processed_datasets: true          # Save processed datasets for future use
+        test_size_samples: false               # If true, use only 4096 samples for testing; if false, use full dataset
+      
+      # Output configuration for ds_processing pipeline
+      output:
+        processed_data_dir: "data/processed"   # Directory for processed HuggingFace datasets
+        cache_dir: "/tmp/hf_cache"             # Use temporary cache directory
+        save_format: "hf"                      # HuggingFace format for processed data
+      
+      # Stage 1: Pre-training datasets (Next Token Prediction)
+      pretraining_datasets:
+        # Hugging Face pretraining datasets with percentage allocation
+        "HuggingFaceFW/fineweb":
+          percentage: 60.0                     # High-quality web content dataset
+          subset: "sample-10BT"               # 10 billion token sample
+        
+        # Math and reasoning datasets
+        "HuggingFaceTB/finemath":
+          percentage: 20.0                     # Math content subset
+          subset: "finemath-3plus"             # Math content subset
+        
+        # Curated content
+        "mlfoundations/dclm-baseline-1.0":
+          percentage: 15.0                     # Curated content (streaming works)
+          subset: null                         # 187k tokens - Curated content
+        
+        # Synthetic educational content
+        "HuggingFaceTB/cosmopedia":
+          percentage: 5.0                      # Synthetic textbooks subset
+          subset: "auto_math_text"             # Synthetic textbooks subset
+        
+        # Total: 100.0% (ensures proper allocation)
+      
+      # Data loading performance options (optimized for 8 A10 GPUs)
+      num_workers: 16               # Increased for better data loading with 8 GPUs
+      pin_memory: true              # Faster GPU transfer
+      persistent_workers: true      # Keep workers alive between batches
+      prefetch_factor: 4            # Increased for better throughput
+
+    checkpoint_dir: "/home/sureshm/nemoACCfiy/outputs/checkpoints/stage1_A10"
+    model_output_dir: "/home/sureshm/nemoACCfiy/outputs/models"
+    model_output_name: "stage1_model_A10.pth"
+
+    wandb:
+      use_wandb: false
+      project: "accfiy-stage1-A10"
+      entity: null
+      run_name: null
+      tags: ["stage1", "pretraining", "A10-8gpu"]
+      group: null
+      notes: "Training on 8 A10 GPUs with 25GB memory each"
+
+    logging:
+      debug: false
+      log_file: null
+      enable_profiling: true
+      profiler_log_dir: "./profiler_logs/stage1_A10"
+      save_steps: 5000
+      validation_steps: 5000
+    
+    # Environment and reproducibility
+    environment:
+      seed: 42                      # Random seed for reproducibility
+      deterministic: false          # Deterministic training (slower but reproducible)
+      benchmark: true               # CUDNN benchmark for better performance
+
+  # Stage 2: Fine-tuning
+  stage2:
+    model:
+      model_config_key: "model_config_1.8B"
+      tokenizer_path: "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+      use_flash_attention: true
+      disable_flash_attention: false
+
+    training:
+      # Training backend selection (optimized for 8 A10 GPUs)
+      training_backend: "lightning"  # Options: "lightning" (PyTorch Lightning) or "megatron" (NeMo Megatron)
+      
+      epochs: 2
+      batch_size: 12                # Optimized for A10 25GB memory
+      sequence_length: 2048         # Increased for A10 GPUs
+      embed_sequence_length: 4096
+      learning_rate: 5e-6
+      max_grad_norm: 2.5
+      gradient_accumulation_steps: 2 # Increased for better gradient stability
+      gradient_checkpointing: false
+      mixed_precision: "bf16"
+    
+    # Distributed training configuration (optimized for 8 A10 GPUs)
+    distributed:
+      strategy: "fsdp"  # Use FSDP for 8 A10 GPUs
+      num_nodes: 1
+      devices: 8        # 8 A10 GPUs on single node
+      sync_batchnorm: false
+      
+      # FSDP specific configuration (optimized for 8 A10 GPUs)
+      fsdp:
+        enabled: true                # Enable FSDP for 8 A10 GPUs
+        cpu_offload: false           # Disable CPU offload for A10 GPUs
+        sharding_strategy: "FULL_SHARD"  # Full sharding for maximum memory efficiency
+        backward_prefetch: "BACKWARD_PRE"  # Optimize backward pass
+        forward_prefetch: true       # Enable forward prefetch for better performance
+        limit_all_gathers: true      # Reduce communication overhead
+        activation_checkpointing: true   # Enable to reduce memory usage
+        use_orig_params: true
+    
+    # Optimizer configuration
+    optimizer:
+      type: "AdamW"
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1e-8
+    
+    # Learning rate scheduler configuration
+    scheduler:
+      type: "LinearLR"
+      start_factor: 0.1
+      end_factor: 1.0
+      warmup_steps: 1000
+      interval: "step"
+      frequency: 1
+    
+    # Dataset configuration (NeMo HFDatasetDataModule with ds_processing pipeline)
+    data:
+      # Processing configuration for ds_processing pipeline
+      processing:
+        max_tokens_per_sample: 16384            # Maximum tokens per document (allows full documents with smart chunking)
+        min_tokens_per_sample: 50              # Minimum tokens per training sample
+        overlap_tokens: 200                    # Overlap between consecutive chunks for better training
+        shuffle_datasets: true                 # Shuffle datasets before mixing
+        seed: 42                               # Random seed for reproducibility
+        total_samples: 10000000                 # Total samples for all datasets combined (code calculates per-dataset based on percentages)
+        use_processed_datasets: true           # Set to true to use preprocessed datasets (much faster!)
+        save_processed_datasets: true          # Save processed datasets for future use
+      
+      # Output configuration for ds_processing pipeline
+      output:
+        processed_data_dir: "data/processed"   # Directory for processed HuggingFace datasets
+        cache_dir: "/tmp/hf_cache"             # Use temporary cache directory
+        save_format: "hf"                      # HuggingFace format for processed data
+      
+      # Stage 2: Fine-tuning datasets
+      pretraining_datasets:
+        # Hugging Face pretraining datasets with percentage allocation
+        "HuggingFaceFW/fineweb":
+          percentage: 60.0                     # High-quality web content dataset
+          subset: "sample-10BT"               # 10 billion token sample
+        
+        # Math and reasoning datasets
+        "HuggingFaceTB/finemath":
+          percentage: 20.0                     # Math content subset
+          subset: "finemath-3plus"             # Math content subset
+        
+        # Curated content
+        "mlfoundations/dclm-baseline-1.0":
+          percentage: 15.0                     # Curated content (streaming works)
+          subset: null                         # 187k tokens - Curated content
+        
+        # Synthetic educational content
+        "HuggingFaceTB/cosmopedia":
+          percentage: 5.0                      # Synthetic textbooks subset
+          subset: "auto_math_text"             # Synthetic textbooks subset
+        
+        # Total: 100.0% (ensures proper allocation)
+      
+      # Data loading performance options (optimized for 8 A10 GPUs)
+      num_workers: 16               # Increased for better data loading with 8 GPUs
+      pin_memory: true              # Pin memory for faster GPU transfer
+      persistent_workers: true      # Keep workers alive between epochs
+      prefetch_factor: 4            # Increased for better throughput
+
+    checkpoint_dir: "/home/sureshm/nemoACCfiy/outputs/checkpoints/stage2_A10"
+    model_output_dir: "/home/sureshm/nemoACCfiy/outputs/models"
+    model_output_name: "stage2_model_A10.pth"
+
+    wandb:
+      use_wandb: false
+      project: "accfiy-stage2-A10"
+      entity: null
+      run_name: null
+      tags: ["stage2", "finetuning", "A10-8gpu"]
+      group: null
+      notes: "Fine-tuning on 8 A10 GPUs with 25GB memory each"
+
+    logging:
+      debug: false
+      log_file: null
+      enable_profiling: true
+      profiler_log_dir: "./profiler_logs/stage2_A10"
+      save_steps: 500
+      validation_steps: 500
+
+
+# Global Configuration
+global_config:
+  # Default tokenizer path
+  default_tokenizer_path: "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+  
+  # Default output directories
+  default_checkpoint_dir: "outputs/checkpoints"
+  default_model_output_dir: "outputs/models"
+  default_log_dir: "outputs/logs"
+  
+  # Default training parameters
+  default_batch_size: 8
+  default_learning_rate: 1e-5
+  default_max_epochs: 3
+  default_mixed_precision: "bf16"
+  
+  # Default wandb settings
+  default_wandb_project: "accfiy"
+  default_wandb_entity: null
+
+# Example distributed training configurations
+distributed_examples:
+  # Single node, multiple GPUs with FSDP
+  single_node_fsdp:
+    strategy: "fsdp"
+    num_nodes: 1
+    devices: 1  # 8 GPUs on single node
+    fsdp:
+      enabled: true
+      cpu_offload: false
+      sharding_strategy: "FULL_SHARD"
+      activation_checkpointing: true
+  
+  # Multi-node, multiple GPUs with FSDP
+  multi_node_fsdp:
+    strategy: "fsdp"
+    num_nodes: 4  # 4 nodes
+    devices: 8    # 8 GPUs per node
+    fsdp:
+      enabled: true
+      cpu_offload: true  # Enable CPU offload for very large models
+      sharding_strategy: "FULL_SHARD"
+      activation_checkpointing: true
+  
+  # Multi-node with DDP (alternative to FSDP)
+  multi_node_ddp:
+    strategy: "ddp"
+    num_nodes: 4
+    devices: 8
+    sync_batchnorm: true
+  
+  # Large scale training with CPU offload
+  large_scale_fsdp:
+    strategy: "fsdp"
+    num_nodes: 8
+    devices: 8
+    fsdp:
+      enabled: true
+      cpu_offload: true
+      sharding_strategy: "FULL_SHARD"
+      backward_prefetch: "BACKWARD_PRE"
+      forward_prefetch: true
+      limit_all_gathers: true
+      activation_checkpointing: true
+      use_orig_params: false
+
