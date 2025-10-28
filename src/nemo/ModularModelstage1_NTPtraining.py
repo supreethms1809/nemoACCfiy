@@ -937,6 +937,118 @@ def setup_config_file(config_path: str):
     logging.info(f"✅ {config_name.capitalize()} configuration ready!")
 
 
+def check_checkpoint_compatibility(checkpoint_path: str, training_module, logger):
+    """
+    Check if checkpoint is compatible with current model structure.
+    Returns True if compatible, False if incompatible.
+    """
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        if 'state_dict' not in checkpoint:
+            return False
+            
+        state_dict = checkpoint['state_dict']
+        
+        # Check for weight tying conflicts
+        has_embed_tokens = any('embed_tokens.weight' in key for key in state_dict.keys())
+        has_lm_head = any('lm_head.weight' in key for key in state_dict.keys())
+        
+        # Get current model structure
+        current_state_dict = training_module.state_dict()
+        current_has_embed_tokens = any('embed_tokens.weight' in key for key in current_state_dict.keys())
+        current_has_lm_head = any('lm_head.weight' in key for key in current_state_dict.keys())
+        
+        # Check if weight tying status matches
+        checkpoint_weight_tying = has_embed_tokens and has_lm_head and len([k for k in state_dict.keys() if 'lm_head.weight' in k]) == 1
+        current_weight_tying = current_has_embed_tokens and current_has_lm_head and len([k for k in current_state_dict.keys() if 'lm_head.weight' in k]) == 1
+        
+        if checkpoint_weight_tying != current_weight_tying:
+            logger.warning(f"⚠️ Weight tying mismatch: checkpoint={checkpoint_weight_tying}, current={current_weight_tying}")
+            return False
+            
+        return True
+        
+    except Exception as e:
+        logger.warning(f"❌ Error checking checkpoint compatibility: {e}")
+        return False
+
+
+def load_checkpoint_with_fallback(checkpoint_path: str, training_module, logger):
+    """
+    Load checkpoint with fallback mechanisms to handle parameter mapping issues.
+    
+    This function handles the case where checkpoint was saved with weight tying enabled
+    but current model has weight tying disabled (or vice versa).
+    """
+    try:
+        logger.info(f"🔄 Attempting checkpoint loading from: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        
+        if 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+            
+            # Create a filtered state dict that handles weight tying mismatches
+            filtered_state_dict = {}
+            embed_tokens_weight = None
+            
+            for key, value in state_dict.items():
+                # Skip optimizer and scheduler states
+                if key.startswith('optimizer') or key.startswith('lr_schedulers'):
+                    continue
+                
+                # Handle weight tying conflicts
+                if 'embed_tokens.weight' in key:
+                    # Store the embedding weight for potential use with LM head
+                    embed_tokens_weight = value
+                    filtered_state_dict[key] = value
+                    logger.info(f"📝 Stored embedding weight: {key}")
+                    
+                elif 'lm_head.weight' in key:
+                    # Check if we have a separate LM head (no weight tying)
+                    if 'model.decoder.lm_head.weight' in filtered_state_dict:
+                        # We already have an LM head weight, skip this one
+                        logger.info(f"⏭️ Skipping duplicate LM head weight: {key}")
+                        continue
+                    else:
+                        # Use the LM head weight from checkpoint
+                        filtered_state_dict[key] = value
+                        logger.info(f"📝 Using LM head weight from checkpoint: {key}")
+                        
+                else:
+                    # All other parameters
+                    filtered_state_dict[key] = value
+            
+            # If we have embedding weight but no LM head weight, and current model doesn't use weight tying,
+            # we need to initialize the LM head separately
+            if embed_tokens_weight is not None and 'model.decoder.lm_head.weight' not in filtered_state_dict:
+                logger.info("🔧 Initializing LM head weight separately (no weight tying)")
+                # The LM head will be initialized randomly, which is fine for training continuation
+            
+            # Load with strict=False to handle parameter mismatches
+            missing_keys, unexpected_keys = training_module.load_state_dict(filtered_state_dict, strict=False)
+            
+            if missing_keys:
+                logger.info(f"⚠️ Missing keys (will use random initialization): {len(missing_keys)}")
+                if logger.level <= logging.DEBUG:
+                    logger.debug(f"Missing keys: {missing_keys[:10]}...")  # Show first 10
+            
+            if unexpected_keys:
+                logger.info(f"⚠️ Unexpected keys (ignored): {len(unexpected_keys)}")
+                if logger.level <= logging.DEBUG:
+                    logger.debug(f"Unexpected keys: {unexpected_keys[:10]}...")  # Show first 10
+            
+            logger.info("✅ Successfully loaded checkpoint with weight tying compatibility")
+            return True
+            
+        else:
+            logger.warning("⚠️ Checkpoint does not contain 'state_dict' key")
+            return False
+            
+    except Exception as e:
+        logger.warning(f"❌ Failed to load checkpoint: {e}")
+        return False
+
+
 def create_strategy(distributed_config: dict):
     """Create the appropriate training strategy based on configuration."""
     if not LIGHTNING_AVAILABLE:
@@ -944,6 +1056,22 @@ def create_strategy(distributed_config: dict):
     
     strategy_name = distributed_config.get("strategy", "auto")
     fsdp_config = distributed_config.get("fsdp", {})
+    devices = distributed_config.get("devices", "auto")
+    
+    # Check if we're using single GPU
+    is_single_gpu = False
+    if isinstance(devices, int) and devices == 1:
+        is_single_gpu = True
+    elif devices == "auto":
+        # Check if we're actually using single GPU by checking available devices
+        import torch
+        is_single_gpu = torch.cuda.device_count() == 1
+    
+    # For single GPU, avoid FSDP due to parameter mapping issues
+    if is_single_gpu and (strategy_name == "fsdp" or (strategy_name == "auto" and fsdp_config.get("enabled", False))):
+        logging.warning("⚠️ Single GPU detected - disabling FSDP to avoid parameter mapping issues")
+        logging.info("Using DDP strategy with find_unused_parameters=True for single GPU training")
+        return "ddp_find_unused_parameters_true"
     
     if strategy_name == "fsdp" or (strategy_name == "auto" and fsdp_config.get("enabled", False)):
         # Create FSDP strategy
@@ -1004,13 +1132,9 @@ def create_strategy(distributed_config: dict):
         return strategy
     
     elif strategy_name == "ddp":
-        # Create DDP strategy
-        from lightning.pytorch.strategies import DDPStrategy
-        strategy = DDPStrategy(
-            sync_batchnorm=distributed_config.get("sync_batchnorm", False)
-        )
-        logging.info("Created DDP strategy")
-        return strategy
+        # Create DDP strategy with find_unused_parameters=True
+        logging.info("Using DDP strategy with find_unused_parameters=True")
+        return "ddp_find_unused_parameters_true"
     
     else:
         # Use auto strategy (PyTorch Lightning will choose automatically)
@@ -1694,11 +1818,27 @@ def train_production_mode(
         logging.info("🚀 Starting training without validation...")
         if checkpoint_path:
             logging.info(f"🔄 Resuming training from checkpoint: {checkpoint_path}")
-            try:
-                trainer.fit(training_module, train_loader, ckpt_path=checkpoint_path)
-            except Exception as e:
-                logging.warning(f"Failed to resume from checkpoint {checkpoint_path}: {e}")
-                logging.info("Starting training from scratch...")
+            
+            # Check checkpoint compatibility first
+            if check_checkpoint_compatibility(checkpoint_path, training_module, logging):
+                logging.info("✅ Checkpoint is compatible, attempting full resume...")
+                try:
+                    trainer.fit(training_module, train_loader, ckpt_path=checkpoint_path)
+                except Exception as e:
+                    logging.warning(f"Failed to resume from checkpoint {checkpoint_path}: {e}")
+                    logging.info("Attempting to load model weights with parameter filtering...")
+                    if load_checkpoint_with_fallback(checkpoint_path, training_module, logging):
+                        logging.info("✅ Loaded model weights successfully, starting training from scratch...")
+                    else:
+                        logging.info("Starting training from scratch...")
+                    trainer.fit(training_module, train_loader)
+            else:
+                logging.warning("⚠️ Checkpoint is incompatible with current model structure")
+                logging.info("Attempting to load model weights with parameter filtering...")
+                if load_checkpoint_with_fallback(checkpoint_path, training_module, logging):
+                    logging.info("✅ Loaded model weights successfully, starting training from scratch...")
+                else:
+                    logging.info("Starting training from scratch...")
                 trainer.fit(training_module, train_loader)
         else:
             logging.info("🚀 Starting training from scratch...")
@@ -1706,17 +1846,33 @@ def train_production_mode(
     else:
         # Validation enabled - include val_loader
         logging.info("🚀 Starting training with validation...")
-    if checkpoint_path:
-        logging.info(f"🔄 Resuming training from checkpoint: {checkpoint_path}")
-        try:
-            trainer.fit(training_module, train_loader, val_loader, ckpt_path=checkpoint_path)
-        except Exception as e:
-            logging.warning(f"Failed to resume from checkpoint {checkpoint_path}: {e}")
-            logging.info("Starting training from scratch...")
+        if checkpoint_path:
+            logging.info(f"🔄 Resuming training from checkpoint: {checkpoint_path}")
+            
+            # Check checkpoint compatibility first
+            if check_checkpoint_compatibility(checkpoint_path, training_module, logging):
+                logging.info("✅ Checkpoint is compatible, attempting full resume...")
+                try:
+                    trainer.fit(training_module, train_loader, val_loader, ckpt_path=checkpoint_path)
+                except Exception as e:
+                    logging.warning(f"Failed to resume from checkpoint {checkpoint_path}: {e}")
+                    logging.info("Attempting to load model weights with parameter filtering...")
+                    if load_checkpoint_with_fallback(checkpoint_path, training_module, logging):
+                        logging.info("✅ Loaded model weights successfully, starting training from scratch...")
+                    else:
+                        logging.info("Starting training from scratch...")
+                    trainer.fit(training_module, train_loader, val_loader)
+            else:
+                logging.warning("⚠️ Checkpoint is incompatible with current model structure")
+                logging.info("Attempting to load model weights with parameter filtering...")
+                if load_checkpoint_with_fallback(checkpoint_path, training_module, logging):
+                    logging.info("✅ Loaded model weights successfully, starting training from scratch...")
+                else:
+                    logging.info("Starting training from scratch...")
+                trainer.fit(training_module, train_loader, val_loader)
+        else:
+            logging.info("🚀 Starting training from scratch...")
             trainer.fit(training_module, train_loader, val_loader)
-    else:
-        logging.info("🚀 Starting training from scratch...")
-        trainer.fit(training_module, train_loader, val_loader)
     
     logging.info("✅ Production training completed successfully!")
     return trainer, training_module

@@ -25,7 +25,7 @@ class DecoderOnlyModel(nn.Module):
     This reduces memory usage by ~50% for decoder-only training.
     """
     
-    def __init__(self, config, vocab_size: int):
+    def __init__(self, config, vocab_size: int, tie_weights: bool = True):
         super().__init__()
         # Handle both dict and object config formats for compatibility
         if isinstance(config, dict):
@@ -35,7 +35,7 @@ class DecoderOnlyModel(nn.Module):
             decoder_config = config
             actual_vocab_size = vocab_size
             
-        self.decoder = LMHeadDecoder(decoder_config, actual_vocab_size)
+        self.decoder = LMHeadDecoder(decoder_config, actual_vocab_size, tie_weights=tie_weights)
         self.hidden_size = decoder_config.hidden_size
         self.gradient_checkpointing = False
         
@@ -231,7 +231,8 @@ def create_optimized_model(model_type: str, config: Dict[str, Any], **kwargs) ->
         nn.Module: Optimized model instance
     """
     if model_type == 'decoder_only':
-        return DecoderOnlyModel(config['decoder_config'], config['vocab_size'])
+        tie_weights = kwargs.get('tie_weights', True)
+        return DecoderOnlyModel(config['decoder_config'], config['vocab_size'], tie_weights=tie_weights)
     elif model_type == 'embedder_only':
         pool_type = config.get('pool_type', 'mean')
         return EmbedderOnlyModel(config['decoder_config'], config['vocab_size'], pool_type)

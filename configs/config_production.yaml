@@ -179,7 +179,7 @@ training_stages:
       disable_flash_attention: false
       
       # Model architecture options (inherited from model_config_1.8B)
-      tie_weights: true             # Tie embedding and LM head weights
+      tie_weights: false            # Tie embedding and LM head weights
       freeze_embedder_decoder: true # Freeze embedder decoder
       embedder_checkpoint_path: null # Path to embedder checkpoint
 
@@ -199,7 +199,7 @@ training_stages:
       
       # Step-based checkpointing and validation (optimized for large dataset)
       checkpointing:
-        save_every_n_steps: 5000    # Less frequent saves to avoid FSDP issues
+        save_every_n_steps: 50    # Less frequent saves to avoid FSDP issues
         save_top_k: 3               # Keep more checkpoints for large training
         monitor: "val_loss"         # Metric to monitor for best checkpoints
         mode: "min"                 # Monitor mode (min/max)
@@ -207,7 +207,7 @@ training_stages:
         auto_insert_metric_name: false  # Don't insert metric name in filename
         
         # Resume training settings
-        resume_from_checkpoint: null  # Path to checkpoint to resume from (null = auto-detect)
+        resume_from_checkpoint: null  # Path to checkpoint to resume from (null = auto-detect, set to "none" to disable)
         resume_ignore_mismatched_sizes: true  # Ignore size mismatches when resuming
         
       # Training monitoring and control (optimized for large dataset)
@@ -238,7 +238,7 @@ training_stages:
         forward_prefetch: true       # Enable forward prefetch for better performance
         limit_all_gathers: true      # Reduce communication overhead
         activation_checkpointing: true   # Re-enable to reduce memory usage
-        use_orig_params: true
+        use_orig_params: true  # Set to true for single GPU FSDP compatibility
     
     # Optimizer configuration (optimized for 1B model)
     optimizer:
@@ -280,23 +280,28 @@ training_stages:
       pretraining_datasets:
         # Hugging Face pretraining datasets with percentage allocation
         "HuggingFaceFW/fineweb":
-          percentage: 60.0                     # High-quality web content dataset
+          percentage: 15.0                     # High-quality web content dataset
           subset: "sample-10BT"               # 10 billion token sample
         
         # Math and reasoning datasets
         "HuggingFaceTB/finemath":
-          percentage: 20.0                     # Math content subset
+          percentage: 15.0                     # Math content subset
           subset: "finemath-3plus"             # Math content subset
         
         # Curated content
         "mlfoundations/dclm-baseline-1.0":
-          percentage: 15.0                     # Curated content (streaming works)
+          percentage: 10.0                     # Curated content (streaming works)
           subset: null                         # 187k tokens - Curated content
         
         # Synthetic educational content
         "HuggingFaceTB/cosmopedia":
-          percentage: 5.0                      # Synthetic textbooks subset
+          percentage: 10.0                      # Synthetic textbooks subset
           subset: "auto_math_text"             # Synthetic textbooks subset
+
+        # nanochat dataset
+        "karpathy/fineweb-edu-100b-shuffle":
+          percentage: 50.0                      # Nanochat subset
+          subset: null                         # 100 billion token sample
         
         # Total: 100.0% (ensures proper allocation)
       
@@ -340,67 +345,78 @@ training_stages:
       tokenizer_path: "Qwen/Qwen3-Coder-30B-A3B-Instruct"
       use_flash_attention: true
       disable_flash_attention: false
+      
+      # Stage 1 checkpoint loading for Stage 2 training
+      stage1_checkpoint_path: null  # Path to Stage 1 checkpoint (null = auto-detect)
+      freeze_embedder_decoder: true # Freeze embedder decoder from Stage 1
+      tie_weights: false            # Tie embedding and LM head weights
 
     training:
       # Training backend selection (for production mode)
       training_backend: "lightning"  # Options: "lightning" (PyTorch Lightning) or "megatron" (NeMo Megatron)
       
-      epochs: 2
-      batch_size: 16
-      sequence_length: 1024
-      embed_sequence_length: 4096
-      learning_rate: 5e-6
-      max_grad_norm: 2.5
-      gradient_accumulation_steps: 1
-      gradient_checkpointing: false
-      mixed_precision: "bf16"
+      # Stage 2 training parameters optimized for instruction tuning
+      epochs: 3                       # More epochs for fine-tuning
+      batch_size: 8                   # Smaller batch size for instruction tuning
+      sequence_length: 1024           # Decoder sequence length
+      embed_sequence_length: 4096     # Embedder sequence length (reasoning)
+      learning_rate: 5e-6             # Lower learning rate for fine-tuning
+      max_grad_norm: 0.8              # Gradient clipping (aligned with Stage 1)
+      gradient_accumulation_steps: 2  # Gradient accumulation for effective larger batch size
+      gradient_checkpointing: true    # Enable for memory efficiency
+      mixed_precision: "bf16-mixed"   # Mixed precision training
+      
+      # Dual loss configuration
+      contrastive_weight: 0.1         # Weight for contrastive loss (embedder)
+      cross_entropy_weight: 1.0       # Weight for cross-entropy loss (decoder)
     
-    # Distributed training configuration
+    # Distributed training configuration (aligned with Stage 1)
     distributed:
-      strategy: "auto"  # Options: "auto", "ddp", "fsdp", "deepspeed"
+      strategy: "fsdp"  # Use FSDP for consistency with Stage 1
       num_nodes: 1
       devices: "auto"  # Can be "auto", number, or list of device IDs
       sync_batchnorm: false
       
-      # FSDP specific configuration
+      # FSDP specific configuration (aligned with Stage 1)
       fsdp:
-        enabled: false
-        cpu_offload: false
-        sharding_strategy: "FULL_SHARD"  # Options: "FULL_SHARD", "SHARD_GRAD_OP", "NO_SHARD"
-        backward_prefetch: "BACKWARD_PRE"  # Options: "BACKWARD_PRE", "BACKWARD_POST", "NONE"
-        forward_prefetch: false
-        limit_all_gathers: true
-        activation_checkpointing: true
-        use_orig_params: false
+        enabled: true                 # Enable FSDP for memory efficiency (aligned with Stage 1)
+        cpu_offload: false           # Disable CPU offload for better performance
+        sharding_strategy: "FULL_SHARD"  # Full sharding for maximum memory efficiency
+        backward_prefetch: "BACKWARD_PRE"  # Optimize backward pass
+        forward_prefetch: true       # Enable forward prefetch for better performance
+        limit_all_gathers: true      # Reduce communication overhead
+        activation_checkpointing: true   # Re-enable to reduce memory usage
+        use_orig_params: true        # Set to true for single GPU FSDP compatibility
     
-    # Optimizer configuration
+    # Optimizer configuration (aligned with Stage 1 for consistency)
     optimizer:
       type: "AdamW"
-      weight_decay: 0.01
-      betas: [0.9, 0.999]
-      eps: 1e-8
+      weight_decay: 0.01              # Keep Stage 2 specific value for fine-tuning
+      betas: [0.9, 0.95]              # More stable betas for fine-tuning
+      eps: 1e-8                       # Keep Stage 2 specific value for fine-tuning
     
-    # Learning rate scheduler configuration
+    # Learning rate scheduler configuration (optimized for instruction tuning)
     scheduler:
-      type: "LinearLR"
-      start_factor: 0.1
-      end_factor: 1.0
-      warmup_steps: 1000
+      type: "CosineAnnealingLR"       # Cosine annealing for better convergence
+      T_max: 10000                    # Total steps for cosine annealing
+      eta_min: 1e-7                   # Minimum learning rate
+      warmup_steps: 500               # Warmup steps
       interval: "step"
       frequency: 1
     
     # Dataset configuration (NeMo HFDatasetDataModule with ds_processing pipeline)
     data:
-      # Processing configuration for ds_processing pipeline
+      # Processing configuration for instruction tuning datasets
       processing:
-        max_tokens_per_sample: 16384            # Maximum tokens per document (allows full documents with smart chunking)
+        max_tokens_per_sample: 2048            # Maximum tokens per instruction (shorter for instruction tuning)
         min_tokens_per_sample: 50              # Minimum tokens per training sample
-        overlap_tokens: 200                    # Overlap between consecutive chunks for better training
+        overlap_tokens: 0                      # No overlap for instruction tuning
         shuffle_datasets: true                 # Shuffle datasets before mixing
         seed: 42                               # Random seed for reproducibility
-        total_samples: 10000000                 # Total samples for all datasets combined (code calculates per-dataset based on percentages)
+        total_samples: 100000                  # Total samples for instruction tuning (smaller than pretraining)
         use_processed_datasets: true           # Set to true to use preprocessed datasets (much faster!)
         save_processed_datasets: true          # Save processed datasets for future use
+        test_size_samples: false               # If true, use only 4096 samples for testing
       
       # Output configuration for ds_processing pipeline
       output:
@@ -408,27 +424,16 @@ training_stages:
         cache_dir: "/tmp/hf_cache"             # Use temporary cache directory
         save_format: "hf"                      # HuggingFace format for processed data
       
-      # Stage 2: Fine-tuning datasets
+      # Stage 2: Fine-tuning datasets (Instruction Tuning)
       pretraining_datasets:
-        # Hugging Face pretraining datasets with percentage allocation
-        "HuggingFaceFW/fineweb":
-          percentage: 60.0                     # High-quality web content dataset
-          subset: "sample-10BT"               # 10 billion token sample
+        # Instruction tuning datasets with percentage allocation
+        "nvidia/OpenCodeReasoning":
+          percentage: 50.0                     # Code reasoning dataset
+          subset: null                         # Full dataset
         
-        # Math and reasoning datasets
-        "HuggingFaceTB/finemath":
-          percentage: 20.0                     # Math content subset
-          subset: "finemath-3plus"             # Math content subset
-        
-        # Curated content
-        "mlfoundations/dclm-baseline-1.0":
-          percentage: 15.0                     # Curated content (streaming works)
-          subset: null                         # 187k tokens - Curated content
-        
-        # Synthetic educational content
-        "HuggingFaceTB/cosmopedia":
-          percentage: 5.0                      # Synthetic textbooks subset
-          subset: "auto_math_text"             # Synthetic textbooks subset
+        "nvidia/OpenMathReasoning":
+          percentage: 50.0                     # Math reasoning dataset
+          subset: null                         # Full dataset
         
         # Total: 100.0% (ensures proper allocation)
       
@@ -442,14 +447,38 @@ training_stages:
     model_output_dir: "/home/sureshm/nemoACCfiy/outputs/models"
     model_output_name: "stage2_model.pth"
 
+    # Stage 2 specific training monitoring
+    checkpointing:
+      save_every_n_steps: 1000        # Save checkpoints every 1000 steps
+      save_top_k: 3                   # Keep top 3 checkpoints
+      monitor: "val_loss"             # Metric to monitor for best checkpoints
+      mode: "min"                     # Monitor mode (min/max)
+      filename: "stage2_checkpoint-{step:06d}-{val_loss:.4f}"
+      auto_insert_metric_name: false
+      
+      # Resume training settings
+      resume_from_checkpoint: null    # Path to checkpoint to resume from
+      resume_ignore_mismatched_sizes: true
+
+    # Training monitoring and control (aligned with Stage 1)
+    log_every_n_steps: 100           # Log every 100 steps (aligned with Stage 1)
+    val_check_interval_steps: 1000   # Validate every 1000 steps (more frequent than Stage 1 for fine-tuning)
+    
+    # Early stopping
+    patience: 5                      # Early stopping patience
+    
+    # Gradient optimization (aligned with Stage 1)
+    gradient_clip_val: 0.8           # Gradient clipping value (aligned with Stage 1)
+    gradient_clip_algorithm: "value" # Gradient clipping algorithm (aligned with Stage 1)
+
     wandb:
       use_wandb: false
       project: "accfiy-stage2"
       entity: null
       run_name: null
-      tags: ["stage2", "finetuning"]
+      tags: ["stage2", "instruction_tuning", "contrastive_loss"]
       group: null
-      notes: null
+      notes: "Stage 2 training with instruction tuning and dual loss functions"
 
     logging:
       debug: false
@@ -457,7 +486,13 @@ training_stages:
       enable_profiling: true
       profiler_log_dir: "./profiler_logs/stage2"
       save_steps: 1000
-      validation_steps: 1000
+      validation_steps: 500
+    
+    # Environment and reproducibility (aligned with Stage 1)
+    environment:
+      seed: 42                      # Random seed for reproducibility
+      deterministic: false          # Deterministic training (slower but reproducible)
+      benchmark: true               # CUDNN benchmark for better performance
 
 
 # Global Configuration

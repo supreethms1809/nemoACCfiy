@@ -46,7 +46,8 @@ try:
                 print(f"✅ [NeMo] Stage 1: Using DecoderOnlyModel wrapper from optimized_models.py")
                 self.model = DecoderOnlyModel(
                     config=cfg,
-                    vocab_size=cfg.vocab_size
+                    vocab_size=cfg.vocab_size,
+                    tie_weights=cfg.tie_weights
                 )
             else:
                 # Fallback to simple transformer if DecoderOnlyModel not available
@@ -171,7 +172,8 @@ except ImportError:
                 print(f"✅ [Fallback] Stage 1: Using DecoderOnlyModel wrapper from optimized_models.py")
                 self.model = DecoderOnlyModel(
                     config=cfg,
-                    vocab_size=cfg.vocab_size
+                    vocab_size=cfg.vocab_size,
+                    tie_weights=cfg.tie_weights
                 )
             else:
                 # Fallback to simple transformer if DecoderOnlyModel not available
@@ -370,7 +372,7 @@ class ModularModelNeMo(NeuralModule, Exportable):
         # Initialize the core model based on training stage
         if cfg.training_stage == 'stage1':
             # Stage 1: Use DecoderOnlyModel for memory efficiency
-            self.model = DecoderOnlyModel(decoder_config, cfg.vocab_size)
+            self.model = DecoderOnlyModel(decoder_config, cfg.vocab_size, tie_weights=cfg.tie_weights)
             self.model_type = 'decoder_only'
         elif cfg.training_stage == 'stage2':
             # Stage 2: Use full ModularModel
@@ -510,7 +512,7 @@ class ModularModelNeMo(NeuralModule, Exportable):
         # Recreate model for new stage
         if stage == 'stage1' and self.model_type != 'decoder_only':
             # Switch to DecoderOnlyModel
-            self.model = DecoderOnlyModel(decoder_config, self.cfg.vocab_size)
+            self.model = DecoderOnlyModel(decoder_config, self.cfg.vocab_size, tie_weights=self.cfg.tie_weights)
             self.model_type = 'decoder_only'
             
         elif stage == 'stage2' and self.model_type != 'modular':
