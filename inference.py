@@ -11,7 +11,6 @@ import os
 import argparse
 from pathlib import Path
 import torch
-from torch.cuda.amp import autocast
 
 # Add project root to system path for consistent imports
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__)))
@@ -82,6 +81,11 @@ def main():
     
     # Load configuration
     config = create_nemo_config_from_existing(args.model_config, args.stage)
+    # Echo weight tying resolved from config for transparency
+    if 'tie_weights' in config:
+        print(f"📊 Weight tying (from config): {'Enabled' if config['tie_weights'] else 'Disabled'}")
+    else:
+        print("📊 Weight tying: not specified in config (will use model default)")
     
     # Set mixed precision based on arguments and device capability
     config['mixed_precision'] = "bf16" if use_mixed_precision else None
@@ -170,26 +174,24 @@ def generate_optimized(model, input_ids, attention_mask, tokenizer, args, device
     try:
         # Use the model's built-in generate method
         if use_mixed_precision:
-            with autocast():
-                generated_ids = model.modular_model.generate(
+            with torch.amp.autocast('cuda'):
+                generated_ids = model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     max_new_tokens=args.max_tokens,
                     temperature=args.temperature,
                     top_k=args.top_k,
                     do_sample=True,
-                    use_cache=True,
                     pad_token_id=tokenizer.eos_token_id
                 )
         else:
-            generated_ids = model.modular_model.generate(
+            generated_ids = model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=args.max_tokens,
                 temperature=args.temperature,
                 top_k=args.top_k,
                 do_sample=True,
-                use_cache=True,
                 pad_token_id=tokenizer.eos_token_id
             )
         
@@ -221,7 +223,7 @@ def generate_standard(model, input_ids, attention_mask, tokenizer, args, device,
             
             # Forward pass with autocast for mixed precision
             if use_mixed_precision:
-                with autocast():
+                with torch.amp.autocast('cuda'):
                     outputs = underlying_model(input_ids=input_ids, attention_mask=attention_mask)
             else:
                 outputs = underlying_model(input_ids=input_ids, attention_mask=attention_mask)
@@ -273,7 +275,7 @@ def generate_standard(model, input_ids, attention_mask, tokenizer, args, device,
                 # Get logits for current sequence
                 with torch.no_grad():
                     if use_mixed_precision:
-                        with autocast():
+                        with torch.amp.autocast('cuda'):
                             if hasattr(model, 'modular_model'):
                                 outputs = model.modular_model(input_ids=current_input_ids, attention_mask=current_attention_mask)
                             else:

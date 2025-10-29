@@ -102,8 +102,10 @@ class ConfigLoader:
         Returns:
             Dictionary containing model configuration
         """
-        # Try unified config first
-        unified_config_file = self.configs_path / "config.yaml"
+        # Try unified config first (prefer production if available)
+        unified_config_file = self.configs_path / "config_production.yaml"
+        if not unified_config_file.exists():
+            unified_config_file = self.configs_path / "config.yaml"
         
         if unified_config_file.exists():
             with open(unified_config_file, 'r') as f:
@@ -143,8 +145,10 @@ class ConfigLoader:
         Returns:
             Dictionary containing training configuration
         """
-        # Try unified config first
-        unified_config_file = self.configs_path / "config.yaml"
+        # Try unified config first (prefer production if available)
+        unified_config_file = self.configs_path / "config_production.yaml"
+        if not unified_config_file.exists():
+            unified_config_file = self.configs_path / "config.yaml"
         
         if unified_config_file.exists():
             with open(unified_config_file, 'r') as f:
@@ -299,6 +303,11 @@ class ConfigLoader:
             
             # Flash attention
             "use_flash_attention": training_config.get("model", {}).get("use_flash_attention", True),
+
+            # Weight tying and embedder freeze settings (ensure parity between train and inference)
+            "tie_weights": training_config.get("model", {}).get("tie_weights", False),
+            "freeze_embedder_decoder": training_config.get("model", {}).get("freeze_embedder_decoder", False),
+            "embedder_checkpoint_path": training_config.get("model", {}).get("embedder_checkpoint_path", None),
             
             # Output configuration - use top-level outputs directory
             "checkpoint_dir": training_config.get("checkpoint_dir", "outputs/checkpoints"),
@@ -324,8 +333,10 @@ class ConfigLoader:
     
     def list_available_model_configs(self) -> list:
         """List all available model configuration keys."""
-        # Try unified config first
-        unified_config_file = self.configs_path / "config.yaml"
+        # Try unified config first (prefer production if available)
+        unified_config_file = self.configs_path / "config_production.yaml"
+        if not unified_config_file.exists():
+            unified_config_file = self.configs_path / "config.yaml"
         
         if unified_config_file.exists():
             with open(unified_config_file, 'r') as f:
@@ -348,8 +359,10 @@ class ConfigLoader:
     
     def list_available_stages(self) -> list:
         """List all available training stages."""
-        # Try unified config first
-        unified_config_file = self.configs_path / "config.yaml"
+        # Try unified config first (prefer production if available)
+        unified_config_file = self.configs_path / "config_production.yaml"
+        if not unified_config_file.exists():
+            unified_config_file = self.configs_path / "config.yaml"
         
         if unified_config_file.exists():
             with open(unified_config_file, 'r') as f:
