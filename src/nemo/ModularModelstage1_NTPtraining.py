@@ -1719,6 +1719,7 @@ def train_production_mode(
         filename="last-checkpoint-{step:06d}",
         every_n_train_steps=save_every_n_steps,
         save_top_k=1,  # Only keep the latest
+        auto_insert_metric_name=False,
         save_last=False,
         save_on_train_epoch_end=False,
     )
