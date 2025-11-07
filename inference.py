@@ -11,6 +11,8 @@ import os
 import argparse
 from pathlib import Path
 import torch
+import json
+from typing import List, Dict, Any
 
 # Add project root to system path for consistent imports
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__)))
@@ -24,6 +26,165 @@ except ImportError:
     create_nemo_config_from_existing = None
 from transformers import AutoTokenizer
 
+def load_prompts_from_file(prompts_file: str) -> List[str]:
+    """Load prompts from a JSON file."""
+    with open(prompts_file, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    prompts = []
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                # Try common keys: 'prompt', 'text', 'input'
+                prompt = item.get('prompt') or item.get('text') or item.get('input')
+                if prompt:
+                    prompts.append(prompt)
+            elif isinstance(item, str):
+                prompts.append(item)
+    elif isinstance(data, dict):
+        # If it's a dict, try to find prompts in common keys
+        if 'prompts' in data:
+            prompts = data['prompts']
+        elif 'prompt' in data:
+            prompts = [data['prompt']]
+    
+    if not prompts:
+        raise ValueError(f"No prompts found in {prompts_file}. Expected a list of objects with 'prompt' or 'text' keys, or a list of strings.")
+    
+    return prompts
+
+def run_single_inference(model, tokenizer, prompt: str, args, device, use_mixed_precision, use_kv_cache) -> str:
+    """Run inference on a single prompt and return the generated text."""
+    # Prepare input
+    inputs = tokenizer(prompt, return_tensors="pt")
+    input_ids = inputs["input_ids"].to(device=device, dtype=torch.long)
+    attention_mask = inputs["attention_mask"].to(device=device, dtype=torch.long)
+    
+    # Check if model has generate method
+    has_generate = False
+    actual_model = None
+    if hasattr(model, 'modular_model') and hasattr(model.modular_model, 'model') and hasattr(model.modular_model.model, 'generate'):
+        actual_model = model.modular_model.model
+        has_generate = True
+    elif hasattr(model, 'model') and hasattr(model.model, 'generate'):
+        actual_model = model.model
+        has_generate = True
+    elif hasattr(model, 'generate'):
+        if hasattr(model, 'modular_model'):
+            if hasattr(model.modular_model, 'model'):
+                actual_model = model.modular_model.model
+            else:
+                actual_model = model.modular_model
+        else:
+            actual_model = model
+        has_generate = True
+    
+    # Use optimized generation if available
+    if use_kv_cache and has_generate:
+        if hasattr(actual_model, 'decoder') and hasattr(actual_model.decoder, 'generate'):
+            actual_model = actual_model.decoder
+        
+        do_sample = not args.greedy
+        temperature = 1.0 if args.greedy else args.temperature
+        top_k = 1 if args.greedy else (args.top_k if args.top_k > 0 else 50)
+        
+        generate_kwargs = {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'max_new_tokens': args.max_tokens,
+            'temperature': temperature,
+            'top_k': top_k,
+            'top_p': 0.95,
+            'do_sample': do_sample,
+            'repetition_penalty': args.repetition_penalty,
+            'eos_token_id': tokenizer.eos_token_id,
+            'pad_token_id': tokenizer.eos_token_id if tokenizer.pad_token_id is None else tokenizer.pad_token_id
+        }
+        
+        with torch.no_grad():
+            if use_mixed_precision:
+                with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    generated_ids = actual_model.generate(**generate_kwargs)
+            else:
+                generated_ids = actual_model.generate(**generate_kwargs)
+        
+        # Decode the generated text
+        generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        prompt_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
+        
+        # Extract only the new generated text
+        if generated_text.startswith(prompt_text):
+            new_text = generated_text[len(prompt_text):]
+        else:
+            new_text = generated_text
+        
+        return new_text.strip()
+    else:
+        # Fallback to standard generation
+        generated_tokens = []
+        current_input_ids = input_ids.clone()
+        current_attention_mask = attention_mask.clone()
+        
+        with torch.no_grad():
+            for step in range(args.max_tokens):
+                if use_mixed_precision:
+                    with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                        outputs = model(input_ids=current_input_ids, attention_mask=current_attention_mask)
+                else:
+                    outputs = model(input_ids=current_input_ids, attention_mask=current_attention_mask)
+                
+                # Extract logits
+                if isinstance(outputs, dict):
+                    logits = outputs.get('logits', outputs)
+                elif hasattr(outputs, 'logits'):
+                    logits = outputs.logits
+                else:
+                    logits = outputs
+                
+                if isinstance(logits, tuple):
+                    logits = logits[0]
+                
+                last_token_logits = logits[0, -1, :].clone()
+                
+                # Apply repetition penalty
+                if args.repetition_penalty != 1.0 and len(generated_tokens) > 0:
+                    unique_generated = set(generated_tokens)
+                    for token_id in unique_generated:
+                        if last_token_logits[token_id] < 0:
+                            last_token_logits[token_id] *= args.repetition_penalty
+                        else:
+                            last_token_logits[token_id] /= args.repetition_penalty
+                
+                # Apply temperature
+                if args.temperature != 1.0:
+                    last_token_logits = last_token_logits / args.temperature
+                
+                # Sample from top_k tokens
+                top_k_logits, top_k_indices = torch.topk(last_token_logits, min(args.top_k, last_token_logits.size(-1)))
+                top_k_probs = torch.softmax(top_k_logits, dim=-1)
+                sampled_idx = torch.multinomial(top_k_probs, 1)[0]
+                next_token_id = top_k_indices[sampled_idx]
+                
+                generated_tokens.append(next_token_id.item())
+                
+                # Update input for next iteration
+                next_token_id_tensor = next_token_id.unsqueeze(0).unsqueeze(0).to(device)
+                current_input_ids = torch.cat([current_input_ids, next_token_id_tensor], dim=1)
+                current_attention_mask = torch.cat([current_attention_mask, torch.ones(1, 1, dtype=torch.long, device=device)], dim=1)
+                
+                # Truncate if sequence gets too long
+                if current_input_ids.shape[1] > 512:
+                    current_input_ids = current_input_ids[:, -512:]
+                    current_attention_mask = current_attention_mask[:, -512:]
+                
+                # Stop if we hit a special token
+                if next_token_id.item() == tokenizer.eos_token_id:
+                    break
+        
+        # Decode generated tokens
+        generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        return generated_text.strip()
+
 def main():
     parser = argparse.ArgumentParser(description="NeMo ModularModel Text Generation")
     parser.add_argument("--model_config", type=str, default="model_config_243M",
@@ -32,8 +193,14 @@ def main():
                        help="Training stage (stage0, stage1, stage2)")
     parser.add_argument("--checkpoint", type=str, required=True,
                        help="Path to model checkpoint file")
-    parser.add_argument("--prompt", type=str, required=True,
-                       help="Input prompt for text generation")
+    parser.add_argument("--prompt", type=str, default=None,
+                       help="Input prompt for text generation (required if --prompts_file not provided)")
+    parser.add_argument("--prompts_file", type=str, default=None,
+                       help="Path to JSON file containing prompts to run inference on")
+    parser.add_argument("--prompt_file", type=str, default=None,
+                       dest="prompts_file", help="Alias for --prompts_file")
+    parser.add_argument("--output_file", type=str, default=None,
+                       help="Path to output JSON file to save prompts and generations (required when using --prompts_file)")
     parser.add_argument("--max_tokens", type=int, default=50,
                        help="Maximum number of tokens to generate")
     parser.add_argument("--temperature", type=float, default=0.8,
@@ -58,6 +225,17 @@ def main():
                        help="Batch size for inference (default: 1)")
     
     args = parser.parse_args()
+    
+    # Handle alias: if --prompt_file was used, it sets prompts_file via dest
+    # But we need to check if it was actually provided
+    # Since argparse doesn't easily let us check which argument was used,
+    # we'll just validate based on the final value
+    
+    # Validate arguments
+    if args.prompts_file is None and args.prompt is None:
+        parser.error("Either --prompt or --prompts_file (or --prompt_file) must be provided")
+    if args.prompts_file is not None and args.output_file is None:
+        parser.error("--output_file is required when using --prompts_file or --prompt_file")
     
     # Setup device
     if args.device == "auto":
@@ -190,6 +368,51 @@ def main():
     print(f"📊 Model is in eval mode: {not model.training}")
     if hasattr(model, 'modular_model') and hasattr(model.modular_model, 'model'):
         print(f"📊 Underlying model is in eval mode: {not model.modular_model.model.training}")
+    
+    # Handle batch processing from prompts file
+    if args.prompts_file:
+        print(f"\n📂 Loading prompts from {args.prompts_file}...")
+        prompts = load_prompts_from_file(args.prompts_file)
+        print(f"✅ Loaded {len(prompts)} prompts")
+        
+        print(f"\n🎯 Generation parameters: max_tokens={args.max_tokens}, temp={args.temperature}, top_k={args.top_k}, repetition_penalty={args.repetition_penalty}")
+        print(f"🔄 Running inference on {len(prompts)} prompts...\n")
+        
+        results = []
+        for i, prompt in enumerate(prompts, 1):
+            print(f"\n[{i}/{len(prompts)}] Processing prompt: {prompt[:80]}{'...' if len(prompt) > 80 else ''}")
+            try:
+                generated_text = run_single_inference(model, tokenizer, prompt, args, device, use_mixed_precision, use_kv_cache)
+                results.append({
+                    "prompt": prompt,
+                    "generated_text": generated_text,
+                    "prompt_index": i
+                })
+                print(f"✅ Generated {len(generated_text)} characters")
+            except Exception as e:
+                print(f"❌ Error processing prompt {i}: {e}")
+                results.append({
+                    "prompt": prompt,
+                    "generated_text": "",
+                    "error": str(e),
+                    "prompt_index": i
+                })
+        
+        # Save results to output file
+        output_path = Path(args.output_file)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        print(f"\n💾 Saving results to {output_path}...")
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+        
+        print(f"✅ Saved {len(results)} results to {output_path}")
+        print(f"📊 Successfully processed: {sum(1 for r in results if 'error' not in r)}/{len(results)} prompts")
+        return
+    
+    # Single prompt mode (original behavior)
+    if args.prompt is None:
+        parser.error("--prompt is required when not using --prompts_file")
     
     # Prepare input with matching dtype
     inputs = tokenizer(args.prompt, return_tensors="pt")
