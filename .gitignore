@@ -208,5 +208,10 @@ __marimo__/
 
 # custom
 data/processed/*
+data/cache/*
+data/stage1/*
+data/stage2/*
+data/stage3/*
 outputs/*
 tokenizers/*
+profiler_logs/*
