@@ -18,7 +18,8 @@ def load_model_checkpoint(checkpoint_path, model, device="auto", use_cpu_offload
     if device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    # PyTorch 2.6+ defaults to weights_only=True, but checkpoints may contain tokenizer objects
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
     if 'model_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -64,7 +65,8 @@ def load_plan_decoder_checkpoint(checkpoint_path, config, tokenizer, device="aut
     )
     
     # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    # PyTorch 2.6+ defaults to weights_only=True, but checkpoints may contain tokenizer objects
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
     if 'model_state_dict' in checkpoint:
         # Handle vocabulary size mismatch by resizing embeddings
@@ -93,7 +95,8 @@ def load_decoder_only_checkpoint(checkpoint_path, config, device="auto", use_cpu
     decoder = LMHeadDecoder(config['decoder_config'], config['vocab_size'])
     
     # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    # PyTorch 2.6+ defaults to weights_only=True, but checkpoints may contain tokenizer objects
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
     if 'model_state_dict' in checkpoint:
         state_dict = checkpoint['model_state_dict']

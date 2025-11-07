@@ -148,19 +148,40 @@ def collate_fn(batch, tokenizer=None, max_length=2048):
             # Handle pre-tokenized data
             batched = {}
             # Only process training-relevant keys (skip 'id' field)
-            training_keys = [key for key in batch[0].keys() if key in ['input_ids', 'attention_mask', 'labels']]
+            training_keys = [key for key in batch[0].keys() if key in ['input_ids', 'attention_mask', 'labels', 'labels_shifted']]
+            
+            # Check if labels_shifted flag is already set in the data
+            # If labels are pre-tokenized, they are likely already shifted
+            # Handle both boolean and list formats (from batched tokenization)
+            labels_shifted_val = batch[0].get('labels_shifted', True)
+            if isinstance(labels_shifted_val, list):
+                # If it's a list (from batched tokenization), check first value
+                labels_shifted = labels_shifted_val[0] if len(labels_shifted_val) > 0 else True
+            else:
+                labels_shifted = labels_shifted_val if labels_shifted_val is not None else True
             
             # First, determine the target length for all sequences
+            # Skip boolean values (like labels_shifted) when calculating lengths
             all_lengths = []
             for item in batch:
                 for key in training_keys:
                     if key in item:
-                        all_lengths.append(len(item[key]))
+                        value = item[key]
+                        # Skip boolean values and other non-sequence types
+                        if isinstance(value, bool) or not hasattr(value, '__len__'):
+                            continue
+                        all_lengths.append(len(value))
             
             # Use the maximum length, but don't exceed max_length
             target_length = min(max(all_lengths), max_length)
             
             for key in training_keys:
+                # Skip boolean values (like labels_shifted) - they don't need padding/truncation
+                if key == 'labels_shifted':
+                    # labels_shifted is a boolean flag, not a tensor
+                    # We'll set it separately after processing other keys
+                    continue
+                
                 tensors = [item[key] for item in batch]
                 # Convert lists to tensors if needed
                 for i, tensor in enumerate(tensors):
@@ -190,6 +211,9 @@ def collate_fn(batch, tokenizer=None, max_length=2048):
                     padded_tensors.append(padded_tensor)
                 
                 batched[key] = torch.stack(padded_tensors, dim=0)
+            
+            # Set labels_shifted flag (immutable once set)
+            batched['labels_shifted'] = labels_shifted
             return batched
         # Check if we have text that needs tokenization
         elif 'text' in batch[0] and isinstance(batch[0]['text'], str):
@@ -210,19 +234,31 @@ def collate_fn(batch, tokenizer=None, max_length=2048):
                 input_ids = tokenized['input_ids']
                 attention_mask = tokenized['attention_mask']
                 
+                # SS debug: SHIFTING LABELS HERE (only if raw text, not pre-tokenized)
+                # This path is for raw text that needs tokenization in collate_fn
+                # If data comes from tokenize_function, labels are already shifted there
                 # Create labels by shifting input_ids
                 labels = input_ids.clone()
-                labels[:, :-1] = input_ids[:, 1:]  # Shift right
+                labels[:, :-1] = input_ids[:, 1:]  # Shift right: labels[i] = input_ids[i+1]
                 labels[:, -1] = -100  # Ignore last token in loss calculation
                 
                 return {
                     'input_ids': input_ids,
                     'attention_mask': attention_mask,
-                    'labels': labels
+                    'labels': labels,
+                    'labels_shifted': True  # Flag: labels are already shifted, do not shift again
                 }
             else:
                 # Fallback: try to stack existing tensors
                 batched = {}
+                # Preserve labels_shifted flag if it exists
+                # CRITICAL: If labels exist, they are ALWAYS shifted (from tokenize_function or dataset)
+                # Default to True for pre-tokenized data, False only if explicitly set to False
+                labels_shifted_val = batch[0].get('labels_shifted', True)  # Changed default from False to True
+                if isinstance(labels_shifted_val, list):
+                    labels_shifted = labels_shifted_val[0] if len(labels_shifted_val) > 0 else True
+                else:
+                    labels_shifted = labels_shifted_val if labels_shifted_val is not None else True
                 for key in batch[0].keys():
                     tensors = [item[key] for item in batch]
                     # Convert lists to tensors if needed
@@ -230,18 +266,32 @@ def collate_fn(batch, tokenizer=None, max_length=2048):
                         if isinstance(tensor, list):
                             tensors[i] = torch.tensor(tensor, dtype=torch.long)
                     batched[key] = torch.stack(tensors, dim=0)
+                # Preserve labels_shifted flag
+                if 'labels' in batched:
+                    batched['labels_shifted'] = labels_shifted
                 return batched
         else:
             # Handle other pre-tokenized data formats
             batched = {}
+            # Preserve labels_shifted flag if it exists
+            # CRITICAL: If labels exist, they are ALWAYS shifted (from tokenize_function or dataset)
+            # Default to True for pre-tokenized data, False only if explicitly set to False
+            labels_shifted_val = batch[0].get('labels_shifted', True)  # Changed default from False to True
+            if isinstance(labels_shifted_val, list):
+                labels_shifted = labels_shifted_val[0] if len(labels_shifted_val) > 0 else True
+            else:
+                labels_shifted = labels_shifted_val if labels_shifted_val is not None else True
             for key in batch[0].keys():
                 tensors = [item[key] for item in batch]
                 # Convert lists to tensors if needed
                 for i, tensor in enumerate(tensors):
                     if isinstance(tensor, list):
                         tensors[i] = torch.tensor(tensor, dtype=torch.long)
-            batched[key] = torch.stack(tensors, dim=0)
-        return batched
+                batched[key] = torch.stack(tensors, dim=0)
+            # Preserve labels_shifted flag
+            if 'labels' in batched:
+                batched['labels_shifted'] = labels_shifted
+            return batched
     
     # If batch is already a dictionary, it means the default collate already processed it
     if isinstance(batch, dict):
@@ -257,16 +307,20 @@ def collate_fn(batch, tokenizer=None, max_length=2048):
                     return_tensors='pt'
                 )
                 
+                # SS debug: SHIFTING LABELS HERE (only if batch is dict with text list)
+                # This is an alternative path for raw text tokenization
+                # If data comes from tokenize_function, labels are already shifted there
                 input_ids = tokenized['input_ids']
                 attention_mask = tokenized['attention_mask']
                 labels = input_ids.clone()
-                labels[:, :-1] = input_ids[:, 1:]
-                labels[:, -1] = -100
+                labels[:, :-1] = input_ids[:, 1:]  # Shift right: labels[i] = input_ids[i+1]
+                labels[:, -1] = -100  # Ignore last token in loss calculation
                 
                 return {
                     'input_ids': input_ids,
                     'attention_mask': attention_mask,
-                    'labels': labels
+                    'labels': labels,
+                    'labels_shifted': True  # Flag: labels are already shifted, do not shift again
                 }
         
         # If already tokenized, return as is
@@ -356,6 +410,7 @@ class ModularModelTrainingModule(pl.LightningModule):
         warmup_steps: int = 100,
         optimizer_config: dict = None,
         scheduler_config: dict = None,
+        tokenizer=None,
     ):
         super().__init__()
         self.model = model
@@ -363,6 +418,13 @@ class ModularModelTrainingModule(pl.LightningModule):
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.warmup_steps = warmup_steps
+        
+        # Store tokenizer for debugging (optional)
+        self.tokenizer = tokenizer
+        
+        # Counter for debug output (first 5 samples)
+        self.debug_sample_count = 0
+        self.max_debug_samples = 5
         
         # Store optimizer and scheduler configurations
         self.optimizer_config = optimizer_config or {
@@ -386,12 +448,155 @@ class ModularModelTrainingModule(pl.LightningModule):
         # Save hyperparameters (excluding the model to avoid pickle issues)
         self.save_hyperparameters(ignore=['model'])
     
+    def _debug_print_batch(self, batch, input_ids, labels, attention_mask, batch_idx, num_samples_to_print):
+        """Print debug information for first 5 samples to verify training data."""
+        try:
+            # Get tokenizer if available
+            tokenizer = self.tokenizer
+            if tokenizer is None:
+                # Try to get tokenizer from model if available
+                if hasattr(self.model, 'tokenizer'):
+                    tokenizer = self.model.tokenizer
+                elif hasattr(self.model, 'modular_model') and hasattr(self.model.modular_model, 'tokenizer'):
+                    tokenizer = self.model.modular_model.tokenizer
+            
+            # If still no tokenizer, try to load it
+            if tokenizer is None:
+                try:
+                    from src.utils.tokenizer_manager import get_tokenizer_with_caching
+                    tokenizer = get_tokenizer_with_caching(
+                        tokenizer_path="Qwen/Qwen3-Coder-30B-A3B-Instruct",
+                        custom_tokens=None,
+                        force_download=False,
+                        cache_dir="tokenizers"
+                    )
+                except Exception as e:
+                    logging.warning(f"Could not load tokenizer for debugging: {e}")
+                    tokenizer = None
+            
+            logging.info("=" * 80)
+            logging.info(f"🔍 DEBUG: Training Batch {batch_idx}, Printing {num_samples_to_print} sample(s)")
+            logging.info("=" * 80)
+            
+            labels_shifted = batch.get('labels_shifted', False)
+            logging.info(f"📊 labels_shifted flag: {labels_shifted}")
+            
+            for sample_idx in range(num_samples_to_print):
+                global_sample_num = self.debug_sample_count + sample_idx + 1
+                logging.info(f"\n{'=' * 80}")
+                logging.info(f"📝 SAMPLE {global_sample_num}/5 (batch_idx={batch_idx}, sample_idx={sample_idx})")
+                logging.info(f"{'=' * 80}")
+                
+                # Get sample data
+                sample_input_ids = input_ids[sample_idx].cpu().clone()
+                sample_labels = labels[sample_idx].cpu().clone()
+                sample_attention_mask = attention_mask[sample_idx].cpu().clone()
+                
+                # Remove padding (where attention_mask is 0)
+                valid_length = sample_attention_mask.sum().item()
+                sample_input_ids = sample_input_ids[:valid_length]
+                sample_labels = sample_labels[:valid_length]
+                sample_attention_mask = sample_attention_mask[:valid_length]
+                
+                # Print input_ids
+                logging.info(f"\n📥 INPUT_IDS (shape: {sample_input_ids.shape}):")
+                logging.info(f"   IDs: {sample_input_ids.tolist()[:50]}..." if len(sample_input_ids) > 50 else f"   IDs: {sample_input_ids.tolist()}")
+                
+                # Print attention_mask
+                logging.info(f"\n🎭 ATTENTION_MASK (shape: {sample_attention_mask.shape}):")
+                logging.info(f"   Mask: {sample_attention_mask.tolist()[:50]}..." if len(sample_attention_mask) > 50 else f"   Mask: {sample_attention_mask.tolist()}")
+                
+                # Print labels (token IDs)
+                logging.info(f"\n🏷️  LABELS (token IDs, shape: {sample_labels.shape}):")
+                logging.info(f"   IDs: {sample_labels.tolist()[:50]}..." if len(sample_labels) > 50 else f"   IDs: {sample_labels.tolist()}")
+                
+                # Decode to text if tokenizer available
+                if tokenizer is not None:
+                    try:
+                        # Decode input_ids to text
+                        input_text = tokenizer.decode(sample_input_ids, skip_special_tokens=False)
+                        logging.info(f"\n📝 INPUT_TEXT (decoded from input_ids):")
+                        logging.info(f"   Text: {input_text[:200]}..." if len(input_text) > 200 else f"   Text: {input_text}")
+                        
+                        # Decode labels to text (filter out -100)
+                        valid_label_ids = sample_labels[sample_labels != -100]
+                        if len(valid_label_ids) > 0:
+                            labels_text = tokenizer.decode(valid_label_ids, skip_special_tokens=False)
+                            logging.info(f"\n🏷️  LABELS_TEXT (decoded from labels, ignoring -100):")
+                            logging.info(f"   Text: {labels_text[:200]}..." if len(labels_text) > 200 else f"   Text: {labels_text}")
+                        else:
+                            logging.info(f"\n🏷️  LABELS_TEXT: All labels are -100 (ignored)")
+                        
+                        # Verify label shifting
+                        logging.info(f"\n✅ LABEL SHIFTING VERIFICATION:")
+                        if labels_shifted:
+                            # Labels are already shifted: labels[i] = input_ids[i+1]
+                            # Check first few positions
+                            num_check = min(10, len(sample_input_ids) - 1)
+                            logging.info(f"   labels_shifted=True: labels[i] should equal input_ids[i+1]")
+                            for i in range(num_check):
+                                if sample_labels[i] != -100:
+                                    expected = sample_input_ids[i + 1].item() if i + 1 < len(sample_input_ids) else -100
+                                    actual = sample_labels[i].item()
+                                    match = "✓" if actual == expected else "✗"
+                                    logging.info(f"   Position {i}: label={actual}, expected (input_ids[{i+1}])={expected} {match}")
+                        else:
+                            # Labels are NOT shifted: labels[i] = input_ids[i]
+                            # We need to shift them
+                            logging.info(f"   labels_shifted=False: labels[i] should equal input_ids[i] (will shift in training_step)")
+                            num_check = min(10, len(sample_input_ids))
+                            for i in range(num_check):
+                                if sample_labels[i] != -100:
+                                    expected = sample_input_ids[i].item()
+                                    actual = sample_labels[i].item()
+                                    match = "✓" if actual == expected else "✗"
+                                    logging.info(f"   Position {i}: label={actual}, expected (input_ids[{i}])={expected} {match}")
+                        
+                    except Exception as e:
+                        logging.warning(f"Could not decode tokens to text: {e}")
+                else:
+                    logging.warning("Tokenizer not available - cannot decode to text")
+                
+                # Print shift_labels that will be used for loss
+                logging.info(f"\n🔄 SHIFTED LABELS FOR LOSS CALCULATION:")
+                if labels_shifted:
+                    shift_labels = sample_labels[:-1]  # Slice labels[:-1]
+                    logging.info(f"   labels_shifted=True: Using labels[:-1] (shape: {shift_labels.shape})")
+                    logging.info(f"   Shift labels IDs: {shift_labels.tolist()[:30]}..." if len(shift_labels) > 30 else f"   Shift labels IDs: {shift_labels.tolist()}")
+                else:
+                    shift_labels = sample_labels[1:]  # Shift labels[1:]
+                    logging.info(f"   labels_shifted=False: Using labels[1:] (shape: {shift_labels.shape})")
+                    logging.info(f"   Shift labels IDs: {shift_labels.tolist()[:30]}..." if len(shift_labels) > 30 else f"   Shift labels IDs: {shift_labels.tolist()}")
+                
+                if tokenizer is not None and len(shift_labels) > 0:
+                    try:
+                        valid_shift_labels = shift_labels[shift_labels != -100]
+                        if len(valid_shift_labels) > 0:
+                            shift_labels_text = tokenizer.decode(valid_shift_labels, skip_special_tokens=False)
+                            logging.info(f"   Shift labels text: {shift_labels_text[:200]}..." if len(shift_labels_text) > 200 else f"   Shift labels text: {shift_labels_text}")
+                    except Exception as e:
+                        logging.warning(f"Could not decode shift_labels: {e}")
+            
+            logging.info(f"\n{'=' * 80}\n")
+            
+        except Exception as e:
+            logging.error(f"Error in debug print: {e}")
+            import traceback
+            logging.error(traceback.format_exc())
+    
     def training_step(self, batch, batch_idx):
         if self.stage == "stage1":
             # Stage 1: Next token prediction
             input_ids = batch["input_ids"]
             labels = batch["labels"]
             attention_mask = batch["attention_mask"]
+            
+            # Debug output for first 5 samples (across all batches)
+            if self.debug_sample_count < self.max_debug_samples:
+                batch_size = input_ids.shape[0]
+                samples_to_print = min(batch_size, self.max_debug_samples - self.debug_sample_count)
+                self._debug_print_batch(batch, input_ids, labels, attention_mask, batch_idx, samples_to_print)
+                self.debug_sample_count += samples_to_print
             
             outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
             # Handle different output formats
@@ -404,8 +609,25 @@ class ModularModelTrainingModule(pl.LightningModule):
                 logits = outputs
             
             # Shift logits and labels for next token prediction
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
+            # Check if labels are already shifted (set by dataset/collate function)
+            # CRITICAL: If labels exist, they are ALWAYS shifted (from tokenize_function or dataset)
+            # Default to True if labels exist, False only if explicitly set to False
+            labels_shifted = batch.get('labels_shifted', True if 'labels' in batch else False)
+            
+            # SS debug: NOT SHIFTING AGAIN - just aligning dimensions
+            # When labels_shifted=True: labels are already shifted (labels[i] = input_ids[i+1])
+            # We only slice to align dimensions: logits[:-1] aligns with labels[:-1]
+            # This is NOT a shift - it's just removing the last position to match logits
+            if labels_shifted:
+                # Labels are already shifted: labels[i] = input_ids[i+1]
+                # We only need to shift logits to align with labels
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., :-1].contiguous()  # Slice labels[:-1] to align with logits[:-1] (NOT shifting)
+            else:
+                # Labels are NOT shifted: labels[i] = input_ids[i]
+                # We need to shift both logits and labels
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()  # Shift labels to get next tokens
             
             loss = self.loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
         
@@ -444,8 +666,19 @@ class ModularModelTrainingModule(pl.LightningModule):
             
             # Calculate accuracy (for next token prediction)
             if self.stage == "stage1":
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
+                # Use the same logic as loss calculation
+                # CRITICAL: If labels exist, they are ALWAYS shifted (from tokenize_function or dataset)
+                labels_shifted = batch.get('labels_shifted', True if 'labels' in batch else False)
+                
+                # SS debug: NOT SHIFTING AGAIN - just aligning dimensions for accuracy calculation
+                # Same logic as loss calculation above
+                if labels_shifted:
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., :-1].contiguous()  # Slice, not shift
+                else:
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., 1:].contiguous()  # Shift labels
+                
                 predictions = torch.argmax(shift_logits, dim=-1)
                 accuracy = (predictions == shift_labels).float().mean()
             else:
@@ -493,13 +726,38 @@ class ModularModelTrainingModule(pl.LightningModule):
                     logits = outputs
                 
                 # Shift logits and labels for next token prediction
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
+                # Check if labels are already shifted (set by dataset/collate function)
+                # CRITICAL: If labels exist, they are ALWAYS shifted (from tokenize_function or dataset)
+                labels_shifted = batch.get('labels_shifted', True if 'labels' in batch else False)
+                
+                # SS debug: NOT SHIFTING AGAIN - just aligning dimensions (validation step)
+                # Same logic as training_step above
+                if labels_shifted:
+                    # Labels are already shifted: labels[i] = input_ids[i+1]
+                    # We only need to shift logits to align with labels
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., :-1].contiguous()  # Slice labels[:-1] to align (NOT shifting)
+                else:
+                    # Labels are NOT shifted: labels[i] = input_ids[i]
+                    # We need to shift both logits and labels
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., 1:].contiguous()  # Shift labels to get next tokens
                 
                 loss = self.loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
                 
                 # Calculate validation metrics
                 perplexity = torch.exp(loss)
+                # Recalculate shift_logits and shift_labels for accuracy (same logic as loss)
+                # CRITICAL: If labels exist, they are ALWAYS shifted (from tokenize_function or dataset)
+                labels_shifted = batch.get('labels_shifted', True if 'labels' in batch else False)
+                # SS debug: NOT SHIFTING AGAIN - just aligning dimensions for accuracy (validation)
+                # Same logic as loss calculation above
+                if labels_shifted:
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., :-1].contiguous()  # Slice, not shift
+                else:
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., 1:].contiguous()  # Shift labels
                 predictions = torch.argmax(shift_logits, dim=-1)
                 accuracy = (predictions == shift_labels).float().mean()
             
@@ -608,10 +866,25 @@ class ModularModelTrainingModule(pl.LightningModule):
                     total_iters=warmup_steps
                 )
                 
+                # Get T_max from config (represents total training steps)
+                total_training_steps = int(self.scheduler_config.get("T_max", 100000))
+                
+                # Validate that T_max > warmup_steps
+                if total_training_steps <= warmup_steps:
+                    raise ValueError(
+                        f"T_max ({total_training_steps}) must be greater than warmup_steps ({warmup_steps}). "
+                        f"T_max represents total training steps, so it should include warmup steps."
+                    )
+                
+                # Cosine annealing runs for (T_max - warmup_steps) steps after warmup completes
+                # SequentialLR will switch to cosine scheduler at warmup_steps, and cosine scheduler
+                # will run for cosine_steps steps (counting from 0 internally)
+                cosine_steps = total_training_steps - warmup_steps
+                
                 # Create cosine annealing scheduler
                 cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                     optimizer,
-                    T_max=int(self.scheduler_config.get("T_max", 100000)) - warmup_steps,
+                    T_max=cosine_steps,  # Number of steps for cosine annealing (after warmup)
                     eta_min=float(self.scheduler_config.get("eta_min", 1e-7))
                 )
                 
@@ -623,9 +896,11 @@ class ModularModelTrainingModule(pl.LightningModule):
                 )
             else:
                 # No warmup, just cosine annealing
+                # T_max represents total training steps (no warmup to subtract)
+                total_training_steps = int(self.scheduler_config.get("T_max", 100000))
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                     optimizer,
-                    T_max=int(self.scheduler_config.get("T_max", 100000)),
+                    T_max=total_training_steps,
                     eta_min=float(self.scheduler_config.get("eta_min", 1e-7))
                 )
         elif scheduler_type == "StepLR":
@@ -943,7 +1218,8 @@ def check_checkpoint_compatibility(checkpoint_path: str, training_module, logger
     Returns True if compatible, False if incompatible.
     """
     try:
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        # PyTorch 2.6+ defaults to weights_only=True, but checkpoints may contain tokenizer objects
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         if 'state_dict' not in checkpoint:
             return False
             
@@ -965,6 +1241,57 @@ def check_checkpoint_compatibility(checkpoint_path: str, training_module, logger
         if checkpoint_weight_tying != current_weight_tying:
             logger.warning(f"⚠️ Weight tying mismatch: checkpoint={checkpoint_weight_tying}, current={current_weight_tying}")
             return False
+        
+        # Check optimizer state compatibility
+        # Get the current model's trainable parameters to compare with optimizer state
+        current_params = list(training_module.model.parameters())
+        current_trainable_params = [p for p in current_params if p.requires_grad]
+        current_param_count = len(current_trainable_params)
+        
+        # Also count total parameters (including frozen) for comparison
+        current_total_params = len(current_params)
+        
+        # Check checkpoint optimizer state
+        if 'optimizer_states' in checkpoint and len(checkpoint['optimizer_states']) > 0:
+            checkpoint_optimizer = checkpoint['optimizer_states'][0]
+            checkpoint_param_count = 0
+            
+            # Count unique parameters in optimizer state
+            if 'state' in checkpoint_optimizer:
+                checkpoint_param_count = len(checkpoint_optimizer['state'])
+            
+            # Get parameter group info
+            checkpoint_param_groups = checkpoint_optimizer.get('param_groups', [])
+            checkpoint_total_params_in_groups = sum(len(g.get('params', [])) for g in checkpoint_param_groups)
+            
+            # More lenient compatibility check:
+            # PyTorch Lightning can handle optimizer state mismatches by filtering
+            # We'll be lenient and let PyTorch Lightning try to load, then fall back if needed
+            # 1. If trainable params match exactly -> compatible
+            # 2. If checkpoint has MORE params -> might be compatible (params frozen, PyTorch Lightning will filter)
+            # 3. If checkpoint has FEWER params -> incompatible (model grew, can't restore optimizer state)
+            
+            if checkpoint_total_params_in_groups == current_param_count:
+                # Exact match - fully compatible
+                logger.info(f"✅ Optimizer state compatible: {checkpoint_total_params_in_groups} params match")
+                return True
+            elif checkpoint_total_params_in_groups > current_param_count:
+                # Checkpoint has more params - likely due to parameter freezing
+                # PyTorch Lightning can filter optimizer state for frozen params
+                logger.info(f"ℹ️  Optimizer state has more params ({checkpoint_total_params_in_groups}) than trainable ({current_param_count})")
+                logger.info(f"   This is likely due to parameter freezing. PyTorch Lightning will filter optimizer state.")
+                logger.info(f"   Frozen params: {current_total_params - current_param_count}")
+                logger.info(f"   Will attempt to load optimizer state (PyTorch Lightning will handle filtering)")
+                # Allow loading - PyTorch Lightning will filter out optimizer state for frozen params
+                return True
+            else:
+                # Checkpoint has fewer params - model grew, incompatible
+                logger.warning(f"⚠️ Optimizer state mismatch:")
+                logger.warning(f"   - Checkpoint has {checkpoint_total_params_in_groups} params")
+                logger.warning(f"   - Current model has {current_param_count} trainable params")
+                logger.warning(f"   - Checkpoint has fewer params than current model (model architecture changed)")
+                logger.warning("Will load model weights only and restart optimizer from scratch")
+                return False
             
         return True
         
@@ -982,7 +1309,8 @@ def load_checkpoint_with_fallback(checkpoint_path: str, training_module, logger)
     """
     try:
         logger.info(f"🔄 Attempting checkpoint loading from: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        # PyTorch 2.6+ defaults to weights_only=True, but checkpoints may contain tokenizer objects
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         
         if 'state_dict' in checkpoint:
             state_dict = checkpoint['state_dict']
@@ -1484,17 +1812,23 @@ def train_production_mode(
                 return_tensors=None  # Return lists, not tensors
             )
             
-            # Create labels by shifting input_ids
+            # SS debug: FIRST TIME SHIFTING LABELS (in tokenize_function)
+            # This is where labels are FIRST created and shifted for pre-tokenized datasets
+            # Labels are shifted: label[i] = input_ids[i+1]
+            # This sets labels_shifted=True, so training_step won't shift again
             input_ids = tokenized['input_ids']
             labels = []
             for ids in input_ids:
-                label = ids[1:] + [-100]  # Shift right and add -100 at the end
+                label = ids[1:] + [-100]  # Shift right: label[i] = ids[i+1], add -100 at end
                 labels.append(label)
             
+            # When using batched=True, return lists/arrays for all fields
+            batch_size = len(input_ids)
             return {
                 'input_ids': input_ids,
                 'attention_mask': tokenized['attention_mask'],
-                'labels': labels
+                'labels': labels,
+                'labels_shifted': [True] * batch_size  # Flag: labels are already shifted, do not shift again (list for batched=True)
             }
         
         # Tokenize the entire dataset
@@ -1527,7 +1861,7 @@ def train_production_mode(
 
     # Create a custom DataModule for HuggingFace datasets
     class HuggingFaceDataModule(LightningDataModule):
-        def __init__(self, dataset, tokenizer, batch_size=8, seq_length=2048, num_workers=8, pin_memory=True, persistent_workers=True, collate_fn=None, is_tokenized=False, test_size_samples=False):
+        def __init__(self, dataset, tokenizer, batch_size=8, seq_length=2048, num_workers=8, pin_memory=True, persistent_workers=True, collate_fn=None, is_tokenized=False, test_size_samples=False, seed=None):
             super().__init__()
             self.dataset = dataset
             self.tokenizer = tokenizer
@@ -1550,6 +1884,42 @@ def train_production_mode(
             
             self.train_dataset = dataset.select(range(train_size))
             self.val_dataset = dataset.select(range(train_size, train_size + val_size))
+            
+            # Create a persistent generator for reproducible shuffling across epochs
+            # Initialize with a seed for reproducibility
+            self.generator = torch.Generator()
+            if seed is not None:
+                self.generator.manual_seed(seed)
+            logging.info("🎲 Created persistent generator for reproducible DataLoader shuffling")
+        
+        def on_save_checkpoint(self, checkpoint):
+            """Save generator state to checkpoint for resumption."""
+            # Save generator state so we can restore exact shuffle order
+            # Note: This hook is only called if DataModule is passed to trainer.fit() directly
+            # Currently we pass loaders directly, so this won't be called automatically
+            # But it's here for future use or if we switch to passing data_module
+            if hasattr(self, 'generator'):
+                checkpoint['dataloader_generator_state'] = self.generator.get_state()
+                logging.debug("💾 Saved DataLoader generator state to checkpoint")
+        
+        def on_load_checkpoint(self, checkpoint):
+            """Restore generator state from checkpoint."""
+            # Restore generator state if available
+            # Note: This hook is only called if DataModule is passed to trainer.fit() directly
+            # Currently we pass loaders directly, so this won't be called automatically
+            # But it's here for future use or if we switch to passing data_module
+            if 'dataloader_generator_state' in checkpoint and hasattr(self, 'generator'):
+                try:
+                    self.generator.set_state(checkpoint['dataloader_generator_state'])
+                    logging.info("✅ Restored DataLoader generator state from checkpoint")
+                    logging.info("   Dataset shuffle order will continue from checkpoint")
+                except Exception as e:
+                    logging.warning(f"⚠️ Failed to restore generator state: {e}")
+                    logging.info("   Will use new generator state (dataset will restart from epoch beginning)")
+            else:
+                # This is expected when passing loaders directly - dataset will restart from epoch beginning
+                # This is standard PyTorch Lightning behavior and usually acceptable
+                pass
         
         def train_dataloader(self):
             logging.info(f"🔍 Creating train DataLoader with:")
@@ -1559,6 +1929,7 @@ def train_production_mode(
             logging.info(f"   - persistent_workers: {self.persistent_workers}")
             logging.info(f"   - dataset size: {len(self.train_dataset)}")
             logging.info(f"   - is_tokenized: {self.is_tokenized}")
+            logging.info(f"   - generator: Persistent (resumable)")
             
             if self.is_tokenized:
                 # For pre-tokenized data, use a simple collate function
@@ -1578,7 +1949,8 @@ def train_production_mode(
                 num_workers=self.num_workers,
                 pin_memory=self.pin_memory,
                 persistent_workers=self.persistent_workers if self.num_workers > 0 else False,
-                collate_fn=collate_fn_to_use
+                collate_fn=collate_fn_to_use,
+                generator=self.generator  # Use persistent generator for reproducible shuffling
             )
         
         def val_dataloader(self):
@@ -1614,7 +1986,8 @@ def train_production_mode(
         persistent_workers=config.get("persistent_workers", True),
         collate_fn=collate_fn,
         is_tokenized=True,
-        test_size_samples=config.get("data", {}).get("processing", {}).get("test_size_samples", False)
+        test_size_samples=config.get("data", {}).get("processing", {}).get("test_size_samples", False),
+        seed=seed  # Pass seed for generator initialization
         )
 
     # Get the data loaders from the custom data module
@@ -1631,12 +2004,14 @@ def train_production_mode(
     logging.info("✅ Using custom HuggingFace DataModule - DataLoaders already created and optimized!")
     
     # Create training module with optimizer and scheduler configs
+    # Pass tokenizer for debugging (first 5 samples)
     training_module = ModularModelTrainingModule(
         model=model,
         stage=stage,
         learning_rate=config["learning_rate"],
         optimizer_config=config.get("optimizer", {}),
-        scheduler_config=config.get("scheduler", {})
+        scheduler_config=config.get("scheduler", {}),
+        tokenizer=tokenizer  # Pass tokenizer for debug output
     )
     
     # Get training configuration (from flattened config structure)

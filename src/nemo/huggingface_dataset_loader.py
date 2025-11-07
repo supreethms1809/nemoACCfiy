@@ -1052,6 +1052,24 @@ class HuggingFaceDatasetWrapper(TorchDataset):
     def __getitem__(self, idx):
         """Get a single training sample."""
         sample = self.data[idx]
+        
+        # Check if sample already has pre-tokenized data with labels
+        if "input_ids" in sample and "labels" in sample:
+            # SS debug: DATASET ALREADY HAS LABELS - using them directly
+            # Dataset is pre-tokenized, use existing labels
+            # Check if labels are already shifted
+            labels_shifted = sample.get("labels_shifted", True)  # Default to True for pre-tokenized data
+            
+            return {
+                "input_ids": torch.tensor(sample["input_ids"], dtype=torch.long) if not isinstance(sample["input_ids"], torch.Tensor) else sample["input_ids"],
+                "attention_mask": torch.tensor(sample.get("attention_mask", [1] * len(sample["input_ids"])), dtype=torch.long) if not isinstance(sample.get("attention_mask"), torch.Tensor) else sample["attention_mask"],
+                "labels": torch.tensor(sample["labels"], dtype=torch.long) if not isinstance(sample["labels"], torch.Tensor) else sample["labels"],
+                "labels_shifted": labels_shifted
+            }
+        
+        # SS debug: SHIFTING LABELS HERE (only if raw text, not pre-tokenized)
+        # This path is for raw text that needs tokenization
+        # If data comes from tokenize_function, labels are already shifted there
         text = sample["text"]
         
         # Tokenize the text
@@ -1067,6 +1085,7 @@ class HuggingFaceDatasetWrapper(TorchDataset):
             attention_mask.extend([0] * padding_length)
         
         # Create labels for next-token prediction
+        # Shift labels: labels[i] = tokens[i+1]
         labels = []
         for i in range(len(tokens)):
             if i == len(tokens) - 1:
@@ -1081,7 +1100,8 @@ class HuggingFaceDatasetWrapper(TorchDataset):
         return {
             "input_ids": torch.tensor(tokens, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-            "labels": torch.tensor(labels, dtype=torch.long)
+            "labels": torch.tensor(labels, dtype=torch.long),
+            "labels_shifted": True  # Flag: labels are already shifted, do not shift again
         }
 
 

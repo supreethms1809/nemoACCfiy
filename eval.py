@@ -19,6 +19,7 @@ import numpy as np
 import math
 from collections import Counter
 import re
+from tqdm import tqdm
 
 # Add project root to system path for consistent imports
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__)))
@@ -33,25 +34,77 @@ except ImportError:
 
 def calculate_perplexity(model, tokenizer, texts, max_length=512):
     """Calculate perplexity on a set of texts."""
+    # CRITICAL: Ensure all nested modules are in eval mode
     model.eval()
+    if hasattr(model, 'modular_model'):
+        model.modular_model.eval()
+        if hasattr(model.modular_model, 'model'):
+            model.modular_model.model.eval()
+    
+    # Get model device and dtype
+    model_device = next(model.parameters()).device
+    model_dtype = next(model.parameters()).dtype
+    
+    # Determine if we should use mixed precision (autocast)
+    # Only use autocast if model is already in bfloat16 to avoid dtype mismatches
+    # If model is float32, autocast can cause dtype conflicts
+    use_mixed_precision = model_dtype == torch.bfloat16
+    
+    if use_mixed_precision:
+        print(f"   Using mixed precision (autocast) for forward pass")
+    else:
+        print(f"   Using full precision (no autocast) - model dtype: {model_dtype}")
+    
     total_loss = 0
     total_tokens = 0
     
+    print(f"   Processing {len(texts)} texts for perplexity calculation...")
+    
+    # Test forward pass to ensure model is working (catches initialization issues)
+    if len(texts) > 0:
+        print(f"   Running test forward pass...")
+        test_inputs = tokenizer(texts[0][:100] if len(texts[0]) > 100 else texts[0], return_tensors="pt", max_length=50, truncation=True)
+        test_input_ids = test_inputs["input_ids"].to(model_device)
+        test_attention_mask = test_inputs["attention_mask"].to(model_device)
+        with torch.no_grad():
+            if use_mixed_precision:
+                with torch.autocast(device_type='cpu' if model_device.type == 'cpu' else 'cuda', dtype=torch.bfloat16):
+                    test_outputs = model(input_ids=test_input_ids, attention_mask=test_attention_mask)
+            else:
+                test_outputs = model(input_ids=test_input_ids, attention_mask=test_attention_mask)
+        if model_device.type == 'cuda':
+            torch.cuda.synchronize()
+        print(f"   ✅ Test forward pass successful")
+    
     with torch.no_grad():
-        for text in texts:
+        for text in tqdm(texts, desc="Calculating perplexity", unit="text"):
             # Tokenize
             inputs = tokenizer(text, return_tensors="pt", max_length=max_length, truncation=True)
-            input_ids = inputs["input_ids"]
-            attention_mask = inputs["attention_mask"]
+            input_ids = inputs["input_ids"].to(model_device)
+            attention_mask = inputs["attention_mask"].to(model_device)
             
             # Create labels (shifted by 1 for next token prediction)
             labels = input_ids.clone()
             labels[:, :-1] = input_ids[:, 1:]
             labels[:, -1] = -100  # Ignore last token
             
-            # Forward pass
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            logits = outputs['logits']
+            # Forward pass with mixed precision if enabled (use wrapper forward pass, same as training)
+            if use_mixed_precision:
+                with torch.autocast(device_type='cpu' if model_device.type == 'cpu' else 'cuda', dtype=torch.bfloat16):
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            else:
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            
+            # Extract logits from wrapper output (wrapper returns dict with 'logits' key)
+            if isinstance(outputs, dict):
+                logits = outputs.get('logits', outputs)
+            elif hasattr(outputs, 'logits'):
+                logits = outputs.logits
+            else:
+                logits = outputs
+            
+            # Convert logits to float32 for loss calculation (as done in training)
+            logits = logits.float()
             
             # Calculate loss
             loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100)
@@ -59,6 +112,10 @@ def calculate_perplexity(model, tokenizer, texts, max_length=512):
             
             total_loss += loss.item() * (input_ids.size(1) - 1)  # Exclude last token
             total_tokens += (input_ids.size(1) - 1)
+            
+            # Synchronize CUDA operations to avoid hangs
+            if model_device.type == 'cuda':
+                torch.cuda.synchronize()
     
     avg_loss = total_loss / total_tokens
     perplexity = torch.exp(torch.tensor(avg_loss)).item()
@@ -66,23 +123,28 @@ def calculate_perplexity(model, tokenizer, texts, max_length=512):
 
 def evaluate_code_generation(model, tokenizer, prompts, max_new_tokens=50):
     """Evaluate code generation quality."""
+    # CRITICAL: Ensure all nested modules are in eval mode
     model.eval()
+    if hasattr(model, 'modular_model'):
+        model.modular_model.eval()
+        if hasattr(model.modular_model, 'model'):
+            model.modular_model.model.eval()
+    
     results = []
     
+    # Get model device and dtype
+    model_device = next(model.parameters()).device
+    model_dtype = next(model.parameters()).dtype
+    
+    # Determine if we should use mixed precision (autocast)
+    use_mixed_precision = model_dtype == torch.bfloat16
+    
     with torch.no_grad():
-        for prompt in prompts:
+        for prompt in tqdm(prompts, desc="Generating code", unit="prompt"):
             # Tokenize input
             inputs = tokenizer(prompt, return_tensors="pt")
-            input_ids = inputs["input_ids"]
-            attention_mask = inputs["attention_mask"]
-            
-            # Get model's dtype and device
-            model_dtype = next(model.parameters()).dtype
-            model_device = next(model.parameters()).device
-            
-            # Move inputs to match model
-            input_ids = input_ids.to(device=model_device, dtype=torch.long)
-            attention_mask = attention_mask.to(device=model_device, dtype=torch.long)
+            input_ids = inputs["input_ids"].to(model_device)
+            attention_mask = inputs["attention_mask"].to(model_device)
             
             # Simple generation (using top-k sampling)
             generated_tokens = []
@@ -90,9 +152,23 @@ def evaluate_code_generation(model, tokenizer, prompts, max_new_tokens=50):
             current_attention_mask = attention_mask
             
             for _ in range(max_new_tokens):
-                # Forward pass
-                outputs = model(input_ids=current_input_ids, attention_mask=current_attention_mask)
-                logits = outputs['logits']
+                # Forward pass with mixed precision if enabled (use wrapper forward pass, same as training)
+                if use_mixed_precision:
+                    with torch.autocast(device_type='cpu' if model_device.type == 'cpu' else 'cuda', dtype=torch.bfloat16):
+                        outputs = model(input_ids=current_input_ids, attention_mask=current_attention_mask)
+                else:
+                    outputs = model(input_ids=current_input_ids, attention_mask=current_attention_mask)
+                
+                # Extract logits from wrapper output
+                if isinstance(outputs, dict):
+                    logits = outputs.get('logits', outputs)
+                elif hasattr(outputs, 'logits'):
+                    logits = outputs.logits
+                else:
+                    logits = outputs
+                
+                # Convert to float32 for sampling
+                logits = logits.float()
                 
                 # Get last token logits
                 last_token_logits = logits[0, -1, :]
@@ -119,6 +195,10 @@ def evaluate_code_generation(model, tokenizer, prompts, max_new_tokens=50):
                 
                 current_input_ids = new_input_ids
                 current_attention_mask = new_attention_mask
+                
+                # Synchronize CUDA operations
+                if model_device.type == 'cuda':
+                    torch.cuda.synchronize()
             
             # Decode generated text
             generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
@@ -147,31 +227,57 @@ def calculate_perplexity_from_logits(logits, labels, ignore_index=-100):
 
 def calculate_generation_entropy(model, tokenizer, texts, max_length=512, temperature=1.0):
     """Calculate average entropy during text generation."""
+    # CRITICAL: Ensure all nested modules are in eval mode
     model.eval()
+    if hasattr(model, 'modular_model'):
+        model.modular_model.eval()
+        if hasattr(model.modular_model, 'model'):
+            model.modular_model.model.eval()
+    
+    # Get model device and dtype
+    model_device = next(model.parameters()).device
+    model_dtype = next(model.parameters()).dtype
+    
+    # Determine if we should use mixed precision (autocast)
+    use_mixed_precision = model_dtype == torch.bfloat16
+    
     total_entropy = 0
     total_tokens = 0
     
     with torch.no_grad():
-        for text in texts:
+        for text in tqdm(texts, desc="Calculating entropy", unit="text"):
             # Tokenize
             inputs = tokenizer(text, return_tensors="pt", max_length=max_length, truncation=True)
-            input_ids = inputs["input_ids"]
-            attention_mask = inputs["attention_mask"]
+            input_ids = inputs["input_ids"].to(model_device)
+            attention_mask = inputs["attention_mask"].to(model_device)
             
-            # Get model's device
-            model_device = next(model.parameters()).device
-            input_ids = input_ids.to(model_device)
-            attention_mask = attention_mask.to(model_device)
+            # Forward pass with mixed precision if enabled (use wrapper forward pass, same as training)
+            if use_mixed_precision:
+                with torch.autocast(device_type='cpu' if model_device.type == 'cpu' else 'cuda', dtype=torch.bfloat16):
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            else:
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             
-            # Forward pass
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            logits = outputs['logits']
+            # Extract logits from wrapper output
+            if isinstance(outputs, dict):
+                logits = outputs.get('logits', outputs)
+            elif hasattr(outputs, 'logits'):
+                logits = outputs.logits
+            else:
+                logits = outputs
+            
+            # Convert to float32 for entropy calculation
+            logits = logits.float()
             
             # Calculate entropy for each position
             for i in range(logits.size(1) - 1):  # Exclude last position
                 token_entropy = calculate_entropy(logits[0, i, :], temperature)
                 total_entropy += token_entropy
                 total_tokens += 1
+            
+            # Synchronize CUDA operations to avoid hangs
+            if model_device.type == 'cuda':
+                torch.cuda.synchronize()
     
     avg_entropy = total_entropy / total_tokens if total_tokens > 0 else 0
     return avg_entropy
@@ -256,8 +362,8 @@ def main():
                        help="Training stage")
     parser.add_argument("--checkpoint", type=str, required=True,
                        help="Path to model checkpoint")
-    parser.add_argument("--eval_data", type=str, default="data/example_training_data.jsonl",
-                       help="Path to evaluation data")
+    parser.add_argument("--eval_data", type=str, default=None,
+                       help="Path to evaluation data (optional, only needed for perplexity/entropy metrics)")
     parser.add_argument("--temperature", type=float, default=1.0,
                        help="Temperature for entropy calculation")
     parser.add_argument("--max_new_tokens", type=int, default=50,
@@ -271,16 +377,26 @@ def main():
     # Load configuration and model
     config = create_nemo_config_from_existing(args.model_config, args.stage)
     
-    # Disable mixed precision for evaluation
-    config['mixed_precision'] = None
-    config['use_flash_attention'] = False
+    # Use mixed precision for evaluation (matches training)
+    # This ensures consistency with training and improves performance
+    config['mixed_precision'] = 'bf16-mixed'  # Changed from None to match training
+    config['use_flash_attention'] = True
     
     # Create model
     model = create_modular_model_nemo(**config)
     
+    # Determine device (CUDA if available, else CPU)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"📊 Using device: {device}")
+    if device.type == 'cuda':
+        print(f"   CUDA available: {torch.cuda.is_available()}")
+        print(f"   CUDA device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A'}")
+    
     # Load checkpoint
     if os.path.exists(args.checkpoint):
-        checkpoint = torch.load(args.checkpoint, map_location='cpu')
+        # PyTorch 2.6+ defaults to weights_only=True, but checkpoints may contain tokenizer objects
+        # Load to CPU first, then move to target device
+        checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
         if 'state_dict' in checkpoint:
             model_state_dict = {}
             for key, value in checkpoint['state_dict'].items():
@@ -291,8 +407,50 @@ def main():
                 model_state_dict[new_key] = value
             
             model.load_state_dict(model_state_dict, strict=False)
-            model = model.float()  # Convert to float32
+            
+            # Move model to target device AFTER loading weights
+            model = model.to(device)
+            print(f"📊 Model moved to {device}")
+            
+            # Verify model is on correct device
+            model_device_after = next(model.parameters()).device
+            if model_device_after != device:
+                print(f"⚠️  Warning: Model device mismatch! Expected {device}, got {model_device_after}")
+                print(f"   Attempting to move model again...")
+                model = model.to(device)
+                model_device_after = next(model.parameters()).device
+                print(f"   Model device after retry: {model_device_after}")
+            
+            # CRITICAL: Ensure all nested modules are in eval mode
             model.eval()
+            if hasattr(model, 'modular_model'):
+                model.modular_model.eval()
+                if hasattr(model.modular_model, 'model'):
+                    model.modular_model.model.eval()
+                    # Also set decoder to eval mode if it exists
+                    if hasattr(model.modular_model.model, 'decoder'):
+                        model.modular_model.model.decoder.eval()
+            
+            # Note: Keep model in its original dtype (don't convert to float32)
+            # If training was in bf16, keep it in bf16 for consistency
+            # Only convert to float32 if explicitly needed for evaluation
+            print(f"📊 Model dtype: {next(model.parameters()).dtype}")
+            print(f"📊 Model is in eval mode: {not model.training}")
+            
+            # Convert model to bfloat16 if mixed precision is enabled (matches training)
+            model_dtype_before = next(model.parameters()).dtype
+            if config.get('mixed_precision') == 'bf16-mixed' and model_dtype_before != torch.bfloat16:
+                print(f"🔄 Converting model to bfloat16 for mixed precision evaluation...")
+                model = model.to(dtype=torch.bfloat16)  # Convert to bfloat16 while keeping device
+                print(f"✅ Model converted to bfloat16")
+            
+            # Check if mixed precision will be used
+            model_dtype = next(model.parameters()).dtype
+            if model_dtype == torch.bfloat16:
+                print(f"✅ Mixed precision (bfloat16) enabled for evaluation (matches training)")
+            else:
+                print(f"ℹ️  Using full precision ({model_dtype}) for evaluation")
+            
             print(f"✅ Loaded checkpoint from {args.checkpoint}")
         else:
             print(f"❌ Invalid checkpoint format: {args.checkpoint}")
@@ -306,46 +464,61 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     print(f"✅ Loaded tokenizer from {tokenizer_path}")
     
-    # Load evaluation data
+    # Load evaluation data (optional - only needed for perplexity/entropy metrics)
     eval_texts = []
-    if os.path.exists(args.eval_data):
+    if args.eval_data and os.path.exists(args.eval_data):
         with open(args.eval_data, 'r') as f:
             for line in f:
                 data = json.loads(line.strip())
                 eval_texts.append(data['text'])
         print(f"✅ Loaded {len(eval_texts)} evaluation texts")
+    elif args.eval_data:
+        print(f"⚠️  Evaluation data file not found: {args.eval_data}")
+        print(f"   Skipping perplexity and entropy metrics (code generation will still run)")
     else:
-        print(f"❌ Evaluation data not found: {args.eval_data}")
-        return
+        print(f"ℹ️  No evaluation data provided (--eval_data not specified)")
+        print(f"   Skipping perplexity and entropy metrics (code generation will still run)")
     
     print("\n📊 Evaluation Results:")
     print("-" * 30)
     
-    # 1. Perplexity Evaluation
-    print("1. Perplexity Evaluation...")
-    perplexity, avg_loss = calculate_perplexity(model, tokenizer, eval_texts)
-    print(f"   Average Loss: {avg_loss:.4f}")
-    print(f"   Perplexity: {perplexity:.2f}")
-    
-    # 1.5. Entropy Evaluation
-    print("\n1.5. Entropy Evaluation...")
-    avg_entropy = calculate_generation_entropy(model, tokenizer, eval_texts, temperature=args.temperature)
-    print(f"   Average Entropy: {avg_entropy:.4f}")
-    print(f"   Entropy Range: 0.0 (very confident) to {math.log(tokenizer.vocab_size):.2f} (very uncertain)")
-    
-    # Interpret entropy score
-    max_entropy = math.log(tokenizer.vocab_size)
-    entropy_percentage = (avg_entropy / max_entropy) * 100
-    print(f"   Entropy Level: {entropy_percentage:.1f}% of maximum entropy")
-    
-    if entropy_percentage < 20:
-        print("   🎯 Low entropy: Model is very confident (may be overfitting)")
-    elif entropy_percentage < 50:
-        print("   ✅ Good entropy: Model has balanced confidence")
-    elif entropy_percentage < 80:
-        print("   ⚠️  High entropy: Model is uncertain (may need more training)")
+    # 1. Perplexity Evaluation (only if eval_data provided)
+    perplexity = None
+    avg_loss = None
+    if eval_texts:
+        print("1. Perplexity Evaluation...")
+        perplexity, avg_loss = calculate_perplexity(model, tokenizer, eval_texts)
+        print(f"   Average Loss: {avg_loss:.4f}")
+        print(f"   Perplexity: {perplexity:.2f}")
     else:
-        print("   ❌ Very high entropy: Model is very uncertain")
+        print("1. Perplexity Evaluation...")
+        print("   ⏭️  Skipped (no evaluation data provided)")
+    
+    # 1.5. Entropy Evaluation (only if eval_data provided)
+    avg_entropy = None
+    entropy_percentage = None
+    if eval_texts:
+        print("\n1.5. Entropy Evaluation...")
+        avg_entropy = calculate_generation_entropy(model, tokenizer, eval_texts, temperature=args.temperature)
+        print(f"   Average Entropy: {avg_entropy:.4f}")
+        print(f"   Entropy Range: 0.0 (very confident) to {math.log(tokenizer.vocab_size):.2f} (very uncertain)")
+        
+        # Interpret entropy score
+        max_entropy = math.log(tokenizer.vocab_size)
+        entropy_percentage = (avg_entropy / max_entropy) * 100
+        print(f"   Entropy Level: {entropy_percentage:.1f}% of maximum entropy")
+        
+        if entropy_percentage < 20:
+            print("   🎯 Low entropy: Model is very confident (may be overfitting)")
+        elif entropy_percentage < 50:
+            print("   ✅ Good entropy: Model has balanced confidence")
+        elif entropy_percentage < 80:
+            print("   ⚠️  High entropy: Model is uncertain (may need more training)")
+        else:
+            print("   ❌ Very high entropy: Model is very uncertain")
+    else:
+        print("\n1.5. Entropy Evaluation...")
+        print("   ⏭️  Skipped (no evaluation data provided)")
     
     # 2. Code Generation Evaluation
     print("\n2. Code Generation Evaluation...")
@@ -434,8 +607,14 @@ def main():
     print("\n📋 Evaluation Summary:")
     print("-" * 20)
     print(f"✅ Model loaded successfully")
-    print(f"✅ Perplexity: {perplexity:.2f}")
-    print(f"✅ Average Entropy: {avg_entropy:.4f} ({entropy_percentage:.1f}% of max)")
+    if perplexity is not None:
+        print(f"✅ Perplexity: {perplexity:.2f}")
+    else:
+        print(f"⏭️  Perplexity: Not calculated (no eval data)")
+    if avg_entropy is not None:
+        print(f"✅ Average Entropy: {avg_entropy:.4f} ({entropy_percentage:.1f}% of max)")
+    else:
+        print(f"⏭️  Average Entropy: Not calculated (no eval data)")
     print(f"✅ Syntax Accuracy: {syntax_accuracy:.1f}%")
     print(f"✅ Repetition Score: {avg_repetition:.3f}")
     print(f"✅ Coherence Score: {avg_coherence:.3f}")
@@ -445,20 +624,22 @@ def main():
     # Overall quality assessment
     print(f"\n🎯 Overall Quality Assessment:")
     
-    if perplexity < 10:
-        print("🎯 Good perplexity (model is learning well)")
-    elif perplexity < 50:
-        print("⚠️  Moderate perplexity (model needs more training)")
-    else:
-        print("❌ High perplexity (model needs significant improvement)")
+    if perplexity is not None:
+        if perplexity < 10:
+            print("🎯 Good perplexity (model is learning well)")
+        elif perplexity < 50:
+            print("⚠️  Moderate perplexity (model needs more training)")
+        else:
+            print("❌ High perplexity (model needs significant improvement)")
     
     # Entropy assessment
-    if entropy_percentage < 30:
-        print("🎯 Good entropy balance (model is confident but not overconfident)")
-    elif entropy_percentage < 60:
-        print("⚠️  Moderate entropy (model could be more confident)")
-    else:
-        print("❌ High entropy (model is very uncertain)")
+    if entropy_percentage is not None:
+        if entropy_percentage < 30:
+            print("🎯 Good entropy balance (model is confident but not overconfident)")
+        elif entropy_percentage < 60:
+            print("⚠️  Moderate entropy (model could be more confident)")
+        else:
+            print("❌ High entropy (model is very uncertain)")
     
     # Generation quality assessment
     quality_score = (syntax_accuracy/100 * 0.3 + (1-avg_repetition) * 0.3 + avg_coherence * 0.2 + diversity_score * 0.2) * 100

@@ -465,10 +465,25 @@ class Stage2TrainingModule(pl.LightningModule):
                     total_iters=warmup_steps
                 )
                 
+                # Get T_max from config (represents total training steps)
+                total_training_steps = int(self.scheduler_config.get("T_max", 100000))
+                
+                # Validate that T_max > warmup_steps
+                if total_training_steps <= warmup_steps:
+                    raise ValueError(
+                        f"T_max ({total_training_steps}) must be greater than warmup_steps ({warmup_steps}). "
+                        f"T_max represents total training steps, so it should include warmup steps."
+                    )
+                
+                # Cosine annealing runs for (T_max - warmup_steps) steps after warmup completes
+                # SequentialLR will switch to cosine scheduler at warmup_steps, and cosine scheduler
+                # will run for cosine_steps steps (counting from 0 internally)
+                cosine_steps = total_training_steps - warmup_steps
+                
                 # Create cosine annealing scheduler
                 cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                     optimizer,
-                    T_max=int(self.scheduler_config.get("T_max", 100000)) - warmup_steps,
+                    T_max=cosine_steps,  # Number of steps for cosine annealing (after warmup)
                     eta_min=float(self.scheduler_config.get("eta_min", 1e-7))
                 )
                 
@@ -480,9 +495,11 @@ class Stage2TrainingModule(pl.LightningModule):
                 )
             else:
                 # No warmup, just cosine annealing
+                # T_max represents total training steps (no warmup to subtract)
+                total_training_steps = int(self.scheduler_config.get("T_max", 100000))
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                     optimizer,
-                    T_max=int(self.scheduler_config.get("T_max", 100000)),
+                    T_max=total_training_steps,
                     eta_min=float(self.scheduler_config.get("eta_min", 1e-7))
                 )
         else:

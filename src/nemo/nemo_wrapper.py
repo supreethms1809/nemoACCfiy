@@ -388,7 +388,9 @@ class ModularModelNeMo(NeuralModule, Exportable):
             raise ValueError(f"Unknown training stage: {cfg.training_stage}")
         
         # Loss function
-        self.loss_fn = nn.CrossEntropyLoss(ignore_index=cfg.pad_token_id)
+        # Use ignore_index=-100 to match training modules and PyTorch convention
+        # Padding tokens should be set to -100 in labels, not pad_token_id
+        self.loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
         
         # Logging
         self.logger = nemo_logging
@@ -465,7 +467,11 @@ class ModularModelNeMo(NeuralModule, Exportable):
             # Use target_ids directly (already shifted for next token prediction)
             loss = self.loss_fn(logits.view(-1, logits.size(-1)), target_ids.view(-1))
         elif labels is not None:
-            # Shift labels for next token prediction
+            # CRITICAL: Shift labels for next token prediction
+            # NOTE: This assumes labels are NOT already shifted (labels[i] = input_ids[i])
+            # If labels are already shifted (labels[i] = input_ids[i+1]), this will cause DOUBLE SHIFTING
+            # In normal training, labels are NOT passed to forward() - training_step handles shifting
+            # This code path is only for direct calls to forward() with labels
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss = self.loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
@@ -1033,55 +1039,6 @@ if __name__ == "__main__":
     print(f"  Loss: {outputs['loss']}")
     
     print(f"\nNeMo integration successful! 🎉")
-
-
-def create_modular_model_nemo(
-    vocab_size: int = 32000,
-    hidden_size: int = 2048,
-    num_layers: int = 24,
-    num_attention_heads: int = 16,
-    intermediate_size: int = 8192,
-    hidden_dropout_prob: float = 0.1,
-    training_stage: str = "stage1",
-    learning_rate: float = 1e-4,
-    weight_decay: float = 0.01,
-    warmup_steps: int = 1000,
-    **kwargs
-) -> ModularModelNeMoWrapper:
-    """
-    Factory function to create a ModularModel with NeMo integration.
-    
-    Args:
-        vocab_size: Vocabulary size
-        hidden_size: Hidden dimension size
-        num_layers: Number of transformer layers
-        num_attention_heads: Number of attention heads
-        intermediate_size: Feed-forward intermediate size
-        hidden_dropout_prob: Dropout probability
-        training_stage: Training stage (stage1, stage2)
-        learning_rate: Learning rate
-        weight_decay: Weight decay
-        warmup_steps: Number of warmup steps
-        **kwargs: Additional configuration parameters
-        
-    Returns:
-        ModularModelNeMoWrapper instance
-    """
-    cfg = ModularModelConfig(
-        vocab_size=vocab_size,
-        hidden_size=hidden_size,
-        num_layers=num_layers,
-        num_attention_heads=num_attention_heads,
-        intermediate_size=intermediate_size,
-        hidden_dropout_prob=hidden_dropout_prob,
-        training_stage=training_stage,
-        learning_rate=learning_rate,
-        weight_decay=weight_decay,
-        warmup_steps=warmup_steps,
-        **kwargs
-    )
-    
-    return ModularModelNeMoWrapper(cfg)
 
 
 class ModularModelConfig:

@@ -37,11 +37,13 @@ def main():
     parser.add_argument("--max_tokens", type=int, default=50,
                        help="Maximum number of tokens to generate")
     parser.add_argument("--temperature", type=float, default=0.8,
-                       help="Sampling temperature (0.1-2.0)")
-    parser.add_argument("--top_k", type=int, default=5,
-                       help="Number of top tokens to sample from")
+                       help="Sampling temperature (0.1-2.0, use 0.0 for greedy decoding)")
+    parser.add_argument("--top_k", type=int, default=50,
+                       help="Number of top tokens to sample from (default: 50, use 0 for no limit)")
     parser.add_argument("--repetition_penalty", type=float, default=1.1,
                        help="Repetition penalty (1.0 = no penalty, >1.0 = reduce repetition)")
+    parser.add_argument("--greedy", action="store_true", default=False,
+                       help="Use greedy decoding instead of sampling (temperature=0, top_k=1)")
     parser.add_argument("--device", type=str, default="auto",
                        help="Device to use (auto, cuda, cpu)")
     parser.add_argument("--mixed_precision", action="store_true", default=True,
@@ -89,7 +91,10 @@ def main():
     
     # Set mixed precision based on arguments and device capability
     config['mixed_precision'] = "bf16" if use_mixed_precision else None
-    config['use_flash_attention'] = False  # Disable flash attention for inference
+    # Keep flash attention enabled to match training (unless explicitly disabled)
+    # Flash attention should produce same results as standard attention, just faster
+    if not hasattr(args, 'disable_flash_attention') or not args.disable_flash_attention:
+        config['use_flash_attention'] = True  # Match training configuration
     
     # Create model
     model = create_modular_model_nemo(**config)
@@ -101,19 +106,50 @@ def main():
     
     # Load checkpoint with proper dtype handling
     if os.path.exists(args.checkpoint):
-        checkpoint = torch.load(args.checkpoint, map_location='cpu')
+        # PyTorch 2.6+ defaults to weights_only=True for security, but checkpoints may contain
+        # tokenizer objects (e.g., Qwen2TokenizerFast) which require weights_only=False
+        checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
         if 'state_dict' in checkpoint:
+            # Debug: Print first few keys to understand structure
+            checkpoint_keys = list(checkpoint['state_dict'].keys())[:10]
+            print(f"📊 Sample checkpoint keys: {checkpoint_keys}")
+            
+            # Get model's expected keys
+            model_keys = list(model.state_dict().keys())[:10]
+            print(f"📊 Sample model keys: {model_keys}")
+            
             model_state_dict = {}
             for key, value in checkpoint['state_dict'].items():
-                if key.startswith('model.'):
-                    new_key = key[6:]
-                else:
-                    new_key = key
+                # Handle different checkpoint key formats
+                # PyTorch Lightning saves with "model." prefix for the wrapped model
+                # Structure: model.modular_model.model.decoder.embed_tokens.weight (for ModularModelNeMoWrapper)
+                #            model.model.decoder.embed_tokens.weight (for DecoderOnlyModel)
+                new_key = key
+                
+                # Remove "model." prefix if present (PyTorch Lightning adds this)
+                if new_key.startswith('model.'):
+                    new_key = new_key[6:]  # Remove "model." -> modular_model.model.decoder...
+                
+                # Now new_key should be: modular_model.model.decoder... or model.decoder...
+                # The model expects: modular_model.model.decoder... (no further stripping needed!)
+                # So we just use new_key as-is
+                
                 # Keep the original dtype from checkpoint (bfloat16)
                 model_state_dict[new_key] = value
             
             # Load state dict while preserving dtypes
-            model.load_state_dict(model_state_dict, strict=False)
+            missing_keys, unexpected_keys = model.load_state_dict(model_state_dict, strict=False)
+            
+            if missing_keys:
+                print(f"⚠️ Missing keys (first 10): {missing_keys[:10]}")
+            if unexpected_keys:
+                print(f"⚠️ Unexpected keys (first 10): {unexpected_keys[:10]}")
+            
+            # Check if we actually loaded any weights
+            loaded_params = sum(1 for k in model_state_dict.keys() if k in model.state_dict())
+            total_params = len(model.state_dict())
+            print(f"📊 Loaded {loaded_params}/{total_params} parameters from checkpoint")
+            
             print(f"✅ Loaded checkpoint from {args.checkpoint}")
             
             # Move model to device first
@@ -121,9 +157,10 @@ def main():
             print(f"📊 Model moved to {device}")
             
             # Convert to appropriate precision based on mixed precision setting
+            # CRITICAL: Training uses BF16, so inference should use BF16 too (not FP16)
             if use_mixed_precision:
-                model = model.half()  # Convert to FP16 for mixed precision
-                print(f"📊 Model converted to FP16 (mixed precision)")
+                model = model.to(torch.bfloat16)  # Convert to BF16 to match training precision
+                print(f"📊 Model converted to BF16 (mixed precision) - matches training precision")
             else:
                 model = model.float()  # Convert to FP32
                 print(f"📊 Model converted to FP32")
@@ -139,8 +176,20 @@ def main():
         print(f"❌ Checkpoint not found: {args.checkpoint}")
         return
     
-    # Set model to evaluation mode (keep original dtype)
+    # Set model to evaluation mode (CRITICAL: ensure all submodules are in eval mode)
     model.eval()
+    # Also ensure nested modules are in eval mode to disable dropout
+    if hasattr(model, 'modular_model'):
+        model.modular_model.eval()
+        if hasattr(model.modular_model, 'model'):
+            model.modular_model.model.eval()
+            # Also set decoder to eval mode if it exists
+            if hasattr(model.modular_model.model, 'decoder'):
+                model.modular_model.model.decoder.eval()
+    
+    print(f"📊 Model is in eval mode: {not model.training}")
+    if hasattr(model, 'modular_model') and hasattr(model.modular_model, 'model'):
+        print(f"📊 Underlying model is in eval mode: {not model.modular_model.model.training}")
     
     # Prepare input with matching dtype
     inputs = tokenizer(args.prompt, return_tensors="pt")
@@ -161,10 +210,76 @@ def main():
     print(f"📝 Prompt: {args.prompt}")
     print(f"🎯 Generation parameters: max_tokens={args.max_tokens}, temp={args.temperature}, top_k={args.top_k}, repetition_penalty={args.repetition_penalty}")
     
+    # Test forward pass first to verify model is working
+    print("🔍 Testing forward pass to verify model is working...")
+    with torch.no_grad():
+        # CRITICAL FIX: Use wrapper forward pass (same as training) instead of bypassing
+        # This ensures we test the exact same path used during training
+        
+        if use_mixed_precision:
+            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                # Use wrapper forward pass (same as training)
+                test_output = model(input_ids=input_ids, attention_mask=attention_mask)
+        else:
+            # Use wrapper forward pass (same as training)
+            test_output = model(input_ids=input_ids, attention_mask=attention_mask)
+        
+        # Extract logits from wrapper output
+        if isinstance(test_output, dict):
+            test_logits = test_output.get('logits', test_output)
+        elif hasattr(test_output, 'logits'):
+            test_logits = test_output.logits
+        else:
+            test_logits = test_output
+        
+        if isinstance(test_logits, tuple):
+            test_logits = test_logits[0]
+        
+        print(f"✅ Forward pass successful! Logits shape: {test_logits.shape}")
+        print(f"📊 Logits dtype: {test_logits.dtype}, device: {test_logits.device}")
+        print(f"📊 Logits range: min={test_logits.min().item():.2f}, max={test_logits.max().item():.2f}, mean={test_logits.mean().item():.2f}")
+        
+        # Test greedy decoding on the prompt to verify model is working
+        print("\n🔍 Testing greedy decoding on prompt to verify model quality...")
+        last_token_logits = test_logits[0, -1, :]
+        greedy_token_id = torch.argmax(last_token_logits).item()
+        greedy_token = tokenizer.decode([greedy_token_id])
+        print(f"📊 Greedy next token: '{greedy_token}' (token_id: {greedy_token_id})")
+        
+        # Check top 5 predictions
+        top_5_logits, top_5_indices = torch.topk(last_token_logits, 5)
+        top_5_probs = torch.softmax(top_5_logits, dim=-1)
+        print(f"📊 Top 5 next token predictions:")
+        for i, (idx, prob) in enumerate(zip(top_5_indices, top_5_probs)):
+            token = tokenizer.decode([idx.item()])
+            print(f"  {i+1}. '{token}' (prob: {prob.item():.4f}, logit: {top_5_logits[i].item():.2f})")
+    
     # Use optimized generation if model supports it and KV cache is enabled
-    if use_kv_cache and hasattr(model, 'modular_model') and hasattr(model.modular_model, 'generate'):
-        print("🔄 Running optimized inference with KV caching...")
-        generate_optimized(model, input_ids, attention_mask, tokenizer, args, device, use_mixed_precision)
+    # Check if model has generate method (either directly or through model attribute)
+    has_generate = False
+    if hasattr(model, 'generate'):
+        has_generate = True
+        print("✅ Model has generate() method")
+    elif hasattr(model, 'modular_model') and hasattr(model.modular_model, 'model') and hasattr(model.modular_model.model, 'generate'):
+        has_generate = True
+        print("✅ Model.modular_model.model has generate() method")
+    elif hasattr(model, 'model') and hasattr(model.model, 'generate'):
+        has_generate = True
+        print("✅ Model.model has generate() method")
+    elif hasattr(model, 'modular_model') and hasattr(model.modular_model, 'generate'):
+        has_generate = True
+        print("✅ Model.modular_model has generate() method")
+    
+    # Try optimized generation first (uses model's built-in generate method)
+    # This is more reliable because it uses the same generation logic as training
+    if use_kv_cache and has_generate:
+        print("🔄 Running optimized inference with KV caching (using model's generate method)...")
+        try:
+            generate_optimized(model, input_ids, attention_mask, tokenizer, args, device, use_mixed_precision)
+        except Exception as e:
+            print(f"⚠️ Optimized generation failed: {e}")
+            print("🔄 Falling back to standard generation...")
+            generate_standard(model, input_ids, attention_mask, tokenizer, args, device, use_mixed_precision)
     else:
         print("🔄 Running standard inference...")
         generate_standard(model, input_ids, attention_mask, tokenizer, args, device, use_mixed_precision)
@@ -172,36 +287,91 @@ def main():
 def generate_optimized(model, input_ids, attention_mask, tokenizer, args, device, use_mixed_precision):
     """Optimized generation using model's built-in generate method with KV caching."""
     try:
-        # Use the model's built-in generate method
-        if use_mixed_precision:
-            with torch.amp.autocast('cuda'):
-                generated_ids = model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=args.max_tokens,
-                    temperature=args.temperature,
-                    top_k=args.top_k,
-                    do_sample=True,
-                    pad_token_id=tokenizer.eos_token_id
-                )
+        # Get the actual model that has generate() method
+        # Handle different model structures: ModularModelNeMo wrapper, etc.
+        # Structure: ModularModelNeMoWrapper -> modular_model (ModularModelNeMo) -> model (DecoderOnlyModel) -> decoder (LMHeadDecoder)
+        # IMPORTANT: We need to access the DecoderOnlyModel directly, not the wrapper
+        actual_model = None
+        if hasattr(model, 'modular_model') and hasattr(model.modular_model, 'model') and hasattr(model.modular_model.model, 'generate'):
+            # ModularModelNeMoWrapper -> modular_model -> model (DecoderOnlyModel)
+            actual_model = model.modular_model.model
+            print("📊 Using model.modular_model.model.generate() (DecoderOnlyModel)")
+        elif hasattr(model, 'model') and hasattr(model.model, 'generate'):
+            actual_model = model.model
+            print("📊 Using model.model.generate()")
+        elif hasattr(model, 'generate'):
+            # Check if this is the wrapper - if so, we need to go deeper
+            if hasattr(model, 'modular_model'):
+                # This is ModularModelNeMoWrapper, go to the actual model
+                if hasattr(model.modular_model, 'model'):
+                    actual_model = model.modular_model.model
+                    print("📊 Using model.modular_model.model.generate() (via wrapper)")
+                else:
+                    actual_model = model.modular_model
+                    print("📊 Using model.modular_model.generate()")
+            else:
+                actual_model = model
+                print("📊 Using model.generate()")
         else:
-            generated_ids = model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=args.max_tokens,
-                temperature=args.temperature,
-                top_k=args.top_k,
-                do_sample=True,
-                pad_token_id=tokenizer.eos_token_id
-            )
+            print("❌ Could not find generate() method, falling back to standard generation")
+            raise AttributeError("No generate() method found")
+        
+        # Use the model's built-in generate method
+        # CRITICAL: Use BF16 autocast to match training precision (not FP16)
+        # DecoderOnlyModel.generate() delegates to decoder.generate() which accepts:
+        # input_ids, attention_mask, max_new_tokens, temperature, top_p, top_k, do_sample, eos_token_id, pad_token_id, repetition_penalty
+        # But DecoderOnlyModel.generate() doesn't accept repetition_penalty, so we need to call decoder.generate() directly
+        # OR we can call the decoder's generate method directly if it's available
+        if hasattr(actual_model, 'decoder') and hasattr(actual_model.decoder, 'generate'):
+            # Call decoder.generate() directly to get access to repetition_penalty
+            actual_model = actual_model.decoder
+            print("📊 Using decoder.generate() directly (has repetition_penalty support)")
+        
+        # Use greedy decoding if requested, otherwise use sampling
+        if args.greedy:
+            do_sample = False
+            temperature = 1.0
+            top_k = 1
+            print("📊 Using greedy decoding (temperature=1.0, top_k=1, do_sample=False)")
+        else:
+            do_sample = True
+            temperature = args.temperature
+            top_k = args.top_k if args.top_k > 0 else 50
+            print(f"📊 Using sampling (temperature={temperature}, top_k={top_k}, do_sample=True)")
+        
+        generate_kwargs = {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'max_new_tokens': args.max_tokens,
+            'temperature': temperature,
+            'top_k': top_k,
+            'top_p': 0.95,  # Default top_p for nucleus sampling
+            'do_sample': do_sample,
+            'repetition_penalty': args.repetition_penalty,
+            'eos_token_id': tokenizer.eos_token_id,
+            'pad_token_id': tokenizer.eos_token_id if tokenizer.pad_token_id is None else tokenizer.pad_token_id
+        }
+        
+        if use_mixed_precision:
+            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                generated_ids = actual_model.generate(**generate_kwargs)
+        else:
+            generated_ids = actual_model.generate(**generate_kwargs)
         
         # Decode the generated text
         generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
         prompt_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
-        new_text = generated_text[len(prompt_text):]
         
-        print(f"🎯 Generated text: {new_text}")
-        print(f"\n✅ Optimized generation complete! Generated {len(new_text.split())} words.")
+        # Handle case where generated_text might be shorter than prompt_text
+        if generated_text.startswith(prompt_text):
+            new_text = generated_text[len(prompt_text):]
+        else:
+            # If prompt doesn't match, just use the generated text
+            new_text = generated_text
+        
+        print(f"\n🎯 Generated text: {new_text}")
+        print(f"📊 Generated {len(generated_ids[0]) - len(input_ids[0])} new tokens")
+        print(f"✅ Optimized generation complete!")
         
     except Exception as e:
         print(f"❌ Optimized generation failed: {e}")
@@ -212,45 +382,41 @@ def generate_standard(model, input_ids, attention_mask, tokenizer, args, device,
     """Standard generation method (fallback)."""
     print("🔄 Running standard inference...")
     
+    # CRITICAL FIX: Use the wrapper's forward pass (same as training) instead of bypassing it
+    # This ensures consistent behavior between training and inference
+    print("📊 Using wrapper forward pass (same as training path)...")
+    
     # Simple forward pass to get logits
     with torch.no_grad():
         try:
-            # Get the underlying model
-            if hasattr(model, 'modular_model'):
-                underlying_model = model.modular_model
-            else:
-                underlying_model = model
-            
             # Forward pass with autocast for mixed precision
+            # CRITICAL: Use BF16 autocast to match training precision (not FP16)
+            # CRITICAL FIX: Use wrapper forward pass (same as training) instead of bypassing
             if use_mixed_precision:
-                with torch.amp.autocast('cuda'):
-                    outputs = underlying_model(input_ids=input_ids, attention_mask=attention_mask)
+                with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    # Use wrapper forward pass (same as training)
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             else:
-                outputs = underlying_model(input_ids=input_ids, attention_mask=attention_mask)
+                # Use wrapper forward pass (same as training)
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             
-            print(f"📊 Output type: {type(outputs)}")
+            # Extract logits from wrapper output (wrapper returns dict with 'logits' key)
             if isinstance(outputs, dict):
-                print(f"📊 Output keys: {list(outputs.keys())}")
-                if 'logits' in outputs:
-                    logits = outputs['logits']
-                    print(f"📊 Logits from dict['logits']: {type(logits)}, shape: {logits.shape}")
-                else:
-                    print(f"❌ No 'logits' key found in output dict")
-                    return
+                logits = outputs.get('logits', outputs)
+                print(f"📊 Logits from dict['logits']: shape={logits.shape}")
             elif hasattr(outputs, 'logits'):
                 logits = outputs.logits
-                print(f"📊 Logits from outputs.logits: {type(logits)}, shape: {logits.shape}")
+                print(f"📊 Logits from outputs.logits: shape={logits.shape}")
             elif isinstance(outputs, tuple):
                 logits = outputs[0]
-                print(f"📊 Logits from tuple[0]: {type(logits)}, shape: {logits.shape}")
+                print(f"📊 Logits from tuple[0]: shape={logits.shape}")
             else:
                 logits = outputs
-                print(f"📊 Logits direct: {type(logits)}, shape: {logits.shape}")
+                print(f"📊 Logits direct: shape={logits.shape}")
             
             # Get the last token's logits
             if isinstance(logits, tuple):
                 logits = logits[0]
-                print(f"📊 Logits after tuple check: {type(logits)}, shape: {logits.shape}")
             
             last_token_logits = logits[0, -1, :]
             print(f"📊 Last token logits shape: {last_token_logits.shape}")
@@ -274,20 +440,21 @@ def generate_standard(model, input_ids, attention_mask, tokenizer, args, device,
             for step in range(args.max_tokens):
                 # Get logits for current sequence
                 with torch.no_grad():
+                    # CRITICAL FIX: Use wrapper forward pass (same as training)
+                    # CRITICAL: Use BF16 autocast to match training precision (not FP16)
                     if use_mixed_precision:
-                        with torch.amp.autocast('cuda'):
-                            if hasattr(model, 'modular_model'):
-                                outputs = model.modular_model(input_ids=current_input_ids, attention_mask=current_attention_mask)
-                            else:
-                                outputs = model(input_ids=current_input_ids, attention_mask=current_attention_mask)
-                    else:
-                        if hasattr(model, 'modular_model'):
-                            outputs = model.modular_model(input_ids=current_input_ids, attention_mask=current_attention_mask)
-                        else:
+                        with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                            # Use wrapper forward pass
                             outputs = model(input_ids=current_input_ids, attention_mask=current_attention_mask)
+                    else:
+                        # Use wrapper forward pass
+                        outputs = model(input_ids=current_input_ids, attention_mask=current_attention_mask)
                     
+                    # Extract logits (wrapper returns dict)
                     if isinstance(outputs, dict):
-                        logits = outputs['logits']
+                        logits = outputs.get('logits', outputs)
+                    elif hasattr(outputs, 'logits'):
+                        logits = outputs.logits
                     else:
                         logits = outputs
                     
@@ -297,22 +464,30 @@ def generate_standard(model, input_ids, attention_mask, tokenizer, args, device,
                 # Get last token logits
                 last_token_logits = logits[0, -1, :].clone()
                 
-                # Apply repetition penalty
+                # Apply repetition penalty (only penalize tokens that appear in the generated sequence)
                 if args.repetition_penalty != 1.0 and len(generated_token_ids) > 0:
-                    for token_id in set(generated_token_ids):
+                    # Only penalize tokens that have been generated (not the prompt)
+                    unique_generated = set(generated_token_ids)
+                    for token_id in unique_generated:
                         if last_token_logits[token_id] < 0:
                             last_token_logits[token_id] *= args.repetition_penalty
                         else:
                             last_token_logits[token_id] /= args.repetition_penalty
                 
                 # Apply temperature
-                last_token_logits = last_token_logits / args.temperature
+                if args.temperature != 1.0:
+                    last_token_logits = last_token_logits / args.temperature
                 
                 # Sample from top_k tokens
-                top_k_logits = torch.topk(last_token_logits, args.top_k)
-                top_k_probs = torch.softmax(top_k_logits.values, dim=-1)
+                # Get top_k logits and indices
+                top_k_logits, top_k_indices = torch.topk(last_token_logits, min(args.top_k, last_token_logits.size(-1)))
+                
+                # Apply softmax to get probabilities
+                top_k_probs = torch.softmax(top_k_logits, dim=-1)
+                
+                # Sample from the top_k probabilities
                 sampled_idx = torch.multinomial(top_k_probs, 1)[0]
-                next_token_id = top_k_logits.indices[sampled_idx]
+                next_token_id = top_k_indices[sampled_idx]
                 
                 # Decode and print token
                 next_token = tokenizer.decode([next_token_id])

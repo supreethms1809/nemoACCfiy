@@ -1134,7 +1134,8 @@ class ModularModel(nn.Module):
         print(f"Loading embedder decoder from checkpoint: {checkpoint_path}")
         
         # Load checkpoint
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        # PyTorch 2.6+ defaults to weights_only=True, but checkpoints may contain tokenizer objects
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         
         # Extract model state dict
         if 'model_state_dict' in checkpoint:
