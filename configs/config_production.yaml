@@ -189,7 +189,7 @@ training_stages:
       
       # Training duration - optimized for 10M samples with 1B model
       epochs: 1                     # Single epoch for large dataset (10M samples)
-      batch_size: 16                # Increased to compensate for reduced gradient accumulation
+      batch_size: 15                # Increased to compensate for reduced gradient accumulation
       sequence_length: 1024         # Reduced from 2048 to reduce memory usage
       learning_rate: 4e-5           # Keep current learning rate
       max_grad_norm: 0.8            # Keep current gradient clipping
@@ -199,7 +199,7 @@ training_stages:
       
       # Step-based checkpointing and validation (optimized for large dataset)
       checkpointing:
-        save_every_n_steps: 50    # Less frequent saves to avoid FSDP issues
+        save_every_n_steps: 500    # Less frequent saves to avoid FSDP issues
         save_top_k: 3               # Keep more checkpoints for large training
         monitor: "val_loss"         # Metric to monitor for best checkpoints
         mode: "min"                 # Monitor mode (min/max)
@@ -265,7 +265,7 @@ training_stages:
         overlap_tokens: 200                    # Overlap between consecutive chunks for better training
         shuffle_datasets: true                 # Shuffle datasets before mixing
         seed: 42                               # Random seed for reproducibility
-        total_samples: 10000000                 # Total samples for all datasets combined (code calculates per-dataset based on percentages) - Reduced for faster testing
+        total_samples: 20000000                 # Total samples for all datasets combined (code calculates per-dataset based on percentages) - Reduced for faster testing
         use_processed_datasets: true           # Set to true to use preprocessed datasets (much faster!)
         save_processed_datasets: true          # Save processed datasets for future use
         test_size_samples: false               # If true, use only 4096 samples for testing; if false, use full dataset
@@ -277,50 +277,90 @@ training_stages:
         save_format: "hf"                      # HuggingFace format for processed data
       
       # Stage 1: Pre-training datasets (Next Token Prediction)
+      # Based on optimal dataset mixing research (50-30-20 mix):
+      # - 50% finePDFs (high-quality textbook-style PDFs)
+      # - 30% DCLM-baseline (filtered, diverse web content)
+      # - 20% FineWeb-Edu (curated educational web resources)
+      # Reference: https://huggingface.co/blog/codelion/optimal-dataset-mixing
+      # This mix achieves 90%+ performance with 1/10th the data compared to naive approaches
       pretraining_datasets:
+        # ===== OPTIMAL MIX DATASETS (from research) =====
+        # High-quality textbook-style PDFs (50% recommended)
+        "codelion/finepdfs-1B":
+          percentage: 33.0                     # High-quality textbook-style PDFs (primary source for 50% finePDFs target)
+          subset: null                         # Full 1B token dataset
+        
+        # Filtered, diverse web content (30% recommended)
+        "codelion/dclm-baseline-1B":
+          percentage: 19.0                     # DCLM-baseline: filtered, diverse web content (primary source for 30% DCLM target)
+          subset: null                         # Full 1B token dataset
+        
+        # Curated educational web resources (20% recommended)
+        "codelion/fineweb-edu-1B":
+          percentage: 11.0                     # FineWeb-Edu: curated educational web resources (primary source for 20% FineWeb-Edu target)
+          subset: null                         # Full 1B token dataset
+        
+        # ===== EXISTING DATASETS (kept for diversity and additional coverage) =====
         # Hugging Face pretraining datasets with percentage allocation
         "HuggingFaceFW/fineweb":
-          percentage: 15.0                     # High-quality web content dataset
+          percentage: 5.0                      # High-quality web content dataset (FineWeb-Edu category)
           subset: "sample-10BT"               # 10 billion token sample
         
-        # Math and reasoning datasets
+        # Math and reasoning datasets (finePDFs-like educational content)
         "HuggingFaceTB/finemath":
-          percentage: 15.0                     # Math content subset
+          percentage: 7.0                      # Math content subset (finePDFs category - educational/math content)
           subset: "finemath-3plus"             # Math content subset
         
-        # Curated content
+        # Curated content (DCLM-baseline variant)
         "mlfoundations/dclm-baseline-1.0":
-          percentage: 10.0                     # Curated content (streaming works)
+          percentage: 9.0                      # DCLM-baseline variant: curated content (DCLM-baseline category)
           subset: null                         # 187k tokens - Curated content
         
-        # Synthetic educational content
+        # Synthetic educational content (finePDFs-like)
         "HuggingFaceTB/cosmopedia":
-          percentage: 10.0                      # Synthetic textbooks subset
+          percentage: 6.0                      # Synthetic textbooks subset (finePDFs category - synthetic educational)
           subset: "auto_math_text"             # Synthetic textbooks subset
 
-        # nanochat dataset
+        # FineWeb-Edu variant (nanochat dataset)
         "karpathy/fineweb-edu-100b-shuffle":
-          percentage: 50.0                      # Nanochat subset
+          percentage: 3.0                      # FineWeb-Edu variant: educational web content (FineWeb-Edu category)
           subset: null                         # 100 billion token sample
         
+        # ===== CODE DATASETS (high-quality structured content) =====
+        # Large-scale curated source code dataset from GitHub
+        # Includes code question-answer pairs in 11 programming languages
+        # Note: Dataset may use 'code', 'content', or 'text' fields - dataset loader handles all
+        "nvidia/Nemotron-Pretraining-Code-v1":
+          percentage: 7.0                      # High-quality code dataset (finePDFs category - structured/educational)
+          subset: Synthetic_Code                         # Full dataset (174.9B tokens of synthetic code + curated GitHub code)
+          # Note: This dataset requires accepting NVIDIA Data Agreement for Model Training
+          # The dataset includes both raw code and code Q&A pairs
+          # Dataset loader will extract text from 'code', 'content', or 'text' fields automatically
+          # Reference: https://huggingface.co/datasets/nvidia/Nemotron-Pretraining-Code-v1
+        
         # Total: 100.0% (ensures proper allocation)
+        # Breakdown by category (aligned with optimal 50-30-20 mix):
+        # - finePDFs category: 33% (codelion/finepdfs-1B) + 7% (finemath) + 6% (cosmopedia) + 7% (Nemotron-Code) = 53%
+        # - DCLM-baseline category: 19% (codelion/dclm-baseline-1B) + 9% (mlfoundations/dclm-baseline-1.0) = 28%
+        # - FineWeb-Edu category: 11% (codelion/fineweb-edu-1B) + 5% (fineweb) + 3% (karpathy/fineweb-edu) = 19%
+        # Note: Code dataset (7%) added to finePDFs category as structured/educational content
       
       # Data loading performance options (optimized for GH200 with 72 CPU cores)
-      num_workers: 8                # Reduced from 16 to minimize overhead and contention
+      num_workers: 64                # Reduced from 16 to minimize overhead and contention
       pin_memory: true              # Faster GPU transfer
       persistent_workers: true      # Keep workers alive between batches
       prefetch_factor: 2            # Reduced from 4 to minimize memory overhead
 
-    checkpoint_dir: "/home/sureshm/nemoACCfiy/outputs/checkpoints/stage1"
-    model_output_dir: "/home/sureshm/nemoACCfiy/outputs/models"
-    model_output_name: "stage1_model.pth"
+    checkpoint_dir: "/home/sureshm/nemoACCfiy/outputs/checkpoints/stage1_v2"
+    model_output_dir: "/home/sureshm/nemoACCfiy/outputs/models_v2"
+    model_output_name: "stage1_model_v2.pth"
 
     wandb:
       use_wandb: false
-      project: "accfiy-stage1"
+      project: "accfiy-stage1-v2"
       entity: null
       run_name: null
-      tags: ["stage1", "pretraining"]
+      tags: ["stage1", "pretraining", "v2"]
       group: null
       notes: null
 
@@ -328,7 +368,7 @@ training_stages:
       debug: false
       log_file: null
       enable_profiling: true
-      profiler_log_dir: "./profiler_logs/stage1"
+      profiler_log_dir: "./profiler_logs/stage1_v2"
       save_steps: 10000
       validation_steps: 10000
     
