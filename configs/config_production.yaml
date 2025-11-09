@@ -378,7 +378,181 @@ training_stages:
       deterministic: false          # Deterministic training (slower but reproducible)
       benchmark: true               # CUDNN benchmark for better performance
 
-  # Stage 2: Fine-tuning
+  # Stage 1 Instruction SFT: Instruction Fine-tuning (decoder-only, after NTP)
+  stage1_inst_SFT:
+    model:
+      model_config_key: "model_config_1.8B"
+      tokenizer_path: "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+      use_flash_attention: true
+      disable_flash_attention: false
+      
+      # Model architecture options (inherited from model_config_1.8B)
+      tie_weights: false            # Tie embedding and LM head weights
+      freeze_embedder_decoder: true # Freeze embedder decoder
+      embedder_checkpoint_path: null # Path to embedder checkpoint
+
+    training:
+      # Training backend selection (for production mode)
+      training_backend: "lightning"  # Options: "lightning" (PyTorch Lightning) or "megatron" (NeMo Megatron)
+      
+      # Training duration - optimized for instruction tuning
+      epochs: 3                     # Multiple epochs for instruction tuning
+      batch_size: 16                # Batch size for instruction SFT
+      sequence_length: 2048         # Sequence length for instruction tuning
+      learning_rate: 1e-5           # Lower learning rate for fine-tuning
+      max_grad_norm: 0.8            # Gradient clipping
+      gradient_accumulation_steps: 2 # Gradient accumulation steps
+      gradient_checkpointing: true   # Essential for memory efficiency
+      mixed_precision: "bf16-mixed" # Use bf16 for GH200 optimization
+      
+      # Step-based checkpointing and validation
+      checkpointing:
+        save_every_n_steps: 1000    # Save checkpoints every 1000 steps
+        save_top_k: 3               # Keep top 3 checkpoints
+        monitor: "val_loss"         # Metric to monitor for best checkpoints
+        mode: "min"                 # Monitor mode (min/max)
+        filename: "stage1_inst_sft_checkpoint-{step:06d}-{val_loss:.4f}"  # Checkpoint filename
+        auto_insert_metric_name: false  # Don't insert metric name in filename
+        
+        # Resume training settings
+        resume_from_checkpoint: null  # Path to checkpoint to resume from
+        resume_ignore_mismatched_sizes: true  # Ignore size mismatches when resuming
+        
+      # Training monitoring and control
+      log_every_n_steps: 100        # Log every 100 steps
+      val_check_interval_steps: 1000   # Validate every 1000 steps
+      
+      # Early stopping
+      patience: 5                    # Early stopping patience
+      
+      # Gradient optimization
+      gradient_clip_val: 0.8         # Gradient clipping value
+      gradient_clip_algorithm: "value"  # Gradient clipping algorithm (compatible with FSDP)
+    
+    # Distributed training configuration (optimized for GH200)
+    distributed:
+      strategy: "fsdp"  # Use FSDP for large model training on GH200
+      num_nodes: 1
+      devices: "auto"  # Can be "auto", number, or list of device IDs
+      sync_batchnorm: false
+      
+      # FSDP specific configuration
+      fsdp:
+        enabled: true                # Enable FSDP for memory efficiency
+        cpu_offload: false           # Disable CPU offload for better performance
+        sharding_strategy: "FULL_SHARD"  # Full sharding for maximum memory efficiency
+        backward_prefetch: "BACKWARD_PRE"  # Optimize backward pass
+        forward_prefetch: true       # Enable forward prefetch for better performance
+        limit_all_gathers: true      # Reduce communication overhead
+        activation_checkpointing: true   # Enable to reduce memory usage
+        use_orig_params: true  # Set to true for single GPU FSDP compatibility
+    
+    # Optimizer configuration
+    optimizer:
+      type: "AdamW"
+      weight_decay: 0.01             # Weight decay for instruction tuning
+      betas: [0.9, 0.999]            # Standard betas
+      eps: 1e-8                      # Epsilon for numerical stability
+    
+    # Learning rate scheduler configuration
+    scheduler:
+      type: "CosineAnnealingLR"      # Cosine annealing for better convergence
+      T_max: 10000                   # Total steps for cosine annealing
+      eta_min: 1e-7                  # Minimum learning rate
+      warmup_steps: 500              # Warmup steps
+      interval: "step"
+      frequency: 1
+    
+    # Dataset configuration for instruction tuning
+    data:
+      # Processing configuration for instruction tuning datasets
+      processing:
+        max_tokens_per_sample: 2048            # Maximum tokens per instruction (shorter for instruction tuning)
+        min_tokens_per_sample: 50              # Minimum tokens per training sample
+        overlap_tokens: 0                      # No overlap for instruction tuning
+        shuffle_datasets: true                 # Shuffle datasets before mixing
+        seed: 42                               # Random seed for reproducibility
+        total_samples: 100000                  # Total samples for instruction tuning (smaller than pretraining)
+        use_processed_datasets: false          # Use HuggingFace datasets directly for instruction tuning
+        save_processed_datasets: false         # Don't save processed datasets for instruction tuning
+        test_size_samples: false               # If true, use only 4096 samples for testing
+      
+      # Output configuration for ds_processing pipeline
+      output:
+        processed_data_dir: "data/processed"   # Directory for processed HuggingFace datasets
+        cache_dir: "/tmp/hf_cache"             # Use temporary cache directory
+        save_format: "hf"                      # HuggingFace format for processed data
+      
+      # Stage 1 Instruction SFT: Instruction tuning datasets
+      pretraining_datasets:
+        # General instruction tuning datasets
+        "allenai/tulu-v2-sft-mixture":
+          percentage: 20.0                     # Tulu V2 SFT mixture - comprehensive instruction dataset
+          subset: null                         # Full dataset
+        
+        "HuggingFaceTB/OpenHermes-2.5-H4":
+          percentage: 20.0                     # OpenHermes 2.5 - high-quality instruction dataset
+          subset: null                         # Full dataset
+        
+        # Math-focused datasets
+        "nvidia/OpenMathInstruct-1":
+          percentage: 15.0                     # NVIDIA OpenMathInstruct - math instruction dataset
+          subset: null                         # Full dataset
+        
+        "meta-math/MetaMathQA":
+          percentage: 15.0                     # MetaMathQA - math question answering dataset
+          subset: null                         # Full dataset
+        
+        # Code-focused datasets
+        "m-a-p/CodeFeedback-Filtered-Instruction":
+          percentage: 10.0                     # CodeFeedback - filtered code instruction dataset
+          subset: null                         # Full dataset
+        
+        # HPC-focused datasets
+        "hpcgroup/hpc-instruct":
+          percentage: 10.0                     # HPC Instruct - HPC instruction dataset
+          subset: null                         # Full dataset
+        
+        "HPC-GPT/HPC":
+          percentage: 10.0                     # HPC-GPT HPC dataset
+          subset: null                         # Full dataset
+          
+        # Total: 100.0% (ensures proper allocation)
+      
+      # Data loading performance options (optimized for GH200 with 72 CPU cores)
+      num_workers: 8                # Reduced from 16 to minimize overhead and contention
+      pin_memory: true              # Pin memory for faster GPU transfer
+      persistent_workers: true      # Keep workers alive between epochs
+      prefetch_factor: 2            # Reduced from 4 to minimize memory overhead
+
+    checkpoint_dir: "/home/sureshm/nemoACCfiy/outputs/checkpoints/stage1_inst_SFT"
+    model_output_dir: "/home/sureshm/nemoACCfiy/outputs/models"
+    model_output_name: "stage1_inst_SFT_model.pth"
+
+    wandb:
+      use_wandb: false
+      project: "accfiy-stage1-inst-sft"
+      entity: null
+      run_name: null
+      tags: ["stage1_inst_sft", "instruction_tuning", "decoder_only"]
+      group: null
+      notes: "Stage 1 Instruction SFT: Decoder-only instruction fine-tuning after NTP training"
+
+    logging:
+      debug: false
+      log_file: null
+      enable_profiling: true
+      profiler_log_dir: "./profiler_logs/stage1_inst_SFT"
+      save_steps: 1000
+      validation_steps: 500
+    
+    # Environment and reproducibility
+    environment:
+      seed: 42                      # Random seed for reproducibility
+      deterministic: false          # Deterministic training (slower but reproducible)
+      benchmark: true               # CUDNN benchmark for better performance
+
+  # Stage 2: Fine-tuning (Full Modular Model - comes later)
   stage2:
     model:
       model_config_key: "model_config_1.8B"
