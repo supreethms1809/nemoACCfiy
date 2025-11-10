@@ -53,6 +53,141 @@ def load_prompts_from_file(prompts_file: str) -> List[str]:
     
     return prompts
 
+def batch_tokenize_prompts(tokenizer, prompts: List[str], device, max_length: int = None) -> tuple:
+    """
+    Tokenize a batch of prompts with padding.
+    
+    Args:
+        tokenizer: Tokenizer to use
+        prompts: List of prompt strings
+        device: Device to move tensors to
+        max_length: Maximum length for padding (None = use longest sequence)
+    
+    Returns:
+        Tuple of (input_ids, attention_mask) tensors with shape (batch_size, seq_len)
+    """
+    # Tokenize all prompts
+    tokenized = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True if max_length else False,
+        max_length=max_length,
+        return_attention_mask=True
+    )
+    
+    input_ids = tokenized["input_ids"].to(device=device, dtype=torch.long)
+    attention_mask = tokenized["attention_mask"].to(device=device, dtype=torch.long)
+    
+    return input_ids, attention_mask
+
+def run_batched_inference(
+    model, 
+    tokenizer, 
+    prompts: List[str], 
+    args, 
+    device, 
+    use_mixed_precision, 
+    use_kv_cache,
+    batch_size: int
+) -> List[str]:
+    """
+    Run inference on a batch of prompts.
+    
+    Args:
+        model: Model to use for inference
+        tokenizer: Tokenizer to use
+        prompts: List of prompt strings
+        args: Arguments object
+        device: Device to use
+        use_mixed_precision: Whether to use mixed precision
+        use_kv_cache: Whether to use KV cache
+        batch_size: Batch size for processing
+    
+    Returns:
+        List of generated text strings
+    """
+    if len(prompts) == 0:
+        return []
+    
+    # Get the actual model that has generate() method
+    actual_model = None
+    has_generate = False
+    
+    if hasattr(model, 'modular_model') and hasattr(model.modular_model, 'model') and hasattr(model.modular_model.model, 'generate'):
+        actual_model = model.modular_model.model
+        has_generate = True
+    elif hasattr(model, 'model') and hasattr(model.model, 'generate'):
+        actual_model = model.model
+        has_generate = True
+    elif hasattr(model, 'generate'):
+        if hasattr(model, 'modular_model'):
+            if hasattr(model.modular_model, 'model'):
+                actual_model = model.modular_model.model
+            else:
+                actual_model = model.modular_model
+        else:
+            actual_model = model
+        has_generate = True
+    
+    # Use batched generation if available
+    if use_kv_cache and has_generate:
+        if hasattr(actual_model, 'decoder') and hasattr(actual_model.decoder, 'generate'):
+            actual_model = actual_model.decoder
+        
+        # Tokenize all prompts with padding
+        input_ids, attention_mask = batch_tokenize_prompts(tokenizer, prompts, device)
+        
+        # Prepare generation kwargs
+        do_sample = not args.greedy
+        temperature = 1.0 if args.greedy else args.temperature
+        top_k = 1 if args.greedy else (args.top_k if args.top_k > 0 else 50)
+        
+        generate_kwargs = {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'max_new_tokens': args.max_tokens,
+            'temperature': temperature,
+            'top_k': top_k,
+            'top_p': 0.95,
+            'do_sample': do_sample,
+            'repetition_penalty': args.repetition_penalty,
+            'eos_token_id': tokenizer.eos_token_id,
+            'pad_token_id': tokenizer.eos_token_id if tokenizer.pad_token_id is None else tokenizer.pad_token_id
+        }
+        
+        # Generate for all prompts in batch
+        with torch.no_grad():
+            if use_mixed_precision:
+                with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    generated_ids = actual_model.generate(**generate_kwargs)
+            else:
+                generated_ids = actual_model.generate(**generate_kwargs)
+        
+        # Decode all generated texts
+        generated_texts = []
+        for i, prompt in enumerate(prompts):
+            # Decode the generated sequence
+            generated_text = tokenizer.decode(generated_ids[i], skip_special_tokens=True)
+            prompt_text = tokenizer.decode(input_ids[i], skip_special_tokens=True)
+            
+            # Extract only the new generated text
+            if generated_text.startswith(prompt_text):
+                new_text = generated_text[len(prompt_text):]
+            else:
+                new_text = generated_text
+            
+            generated_texts.append(new_text.strip())
+        
+        return generated_texts
+    else:
+        # Fallback to sequential processing if batching not supported
+        generated_texts = []
+        for prompt in prompts:
+            generated_text = run_single_inference(model, tokenizer, prompt, args, device, use_mixed_precision, use_kv_cache)
+            generated_texts.append(generated_text)
+        return generated_texts
+
 def run_single_inference(model, tokenizer, prompt: str, args, device, use_mixed_precision, use_kv_cache) -> str:
     """Run inference on a single prompt and return the generated text."""
     # Prepare input
@@ -222,7 +357,7 @@ def main():
     parser.add_argument("--no_cache", action="store_true", default=False,
                        help="Disable KV caching")
     parser.add_argument("--batch_size", type=int, default=1,
-                       help="Batch size for inference (default: 1)")
+                       help="Batch size for batched inference when processing multiple prompts (default: 1, use >1 for faster processing)")
     
     args = parser.parse_args()
     
@@ -256,8 +391,12 @@ def main():
     use_kv_cache = args.use_cache and not args.no_cache and device.type == 'cuda'
     print(f"📊 KV Cache: {'Enabled' if use_kv_cache else 'Disabled'}")
     
-    if use_kv_cache:
-        print(f"📊 Batch size: {args.batch_size}")
+    if args.prompts_file:
+        print(f"📊 Batch size: {args.batch_size} (batched inference enabled)")
+        if args.batch_size > 1 and use_kv_cache:
+            print(f"💡 Using batched inference for faster processing")
+        elif args.batch_size > 1 and not use_kv_cache:
+            print(f"⚠️ Batch size > 1 but KV cache disabled - will fall back to sequential processing")
     
     # Load configuration
     config = create_nemo_config_from_existing(args.model_config, args.stage)
@@ -376,27 +515,70 @@ def main():
         print(f"✅ Loaded {len(prompts)} prompts")
         
         print(f"\n🎯 Generation parameters: max_tokens={args.max_tokens}, temp={args.temperature}, top_k={args.top_k}, repetition_penalty={args.repetition_penalty}")
+        print(f"📦 Batch size: {args.batch_size}")
         print(f"🔄 Running inference on {len(prompts)} prompts...\n")
         
         results = []
-        for i, prompt in enumerate(prompts, 1):
-            print(f"\n[{i}/{len(prompts)}] Processing prompt: {prompt[:80]}{'...' if len(prompt) > 80 else ''}")
+        
+        # Process prompts in batches
+        num_batches = (len(prompts) + args.batch_size - 1) // args.batch_size
+        
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * args.batch_size
+            end_idx = min(start_idx + args.batch_size, len(prompts))
+            batch_prompts = prompts[start_idx:end_idx]
+            
+            print(f"\n📦 Batch {batch_idx + 1}/{num_batches} ({len(batch_prompts)} prompts)")
+            print(f"   Processing prompts {start_idx + 1}-{end_idx}...")
+            
             try:
-                generated_text = run_single_inference(model, tokenizer, prompt, args, device, use_mixed_precision, use_kv_cache)
-                results.append({
-                    "prompt": prompt,
-                    "generated_text": generated_text,
-                    "prompt_index": i
-                })
-                print(f"✅ Generated {len(generated_text)} characters")
+                # Run batched inference
+                batch_generated_texts = run_batched_inference(
+                    model, 
+                    tokenizer, 
+                    batch_prompts, 
+                    args, 
+                    device, 
+                    use_mixed_precision, 
+                    use_kv_cache,
+                    args.batch_size
+                )
+                
+                # Add results for this batch
+                for i, (prompt, generated_text) in enumerate(zip(batch_prompts, batch_generated_texts)):
+                    prompt_idx = start_idx + i + 1
+                    results.append({
+                        "prompt": prompt,
+                        "generated_text": generated_text,
+                        "prompt_index": prompt_idx
+                    })
+                    print(f"   [{prompt_idx}/{len(prompts)}] ✅ Generated {len(generated_text)} characters")
+                
             except Exception as e:
-                print(f"❌ Error processing prompt {i}: {e}")
-                results.append({
-                    "prompt": prompt,
-                    "generated_text": "",
-                    "error": str(e),
-                    "prompt_index": i
-                })
+                print(f"   ❌ Error processing batch {batch_idx + 1}: {e}")
+                import traceback
+                traceback.print_exc()
+                
+                # Fallback to individual processing for this batch
+                print(f"   🔄 Falling back to individual processing for this batch...")
+                for i, prompt in enumerate(batch_prompts):
+                    prompt_idx = start_idx + i + 1
+                    try:
+                        generated_text = run_single_inference(model, tokenizer, prompt, args, device, use_mixed_precision, use_kv_cache)
+                        results.append({
+                            "prompt": prompt,
+                            "generated_text": generated_text,
+                            "prompt_index": prompt_idx
+                        })
+                        print(f"   [{prompt_idx}/{len(prompts)}] ✅ Generated {len(generated_text)} characters")
+                    except Exception as e2:
+                        print(f"   [{prompt_idx}/{len(prompts)}] ❌ Error: {e2}")
+                        results.append({
+                            "prompt": prompt,
+                            "generated_text": "",
+                            "error": str(e2),
+                            "prompt_index": prompt_idx
+                        })
         
         # Save results to output file
         output_path = Path(args.output_file)
