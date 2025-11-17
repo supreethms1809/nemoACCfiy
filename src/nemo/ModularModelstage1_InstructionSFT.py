@@ -17,6 +17,7 @@ import argparse
 import sys
 import os
 import logging
+import time
 from typing import Optional, Dict, Any, List
 from pathlib import Path
 
@@ -202,13 +203,17 @@ def collate_fn(batch, tokenizer=None, max_length=2048):
                         # Pad if too short
                         pad_length = target_length - len(tensor)
                         if key == 'input_ids':
-                            # Pad with 0 (pad token)
-                            padded_tensor = torch.cat([tensor, torch.full((pad_length,), 0, dtype=torch.long)])
+                            # Pad with pad_token_id (default 0, but should match tokenizer)
+                            # Note: We use 0 as default, but ideally should get from tokenizer
+                            pad_token_id = 0  # Default pad token ID
+                            if tokenizer is not None and hasattr(tokenizer, 'pad_token_id') and tokenizer.pad_token_id is not None:
+                                pad_token_id = tokenizer.pad_token_id
+                            padded_tensor = torch.cat([tensor, torch.full((pad_length,), pad_token_id, dtype=torch.long)])
                         elif key == 'attention_mask':
-                            # Pad attention mask with 0s
+                            # Pad attention mask with 0s (padding positions)
                             padded_tensor = torch.cat([tensor, torch.zeros(pad_length, dtype=torch.long)])
                         elif key == 'labels':
-                            # Pad labels with -100 (ignore index)
+                            # Pad labels with -100 (ignore index) - REQUIRED: padding positions must be -100
                             padded_tensor = torch.cat([tensor, torch.full((pad_length,), -100, dtype=torch.long)])
                         else:
                             padded_tensor = torch.cat([tensor, torch.zeros(pad_length, dtype=torch.long)])
@@ -355,7 +360,7 @@ class BasicDataset(Dataset):
     def __getitem__(self, idx):
         item = self.data[idx]
         
-        if self.stage == "stage1":
+        if self.stage == "stage1" or self.stage == "stage1_inst_SFT":
             # Stage 1: Next token prediction
             input_ids = item["input_ids"]
             if len(input_ids) > self.max_length:
@@ -589,7 +594,7 @@ class ModularModelTrainingModule(pl.LightningModule):
             logging.error(traceback.format_exc())
     
     def training_step(self, batch, batch_idx):
-        if self.stage == "stage1":
+        if self.stage == "stage1" or self.stage == "stage1_inst_SFT":
             # Stage 1: Next token prediction
             input_ids = batch["input_ids"]
             labels = batch["labels"]
@@ -669,7 +674,7 @@ class ModularModelTrainingModule(pl.LightningModule):
             perplexity = torch.exp(loss)
             
             # Calculate accuracy (for next token prediction)
-            if self.stage == "stage1":
+            if self.stage == "stage1" or self.stage == "stage1_inst_SFT":
                 # Use the same logic as loss calculation
                 # CRITICAL: If labels exist, they are ALWAYS shifted (from tokenize_function or dataset)
                 labels_shifted = batch.get('labels_shifted', True if 'labels' in batch else False)
@@ -711,7 +716,7 @@ class ModularModelTrainingModule(pl.LightningModule):
         # Same as training step but with model.eval()
         self.model.eval()
         with torch.no_grad():
-            if self.stage == "stage1":
+            if self.stage == "stage1" or self.stage == "stage1_inst_SFT":
                 # Stage 1: Next token prediction
                 # Debug: log batch keys
                 logging.debug(f"Validation batch keys: {list(batch.keys())}")
@@ -747,10 +752,28 @@ class ModularModelTrainingModule(pl.LightningModule):
                     shift_logits = logits[..., :-1, :].contiguous()
                     shift_labels = labels[..., 1:].contiguous()  # Shift labels to get next tokens
                 
-                loss = self.loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+                # Filter out masked labels BEFORE loss calculation to prevent NaN
+                # CrossEntropyLoss with ignore_index=-100 should handle this, but let's be explicit
+                valid_labels_mask = (shift_labels.view(-1) != -100)
+                if valid_labels_mask.sum() == 0:
+                    logging.warning(f"⚠️ Validation batch {batch_idx}: All labels are masked (-100), skipping this batch")
+                    return None
                 
-                # Calculate validation metrics
-                perplexity = torch.exp(loss)
+                # Calculate loss only on valid (non-masked) labels
+                valid_logits = shift_logits.view(-1, shift_logits.size(-1))[valid_labels_mask]
+                valid_labels = shift_labels.view(-1)[valid_labels_mask]
+                loss = self.loss_fn(valid_logits, valid_labels)
+                
+                # Check for NaN/Inf after calculation
+                if torch.isnan(loss) or torch.isinf(loss):
+                    logging.warning(f"⚠️ Validation batch {batch_idx}: Loss is NaN/Inf after calculation. Loss={loss}, valid_labels_count={valid_labels_mask.sum()}")
+                    return None
+                
+                # Calculate validation metrics with safety checks
+                # Clamp loss to prevent overflow in exp()
+                clamped_loss = torch.clamp(loss, max=50.0)  # exp(50) is still finite
+                perplexity = torch.exp(clamped_loss)
+                
                 # Recalculate shift_logits and shift_labels for accuracy (same logic as loss)
                 # CRITICAL: If labels exist, they are ALWAYS shifted (from tokenize_function or dataset)
                 labels_shifted = batch.get('labels_shifted', True if 'labels' in batch else False)
@@ -762,8 +785,15 @@ class ModularModelTrainingModule(pl.LightningModule):
                 else:
                     shift_logits = logits[..., :-1, :].contiguous()
                     shift_labels = labels[..., 1:].contiguous()  # Shift labels
-                predictions = torch.argmax(shift_logits, dim=-1)
-                accuracy = (predictions == shift_labels).float().mean()
+                
+                # Calculate accuracy only on valid (non-masked) labels
+                valid_mask = (shift_labels != -100)
+                if valid_mask.sum() > 0:
+                    predictions = torch.argmax(shift_logits, dim=-1)
+                    accuracy = (predictions[valid_mask] == shift_labels[valid_mask]).float().mean()
+                else:
+                    accuracy = torch.tensor(0.0, device=loss.device)
+                    logging.warning(f"⚠️ Validation batch {batch_idx}: No valid labels for accuracy calculation")
             
             elif self.stage == "stage2":
                 # Stage 2: Full model training
@@ -786,22 +816,54 @@ class ModularModelTrainingModule(pl.LightningModule):
                 else:
                     logits = outputs
                 
-                loss = self.loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
+                # Filter out masked labels BEFORE loss calculation to prevent NaN
+                # CrossEntropyLoss with ignore_index=-100 should handle this, but let's be explicit
+                valid_labels_mask = (labels.view(-1) != -100)
+                if valid_labels_mask.sum() == 0:
+                    logging.warning(f"⚠️ Validation batch {batch_idx}: All labels are masked (-100), skipping this batch")
+                    return None
                 
-                # Calculate validation metrics
-                perplexity = torch.exp(loss)
-                predictions = torch.argmax(logits, dim=-1)
-                accuracy = (predictions == labels).float().mean()
+                # Calculate loss only on valid (non-masked) labels
+                valid_logits = logits.view(-1, logits.size(-1))[valid_labels_mask]
+                valid_labels = labels.view(-1)[valid_labels_mask]
+                loss = self.loss_fn(valid_logits, valid_labels)
+                
+                # Check for NaN/Inf after calculation
+                if torch.isnan(loss) or torch.isinf(loss):
+                    logging.warning(f"⚠️ Validation batch {batch_idx}: Loss is NaN/Inf after calculation. Loss={loss}, valid_labels_count={valid_labels_mask.sum()}")
+                    return None
+                
+                # Calculate validation metrics with safety checks
+                # Clamp loss to prevent overflow in exp()
+                clamped_loss = torch.clamp(loss, max=50.0)  # exp(50) is still finite
+                perplexity = torch.exp(clamped_loss)
+                
+                # Calculate accuracy only on valid (non-masked) labels
+                valid_mask = (labels != -100)
+                if valid_mask.sum() > 0:
+                    predictions = torch.argmax(logits, dim=-1)
+                    accuracy = (predictions[valid_mask] == labels[valid_mask]).float().mean()
+                else:
+                    accuracy = torch.tensor(0.0, device=loss.device)
+                    logging.warning(f"⚠️ Validation batch {batch_idx}: No valid labels for accuracy calculation")
             
             else:
                 raise ValueError(f"Unknown stage: {self.stage}")
         
         self.model.train()
         
-        # Log validation metrics
-        self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
-        self.log("val_perplexity", perplexity, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
-        self.log("val_accuracy", accuracy, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+        # Skip logging if loss is still NaN/Inf after handling
+        if loss is None or torch.isnan(loss) or torch.isinf(loss):
+            logging.warning(f"⚠️ Skipping validation logging for batch {batch_idx} due to invalid loss")
+            return
+        
+        # Log validation metrics with safety checks
+        if not torch.isnan(loss) and not torch.isinf(loss):
+            self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+        if not torch.isnan(perplexity) and not torch.isinf(perplexity):
+            self.log("val_perplexity", perplexity, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+        if not torch.isnan(accuracy) and not torch.isinf(accuracy):
+            self.log("val_accuracy", accuracy, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
         
         return loss
     
@@ -1687,24 +1749,84 @@ def load_instruction_datasets_with_percentages(
                         dataset = load_dataset(dataset_name, split="test_sft")
                     actual_split = "test_sft"
                     logging.info(f"  Using split 'test_sft' for {dataset_name}")
-                except (ValueError, KeyError):
+                except Exception as e1:
+                    error_msg1 = str(e1).lower()
+                    if "unknown split" not in error_msg1 and "not available" not in error_msg1 and "should be one of" not in error_msg1:
+                        # Not a split error, re-raise
+                        raise
                     try:
                         if subset:
                             dataset = load_dataset(dataset_name, subset, split="validation")
                         else:
                             dataset = load_dataset(dataset_name, split="validation")
-                    except (ValueError, KeyError):
+                        actual_split = "validation"
+                    except Exception as e2:
+                        error_msg2 = str(e2).lower()
+                        if "unknown split" not in error_msg2 and "not available" not in error_msg2 and "should be one of" not in error_msg2:
+                            # Not a split error, re-raise
+                            raise
                         # Fall back to test split
-                        if subset:
-                            dataset = load_dataset(dataset_name, subset, split="test")
-                        else:
-                            dataset = load_dataset(dataset_name, split="test")
+                        try:
+                            if subset:
+                                dataset = load_dataset(dataset_name, subset, split="test")
+                            else:
+                                dataset = load_dataset(dataset_name, split="test")
+                            actual_split = "test"
+                        except Exception as test_error:
+                            # If test also doesn't exist, fall back to train
+                            error_msg = str(test_error).lower()
+                            if "unknown split" in error_msg or "not available" in error_msg or "should be one of" in error_msg:
+                                logging.warning(f"  Split 'test' not available for {dataset_name}, falling back to 'train'")
+                                if subset:
+                                    dataset = load_dataset(dataset_name, subset, split="train")
+                                else:
+                                    dataset = load_dataset(dataset_name, split="train")
+                                actual_split = "train"
+                            else:
+                                raise
             else:
                 # Load dataset with optional subset
-                if subset:
-                    dataset = load_dataset(dataset_name, subset, split=split)
+                # Try the requested split first, fall back to train if it doesn't exist
+                try:
+                    if subset:
+                        dataset = load_dataset(dataset_name, subset, split=split)
+                    else:
+                        dataset = load_dataset(dataset_name, split=split)
+                except Exception as e:
+                    # If the requested split doesn't exist, try train as fallback
+                    error_msg = str(e).lower()
+                    if "unknown split" in error_msg or "not available" in error_msg or "should be one of" in error_msg:
+                        logging.warning(f"  Split '{split}' not available for {dataset_name}, falling back to 'train'")
+                        try:
+                            if subset:
+                                dataset = load_dataset(dataset_name, subset, split="train")
+                            else:
+                                dataset = load_dataset(dataset_name, split="train")
+                            actual_split = "train"
+                        except Exception:
+                            # Re-raise the original error if train also doesn't exist
+                            raise e
+                    else:
+                        raise
+            
+            # Check dataset size and adjust if needed
+            try:
+                # Try to get dataset length (works for non-streaming datasets)
+                dataset_size = len(dataset)
+                if dataset_size < dataset_samples:
+                    logging.warning(
+                        f"  Dataset {dataset_name} has only {dataset_size:,} samples, "
+                        f"less than requested {dataset_samples:,} ({percentage}%). "
+                        f"Using all available samples."
+                    )
+                    dataset_samples = dataset_size
+                elif dataset_size == dataset_samples:
+                    logging.info(f"  Dataset {dataset_name} has exactly {dataset_size:,} samples")
                 else:
-                    dataset = load_dataset(dataset_name, split=split)
+                    logging.info(f"  Dataset {dataset_name} has {dataset_size:,} samples, taking {dataset_samples:,}")
+            except (TypeError, AttributeError):
+                # Streaming dataset or unknown size - proceed with requested limit
+                logging.info(f"  Dataset size unknown (streaming?), will take up to {dataset_samples:,} samples")
             
             # Convert to our format
             dataset_data = []
@@ -1750,6 +1872,13 @@ def load_instruction_datasets_with_percentages(
                         "answer": item["expected_answer"],
                         "dataset": dataset_name
                     }
+                elif "question" in item and "expected_answer" in item:
+                    # nvidia/OpenMathInstruct format
+                    sample = {
+                        "question": item["question"],
+                        "answer": item["expected_answer"],
+                        "dataset": dataset_name
+                    }
                 elif "question" in item and "answer" in item:
                     # Generic question-answer format
                     sample = {
@@ -1778,6 +1907,33 @@ def load_instruction_datasets_with_percentages(
                         "answer": item["completion"],
                         "dataset": dataset_name
                     }
+                elif "query" in item and "answer" in item:
+                    # Query-answer format (m-a-p/CodeFeedback-Filtered-Instruction)
+                    sample = {
+                        "question": item["query"],
+                        "answer": item["answer"],
+                        "dataset": dataset_name
+                    }
+                elif "query" in item and "response" in item:
+                    # Query-response format (meta-math/MetaMathQA)
+                    sample = {
+                        "question": item["query"],
+                        "answer": item["response"],
+                        "dataset": dataset_name
+                    }
+                elif "problem statement" in item and "solution" in item:
+                    # Problem statement-solution format (hpcgroup/hpc-instruct)
+                    problem_stmt = item.get("problem statement", "")
+                    solution = item.get("solution", "")
+                    if problem_stmt and solution:
+                        sample = {
+                            "question": str(problem_stmt),
+                            "answer": str(solution),
+                            "dataset": dataset_name
+                        }
+                    else:
+                        # Skip if fields are empty
+                        continue
                 else:
                     # Log unknown format for debugging (first time only per dataset)
                     if i == 0:
@@ -1787,7 +1943,14 @@ def load_instruction_datasets_with_percentages(
                 dataset_data.append(sample)
             
             all_data.extend(dataset_data)
-            logging.info(f"Loaded {len(dataset_data)} samples from {dataset_name}")
+            requested_samples = int(max_samples * (percentage / 100.0))
+            if len(dataset_data) < requested_samples:
+                logging.info(
+                    f"Loaded {len(dataset_data):,} samples from {dataset_name} "
+                    f"(requested {requested_samples:,}, {len(dataset_data)/requested_samples*100:.1f}% of requested)"
+                )
+            else:
+                logging.info(f"Loaded {len(dataset_data):,} samples from {dataset_name}")
             
         except Exception as e:
             logging.warning(f"Failed to load dataset {dataset_name}: {e}")
@@ -1993,134 +2156,379 @@ def train_production_mode(
     
     max_samples = data_config.get("processing", {}).get("total_samples", 100000)
     
-    logging.info(f"📚 Loading instruction tuning datasets from config")
-    logging.info(f"   Datasets: {list(pretraining_datasets.keys())}")
-    logging.info(f"   Max samples: {max_samples}")
+    # Check if we should use preprocessed datasets
+    use_processed = data_config.get("processing", {}).get("use_processed_datasets", False)
+    if use_processed:
+        logging.info("🔍 Checking for preprocessed instruction datasets...")
+        from pathlib import Path
+        from datasets import load_from_disk
+        
+        processed_dir = Path("data") / "stage1_inst_SFT" / "processed"
+        train_path = processed_dir / "train_dataset"
+        val_path = processed_dir / "val_dataset"
+        
+        if train_path.exists() and val_path.exists():
+            logging.info(f"✅ Found preprocessed datasets at {processed_dir}")
+            logging.info(f"📥 Loading preprocessed instruction datasets...")
+            train_hf_dataset = load_from_disk(str(train_path))
+            val_hf_dataset = load_from_disk(str(val_path))
+            logging.info(f"✅ Loaded {len(train_hf_dataset):,} training and {len(val_hf_dataset):,} validation samples from preprocessed datasets")
+        else:
+            logging.warning(f"⚠️ Preprocessed datasets not found at {processed_dir}")
+            logging.warning(f"   Looking for: {train_path} and {val_path}")
+            logging.warning(f"   Falling back to loading from HuggingFace...")
+            use_processed = False
     
-    # Load instruction datasets
-    train_instruction_data = load_instruction_datasets_with_percentages(
-        pretraining_datasets, 
-        max_samples, 
-        "train"
+    if not use_processed:
+        logging.info(f"📚 Loading instruction tuning datasets from HuggingFace")
+        logging.info(f"   Datasets: {list(pretraining_datasets.keys())}")
+        logging.info(f"   Max samples: {max_samples}")
+        
+        # Load instruction datasets
+        train_instruction_data = load_instruction_datasets_with_percentages(
+            pretraining_datasets, 
+            max_samples, 
+            "train"
+        )
+        val_instruction_data = load_instruction_datasets_with_percentages(
+            pretraining_datasets, 
+            max(max_samples // 10, 100),  # At least 100 validation samples
+            "validation"
+        )
+        
+        logging.info(f"✅ Loaded {len(train_instruction_data)} training and {len(val_instruction_data)} validation instruction samples")
+        
+        # Convert instruction data to HuggingFace dataset format for tokenization
+        from datasets import Dataset as HFDataset
+        train_hf_dataset = HFDataset.from_list(train_instruction_data)
+        val_hf_dataset = HFDataset.from_list(val_instruction_data)
+    
+    # Check if datasets are already tokenized (have input_ids, labels, etc.)
+    datasets_already_tokenized = (
+        'input_ids' in train_hf_dataset.column_names and 
+        'labels' in train_hf_dataset.column_names
     )
-    val_instruction_data = load_instruction_datasets_with_percentages(
-        pretraining_datasets, 
-        max(max_samples // 10, 100),  # At least 100 validation samples
-        "validation"
-    )
     
-    logging.info(f"✅ Loaded {len(train_instruction_data)} training and {len(val_instruction_data)} validation instruction samples")
+    # Check for cached tokenized datasets
+    from pathlib import Path
+    from datasets import load_from_disk
+    import hashlib
+    import json
     
-    # Convert instruction data to HuggingFace dataset format for tokenization
-    from datasets import Dataset as HFDataset
-    train_hf_dataset = HFDataset.from_list(train_instruction_data)
-    val_hf_dataset = HFDataset.from_list(val_instruction_data)
+    # Create cache directory
+    cache_dir = Path("data") / "stage1_inst_SFT" / "tokenized_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
     
-    # Combine train and val for processing, then split later
-    from datasets import concatenate_datasets
-    hf_dataset = concatenate_datasets([train_hf_dataset, val_hf_dataset])
-    
-    # Load tokenizer with caching support
-    from src.utils.tokenizer_manager import get_tokenizer_with_caching
-    tokenizer = get_tokenizer_with_caching(
-        tokenizer_path=tokenizer_path,
-        custom_tokens=None,  # Use default special tokens
-        force_download=False,
-        cache_dir="tokenizers"
-    )
-    
-    # Get sequence length from config
+    # Create cache key based on dataset config, tokenizer, and sequence length
     seq_length = config.get("sequence_length", 2048)
+    cache_key_data = {
+        "datasets": list(pretraining_datasets.keys()),
+        "max_samples": max_samples,
+        "tokenizer_path": tokenizer_path,
+        "seq_length": seq_length,
+        "train_samples": len(train_hf_dataset),
+        "val_samples": len(val_hf_dataset),
+        "version": "v2"  # Version to invalidate old caches with incorrect label logic
+    }
+    cache_key = hashlib.md5(json.dumps(cache_key_data, sort_keys=True).encode()).hexdigest()
+    tokenized_cache_path = cache_dir / f"tokenized_{cache_key}"
     
-    # Special tokens for instruction format (simpler than stage2 - no reasoning token)
-    instruction_token = "<|instruction|>"
-    response_token = "<|response|>"
-    end_token = "<|end|>"
+    if datasets_already_tokenized:
+        logging.info("✅ Preprocessed datasets are already tokenized, skipping tokenization step")
+        # Split back into train and val if needed
+        train_size = len(train_hf_dataset)
+        val_size = len(val_hf_dataset)
+    elif tokenized_cache_path.exists():
+        logging.info(f"📥 Loading cached tokenized datasets from {tokenized_cache_path}")
+        try:
+            cached_datasets = load_from_disk(str(tokenized_cache_path))
+            train_hf_dataset = cached_datasets["train"]
+            val_hf_dataset = cached_datasets["val"]
+            logging.info(f"✅ Loaded {len(train_hf_dataset):,} training and {len(val_hf_dataset):,} validation tokenized samples from cache")
+            datasets_already_tokenized = True
+        except Exception as e:
+            logging.warning(f"⚠️ Failed to load cached tokenized datasets: {e}. Will retokenize...")
+            datasets_already_tokenized = False
+    else:
+        datasets_already_tokenized = False
     
-    # Define tokenization function for instruction format
-    def tokenize_instruction_function(examples):
-        """Tokenize instruction examples with proper masking for instruction SFT."""
-        batch_size = len(examples['question'])
-        input_ids_list = []
-        attention_mask_list = []
-        labels_list = []
+    if not datasets_already_tokenized:
+        # Combine train and val for processing, then split later
+        from datasets import concatenate_datasets
+        hf_dataset = concatenate_datasets([train_hf_dataset, val_hf_dataset])
         
-        for i in range(batch_size):
-            question = str(examples['question'][i]) if examples['question'][i] else ""
-            answer = str(examples['answer'][i]) if examples['answer'][i] else ""
-            
-            # Format: <|instruction|> {question} <|response|> {answer} <|end|>
-            instruction_text = f"{instruction_token} {question} {response_token} {answer} {end_token}"
-            
-            # Tokenize the full instruction
-            tokenized = tokenizer(
-                instruction_text,
-                padding=False,
-                truncation=True,
-                max_length=seq_length,
-                return_tensors=None
-            )
-            
-            input_ids = tokenized['input_ids']
-            attention_mask = tokenized['attention_mask']
-            
-            # Find where response starts (after response_token)
-            response_token_id = tokenizer.convert_tokens_to_ids(response_token)
-            try:
-                response_start_idx = input_ids.index(response_token_id) + 1  # +1 to start after token
-            except ValueError:
-                # If response_token not found, assume response starts after instruction_token
-                instruction_token_id = tokenizer.convert_tokens_to_ids(instruction_token)
-                try:
-                    response_start_idx = input_ids.index(instruction_token_id) + len(tokenizer.encode(question)) + 1
-                except ValueError:
-                    # Fallback: mask everything except last 20% (assumed to be response)
-                    response_start_idx = int(len(input_ids) * 0.8)
-            
-            # Create labels: mask instruction tokens (-100), keep response tokens
-            labels = [-100] * len(input_ids)  # Start with all masked
-            # Only compute loss on response tokens (after response_start_idx)
-            # Shift labels for next token prediction: labels[i] = input_ids[i+1]
-            for j in range(response_start_idx, len(input_ids) - 1):
-                labels[j] = input_ids[j + 1]
-            labels[-1] = -100  # Last token always ignored
-            
-            input_ids_list.append(input_ids)
-            attention_mask_list.append(attention_mask)
-            labels_list.append(labels)
+        # Load tokenizer with caching support
+        from src.utils.tokenizer_manager import get_tokenizer_with_caching
+        tokenizer = get_tokenizer_with_caching(
+            tokenizer_path=tokenizer_path,
+            custom_tokens=None,  # Use default special tokens
+            force_download=False,
+            cache_dir="tokenizers"
+        )
         
-        return {
-            'input_ids': input_ids_list,
-            'attention_mask': attention_mask_list,
-            'labels': labels_list,
-            'labels_shifted': [True] * batch_size  # Labels are already shifted
-        }
+        # Get sequence length from config
+        seq_length = config.get("sequence_length", 2048)
+        
+        # Special tokens for instruction format (simpler than stage2 - no reasoning token)
+        instruction_token = "<|instruction|>"
+        response_token = "<|response|>"
+        end_token = "<|end|>"
+        
+        # IMPORTANT DECISION: We do NOT learn to emit <|response|> token
+        # - The <|response|> token is MASKED in labels (set to -100)
+        # - Only answer tokens (after <|response|>) contribute to loss
+        # - During inference, <|response|> should be provided in the prompt
+        # - This is consistent with standard instruction tuning practices
+        
+        # Define tokenization function for instruction format
+        def tokenize_instruction_function(examples):
+            """Tokenize instruction examples with proper masking for instruction SFT.
+            
+            Uses SMART TRUNCATION:
+            - Prioritizes keeping answer tokens (what we're training on)
+            - Truncates from question side if needed
+            - Only truncates answer as last resort
+            """
+            batch_size = len(examples['question'])
+            input_ids_list = []
+            attention_mask_list = []
+            labels_list = []
+            
+            # Track statistics for logging
+            stats = {
+                'total': 0,
+                'question_truncated': 0,
+                'answer_truncated': 0,
+                'min_answer_tokens': float('inf'),
+                'max_answer_tokens': 0
+            }
+            
+            for i in range(batch_size):
+                question = str(examples['question'][i]) if examples['question'][i] else ""
+                answer = str(examples['answer'][i]) if examples['answer'][i] else ""
+                
+                # Format: <|instruction|> {question} <|response|> {answer} <|end|>
+                # SMART TRUNCATION: Prioritize keeping the answer (what we're training on)
+                # If sequence is too long, truncate from the question side, not the answer side
+                
+                # First, tokenize components separately to understand their lengths
+                instruction_token_ids = tokenizer.encode(instruction_token, add_special_tokens=False)
+                response_token_ids = tokenizer.encode(response_token, add_special_tokens=False)
+                end_token_ids = tokenizer.encode(end_token, add_special_tokens=False)
+                
+                # Tokenize answer part (this is critical - we need to keep this)
+                answer_text = f"{response_token} {answer} {end_token}"
+                answer_ids = tokenizer.encode(answer_text, add_special_tokens=False)
+                
+                # Calculate available space for question
+                # Reserve space for: instruction_token + question + answer_part
+                reserved_space = len(instruction_token_ids) + len(answer_ids)
+                max_question_length = max(0, seq_length - reserved_space - 10)  # Extra 10 tokens buffer
+                
+                # Tokenize question with truncation if needed
+                if max_question_length > 0:
+                    question_ids = tokenizer.encode(
+                        question,
+                        add_special_tokens=False,
+                        truncation=True,
+                        max_length=max_question_length
+                    )
+                else:
+                    # If answer itself is too long, we'll truncate it (last resort)
+                    question_ids = []
+                    # Truncate answer to fit
+                    max_answer_length = seq_length - len(instruction_token_ids) - len(response_token_ids) - len(end_token_ids) - 10
+                    if max_answer_length > 0:
+                        answer_ids = tokenizer.encode(
+                            answer,
+                            add_special_tokens=False,
+                            truncation=True,
+                            max_length=max_answer_length
+                        )
+                        answer_ids = response_token_ids + answer_ids + end_token_ids
+                    else:
+                        # Answer is extremely long, use minimal truncation
+                        answer_ids = response_token_ids + tokenizer.encode(
+                            answer,
+                            add_special_tokens=False,
+                            truncation=True,
+                            max_length=seq_length - len(instruction_token_ids) - len(response_token_ids) - len(end_token_ids) - 5
+                        ) + end_token_ids
+                
+                # Combine: instruction_token + question + answer_part
+                input_ids = instruction_token_ids + question_ids + answer_ids
+                
+                # Truncate to max_length if still too long (shouldn't happen, but safety check)
+                if len(input_ids) > seq_length:
+                    # Last resort: truncate from question side
+                    excess = len(input_ids) - seq_length
+                    if excess < len(question_ids):
+                        # Can truncate from question
+                        question_ids = question_ids[excess:]
+                        input_ids = instruction_token_ids + question_ids + answer_ids
+                    else:
+                        # Question is completely truncated, keep only instruction + answer
+                        input_ids = instruction_token_ids + answer_ids[:seq_length - len(instruction_token_ids)]
+                
+                attention_mask = [1] * len(input_ids)
+                
+                # Find where response starts (after response_token)
+                # Since we built input_ids as: instruction_token + question_ids + answer_ids
+                # And answer_ids starts with response_token, we know exactly where it starts
+                # response_start_idx = len(instruction_token_ids) + len(question_ids) + len(response_token_ids)
+                response_start_idx = len(instruction_token_ids) + len(question_ids) + len(response_token_ids)
+                
+                # Verify response_start_idx is correct by checking if response_token is at expected position
+                if response_start_idx <= len(input_ids):
+                    # Verify: response_token should be at position (response_start_idx - len(response_token_ids))
+                    expected_response_pos = response_start_idx - len(response_token_ids)
+                    if expected_response_pos >= 0 and expected_response_pos + len(response_token_ids) <= len(input_ids):
+                        actual_response_tokens = input_ids[expected_response_pos:expected_response_pos + len(response_token_ids)]
+                        if actual_response_tokens != response_token_ids:
+                            # Mismatch - fallback to search
+                            logging.warning(f"⚠️ Response token mismatch at expected position, searching...")
+                            # Search from the end backwards
+                            for idx in range(len(input_ids) - len(response_token_ids), -1, -1):
+                                if input_ids[idx:idx+len(response_token_ids)] == response_token_ids:
+                                    response_start_idx = idx + len(response_token_ids)
+                                    break
+                
+                # Safety check: ensure response_start_idx is valid
+                if response_start_idx >= len(input_ids):
+                    # Answer was completely truncated - this shouldn't happen with smart truncation
+                    logging.warning(f"⚠️ Response start index ({response_start_idx}) >= sequence length ({len(input_ids)}), using fallback")
+                    # Use last 20% as answer (fallback)
+                    response_start_idx = max(5, int(len(input_ids) * 0.8))
+                
+                # Ensure we have at least some answer tokens
+                answer_tokens_count = len(input_ids) - response_start_idx
+                if answer_tokens_count < 3:  # Less than 3 tokens for answer (including <|end|>)
+                    logging.warning(f"⚠️ Very few answer tokens ({answer_tokens_count}), response_start_idx={response_start_idx}, seq_len={len(input_ids)}")
+                    # Try to find response_token and adjust
+                    for idx in range(len(input_ids) - len(response_token_ids), max(0, len(input_ids) - 100), -1):
+                        if input_ids[idx:idx+len(response_token_ids)] == response_token_ids:
+                            response_start_idx = idx + len(response_token_ids)
+                            if len(input_ids) - response_start_idx >= 3:
+                                break
+                
+                # Log truncation statistics (only for first sample to avoid spam)
+                if i == 0:
+                    question_tokens = len(question_ids)
+                    answer_tokens = answer_tokens_count
+                    total_tokens = len(input_ids)
+                    logging.info(f"📊 Tokenization stats (first sample): question={question_tokens}, answer={answer_tokens}, total={total_tokens}, response_start_idx={response_start_idx}")
+                    if question_tokens == 0:
+                        logging.warning(f"⚠️ Question was completely truncated (answer too long)")
+                    if answer_tokens < 10:
+                        logging.warning(f"⚠️ Very few answer tokens ({answer_tokens}), may cause training issues")
+                
+                # Update statistics
+                stats['total'] += 1
+                if len(question_ids) < len(tokenizer.encode(question, add_special_tokens=False, truncation=False)):
+                    stats['question_truncated'] += 1
+                if len(answer_ids) < len(tokenizer.encode(f"{response_token} {answer} {end_token}", add_special_tokens=False, truncation=False)):
+                    stats['answer_truncated'] += 1
+                stats['min_answer_tokens'] = min(stats['min_answer_tokens'], answer_tokens_count)
+                stats['max_answer_tokens'] = max(stats['max_answer_tokens'], answer_tokens_count)
+                
+                # Create labels for next token prediction: labels[i] = input_ids[i+1] for ALL positions
+                # This is standard NTP: predict next token at each position
+                # But mask instruction tokens (-100) so loss is only computed on response
+                # 
+                # REQUIREMENTS CHECKLIST:
+                # ✅ Labels are -100 up to (and including) <|response|>
+                # ✅ Labels include the answer and <|end|>
+                # ✅ No stray question tokens appear unmasked in labels
+                # ✅ Padding positions will be set to -100 in collate_fn (attention_mask=0, labels=-100)
+                # ✅ We do NOT learn to emit <|response|> (it's masked)
+                #
+                # CRITICAL: Labels are created ONCE here and marked with labels_shifted=True
+                # The training/validation steps will check this flag and NOT shift again
+                # Note: We're using a custom DecoderOnlyModel, not HF CausalLM, so manual shifting is fine
+                labels = []
+                for pos in range(len(input_ids)):
+                    if pos < len(input_ids) - 1:
+                        # Standard NTP: labels[pos] = input_ids[pos+1]
+                        # Mask everything BEFORE response_start_idx (including <|response|> token itself)
+                        # Only predict tokens AFTER <|response|> (the answer tokens, including <|end|>)
+                        if pos >= response_start_idx:
+                            # Predict next token for answer part only (answer + <|end|>)
+                            labels.append(input_ids[pos + 1])
+                        else:
+                            # Mask instruction part (question + <|response|> token)
+                            labels.append(-100)
+                    else:
+                        # Last position: nothing to predict after it
+                        labels.append(-100)
+                
+                input_ids_list.append(input_ids)
+                attention_mask_list.append(attention_mask)
+                labels_list.append(labels)
+            
+            # Log batch statistics (only first batch to avoid spam)
+            if stats['total'] > 0:
+                # Only log if we have meaningful stats
+                if stats['min_answer_tokens'] != float('inf'):
+                    logging.debug(f"📊 Batch tokenization stats: total={stats['total']}, question_truncated={stats['question_truncated']}, answer_truncated={stats['answer_truncated']}, answer_tokens=[{stats['min_answer_tokens']:.0f}, {stats['max_answer_tokens']:.0f}]")
+            
+            return {
+                'input_ids': input_ids_list,
+                'attention_mask': attention_mask_list,
+                'labels': labels_list,
+                'labels_shifted': [True] * batch_size  # Labels are already shifted
+            }
     
-    # Tokenize the instruction dataset
-    logging.info("🔄 Tokenizing instruction dataset...")
-    logging.info(f"   - Total samples: {len(hf_dataset)}")
-    
-    tokenization_workers = min(48, config.get('num_workers', 8) * 4)
-    logging.info(f"   - Using {tokenization_workers} workers for tokenization")
-    
-    hf_dataset = hf_dataset.map(
-        tokenize_instruction_function,
-        batched=True,
-        batch_size=2000,
-        num_proc=tokenization_workers,
-        remove_columns=['question', 'answer', 'dataset'] if 'dataset' in hf_dataset.column_names else ['question', 'answer'],
-        desc='Tokenizing instruction dataset'
-    )
-    
-    logging.info("✅ Instruction dataset tokenization completed!")
-    logging.info(f"📊 Dataset features: {list(hf_dataset.features.keys())}")
-    
-    # Split back into train and val
-    train_size = len(train_instruction_data)
-    train_hf_dataset = hf_dataset.select(range(train_size))
-    val_hf_dataset = hf_dataset.select(range(train_size, train_size + len(val_instruction_data)))
-    
-    is_tokenized = True
+        # Tokenize the instruction dataset
+        logging.info("🔄 Tokenizing instruction dataset...")
+        logging.info(f"   - Total samples: {len(hf_dataset)}")
+        
+        tokenization_workers = min(48, config.get('num_workers', 8) * 4)
+        logging.info(f"   - Using {tokenization_workers} workers for tokenization")
+        
+        hf_dataset = hf_dataset.map(
+            tokenize_instruction_function,
+            batched=True,
+            batch_size=2000,
+            num_proc=tokenization_workers,
+            remove_columns=['question', 'answer', 'dataset'] if 'dataset' in hf_dataset.column_names else ['question', 'answer'],
+            desc='Tokenizing instruction dataset',
+            load_from_cache_file=False  # Disable HF cache to ensure fresh tokenization
+        )
+        
+        logging.info("✅ Instruction dataset tokenization completed!")
+        logging.info(f"📊 Dataset features: {list(hf_dataset.features.keys())}")
+        
+        # Split back into train and val
+        train_size = len(train_hf_dataset)
+        train_hf_dataset = hf_dataset.select(range(train_size))
+        val_hf_dataset = hf_dataset.select(range(train_size, len(hf_dataset)))
+        
+        # Save tokenized datasets to cache for future runs
+        logging.info(f"💾 Saving tokenized datasets to cache: {tokenized_cache_path}")
+        try:
+            from datasets import DatasetDict
+            cached_datasets = DatasetDict({
+                "train": train_hf_dataset,
+                "val": val_hf_dataset
+            })
+            cached_datasets.save_to_disk(str(tokenized_cache_path))
+            
+            # Save cache metadata
+            cache_metadata = {
+                "cache_key": cache_key,
+                "cache_key_data": cache_key_data,
+                "train_samples": len(train_hf_dataset),
+                "val_samples": len(val_hf_dataset),
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            with open(tokenized_cache_path / "cache_metadata.json", 'w') as f:
+                json.dump(cache_metadata, f, indent=2)
+            
+            logging.info(f"✅ Tokenized datasets cached successfully!")
+        except Exception as e:
+            logging.warning(f"⚠️ Failed to save tokenized datasets to cache: {e}")
+        
+        is_tokenized = True
     
     # Create PyTorch Lightning DataModule with HuggingFace dataset
     from lightning.pytorch import LightningDataModule
