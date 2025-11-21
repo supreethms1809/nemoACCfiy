@@ -286,7 +286,7 @@ class ModularModelConfig(Config):
         # ModularModel specific parameters
         self.pool_type = kwargs.get('pool_type', 'mean')
         self.num_reasoning_vectors = kwargs.get('num_reasoning_vectors', 8)
-        self.tie_weights = kwargs.get('tie_weights', True)
+        self.tie_weights = kwargs.get('tie_weights', False)
         self.freeze_embedder_decoder = kwargs.get('freeze_embedder_decoder', True)
         self.embedder_checkpoint_path = kwargs.get('embedder_checkpoint_path', None)
         
@@ -860,7 +860,7 @@ def create_modular_model_nemo(
     eos_token_id: int = 2,
     pool_type: str = "mean",
     num_reasoning_vectors: int = 8,
-    tie_weights: bool = True,
+    tie_weights: bool = False,
     freeze_embedder_decoder: bool = True,
     embedder_checkpoint_path: Optional[str] = None,
     attention_type: str = "gqa",
@@ -1062,7 +1062,7 @@ class ModularModelConfig:
         self.rms_norm_eps = kwargs.get('rms_norm_eps', 1e-6)  # For RMSNorm
         self.initializer_range = kwargs.get('initializer_range', 0.02)
         self.use_cache = kwargs.get('use_cache', True)
-        self.tie_weights = kwargs.get('tie_weights', True)
+        self.tie_weights = kwargs.get('tie_weights', False)
         self.activation = kwargs.get('activation', 'silu')  # For MLP activation
         self.rotary_base = kwargs.get('rotary_base', 10000.0)  # For RoPE
         self.use_flash_attention = kwargs.get('use_flash_attention', True)

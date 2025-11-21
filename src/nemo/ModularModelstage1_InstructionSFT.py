@@ -1366,6 +1366,290 @@ def check_checkpoint_compatibility(checkpoint_path: str, training_module, logger
         return False
 
 
+def resize_model_embeddings(model, new_vocab_size: int, logger, tie_weights: bool = None):
+    """
+    Resize model embeddings and LM head to accommodate new vocabulary size.
+    
+    This is needed when loading a checkpoint from NTP training that has fewer tokens
+    than the instruction SFT tokenizer (which includes additional special tokens).
+    
+    Args:
+        model: The model to resize (ModularModelNeMo)
+        new_vocab_size: New vocabulary size (from tokenizer)
+        logger: Logger instance
+        tie_weights: Whether weight tying should be enabled after resize.
+                    If None, maintains current state. If True/False, enforces that state.
+        
+    Returns:
+        bool: True if resizing was performed, False if not needed
+    """
+    try:
+        # Get the underlying model (DecoderOnlyModel for stage1)
+        # Handle different model wrapper structures:
+        # 1. ModularModelNeMoWrapper -> modular_model -> model -> decoder
+        # 2. ModularModelNeMo -> model -> decoder  
+        # 3. DecoderOnlyModel -> decoder (direct)
+        
+        core_model = None
+        if hasattr(model, 'modular_model'):
+            # Case 1: ModularModelNeMoWrapper
+            logger.info("🔍 Detected ModularModelNeMoWrapper structure")
+            if hasattr(model.modular_model, 'model'):
+                core_model = model.modular_model.model
+                logger.info(f"🔍 Accessing model.modular_model.model (type: {type(core_model)})")
+            else:
+                core_model = model.modular_model
+                logger.info(f"🔍 Accessing model.modular_model (type: {type(core_model)})")
+        elif hasattr(model, 'model'):
+            # Case 2: ModularModelNeMo or similar
+            core_model = model.model
+            logger.info(f"🔍 Accessing model.model (type: {type(core_model)})")
+        else:
+            # Case 3: Direct DecoderOnlyModel
+            core_model = model
+            logger.info(f"🔍 Using model directly (type: {type(core_model)})")
+        
+        logger.info(f"🔍 Final core_model type = {type(core_model)}")
+        logger.info(f"🔍 Has 'decoder' attribute: {hasattr(core_model, 'decoder')}")
+        
+        # Get current vocab size from embedding layer
+        if hasattr(core_model, 'decoder'):
+            decoder = core_model.decoder
+            logger.info(f"🔍 Decoder type: {type(decoder)}")
+            logger.info(f"🔍 Has 'embed_tokens': {hasattr(decoder, 'embed_tokens')}")
+            logger.info(f"🔍 Has 'lm_head': {hasattr(decoder, 'lm_head')}")
+            
+            # Validate decoder structure
+            if not hasattr(decoder, 'embed_tokens'):
+                logger.error("❌ Decoder does not have 'embed_tokens' attribute - cannot resize")
+                logger.error(f"   Available decoder attributes: {[attr for attr in dir(decoder) if not attr.startswith('_')]}")
+                return False
+            
+            if not hasattr(decoder, 'lm_head'):
+                logger.error("❌ Decoder does not have 'lm_head' attribute - cannot resize")
+                return False
+            
+            # Get current vocab size
+            try:
+                current_vocab_size = decoder.embed_tokens.weight.shape[0]
+                logger.info(f"🔍 Current vocab size from embed_tokens: {current_vocab_size}")
+                logger.info(f"🔍 Embed tokens shape: {decoder.embed_tokens.weight.shape}")
+            except Exception as e:
+                logger.error(f"❌ Error accessing embed_tokens.weight: {e}")
+                if hasattr(decoder, 'vocab_size'):
+                    current_vocab_size = decoder.vocab_size
+                    logger.info(f"🔍 Using vocab_size attribute instead: {current_vocab_size}")
+                else:
+                    logger.error("❌ Could not determine current vocab size")
+                    return False
+            
+            # Log LM head info
+            try:
+                logger.info(f"🔍 LM head shape: {decoder.lm_head.weight.shape}")
+                logger.info(f"🔍 Are weights tied? {decoder.lm_head.weight is decoder.embed_tokens.weight}")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not access LM head info: {e}")
+        else:
+            logger.warning("⚠️ Model structure not recognized, skipping resize")
+            logger.warning(f"   Available attributes: {[attr for attr in dir(core_model) if not attr.startswith('_')]}")
+            return False
+        
+        if current_vocab_size >= new_vocab_size:
+            logger.info(f"✅ Model vocab size ({current_vocab_size}) >= tokenizer vocab size ({new_vocab_size}), no resize needed")
+            return False
+        
+        logger.info("=" * 80)
+        logger.info(f"🔧 Resizing model embeddings from {current_vocab_size} to {new_vocab_size}")
+        logger.info(f"   Adding {new_vocab_size - current_vocab_size} new token embeddings for instruction format tokens")
+        logger.info("=" * 80)
+        
+        # Check if weight tying is currently enabled in the model
+        current_weight_tying = False
+        if hasattr(decoder, 'lm_head') and hasattr(decoder, 'embed_tokens'):
+            # Check if weights are tied (they point to the same tensor)
+            if decoder.lm_head.weight is decoder.embed_tokens.weight:
+                current_weight_tying = True
+                logger.info(f"🔍 Current model state: Weight tying is ENABLED (weights are tied)")
+            else:
+                logger.info(f"🔍 Current model state: Weight tying is DISABLED (weights are separate)")
+        
+        # Determine target weight tying state
+        if tie_weights is not None:
+            # Explicitly set based on config
+            target_weight_tying = tie_weights
+            if target_weight_tying != current_weight_tying:
+                logger.info(f"🔄 Weight tying will be {'ENABLED' if target_weight_tying else 'DISABLED'} after resize (config override)")
+            else:
+                logger.info(f"✅ Weight tying will remain {'ENABLED' if target_weight_tying else 'DISABLED'} (matches current state)")
+        else:
+            # Maintain current state
+            target_weight_tying = current_weight_tying
+            logger.info(f"✅ Weight tying will remain {'ENABLED' if target_weight_tying else 'DISABLED'} (maintaining current state)")
+        
+        # Store old weights before resizing (needed for LM head resizing)
+        old_embedding_weights = None
+        old_lm_head_weights = None
+        if hasattr(decoder, 'embed_tokens'):
+            old_embedding_weights = decoder.embed_tokens.weight.data.clone()
+            logger.info(f"📦 Stored embedding weights: shape {old_embedding_weights.shape}")
+        if hasattr(decoder, 'lm_head'):
+            old_lm_head_weights = decoder.lm_head.weight.data.clone()
+            logger.info(f"📦 Stored LM head weights: shape {old_lm_head_weights.shape}")
+            # If weights are tied, they should be the same tensor (same memory)
+            if current_weight_tying:
+                if old_embedding_weights is not None and torch.equal(old_embedding_weights, old_lm_head_weights):
+                    logger.info("✅ Confirmed: stored weights match (weight tying detected correctly)")
+                else:
+                    logger.warning("⚠️ Weights should be tied but stored copies don't match - this may indicate an issue")
+        
+        # Resize embedding layer
+        if hasattr(decoder, 'embed_tokens'):
+            old_embedding = decoder.embed_tokens
+            hidden_size = old_embedding.weight.shape[1]
+            
+            # Create new embedding layer with larger vocab size
+            # Use torch.nn from module-level import
+            if not LIGHTNING_AVAILABLE:
+                logger.error("❌ PyTorch not available, cannot resize embeddings")
+                return False
+            new_embedding = nn.Embedding(new_vocab_size, hidden_size)
+            
+            # Copy old weights (use stored copy to handle weight tying correctly)
+            new_embedding.weight.data[:current_vocab_size] = old_embedding_weights
+            
+            # Initialize new token embeddings (use mean of existing embeddings)
+            # This is a common initialization strategy for new tokens
+            mean_embedding = old_embedding_weights.mean(dim=0)
+            std_embedding = old_embedding_weights.std(dim=0)
+            for i in range(current_vocab_size, new_vocab_size):
+                new_embedding.weight.data[i] = mean_embedding + torch.randn_like(mean_embedding) * std_embedding * 0.1
+            
+            # Replace embedding layer
+            decoder.embed_tokens = new_embedding
+            decoder.vocab_size = new_vocab_size
+            logger.info(f"✅ Resized embedding layer: {current_vocab_size} → {new_vocab_size}")
+        
+        # Resize LM head
+        if hasattr(decoder, 'lm_head'):
+            old_lm_head = decoder.lm_head
+            
+            # Get hidden_size from stored weights to ensure consistency
+            # CRITICAL: Use embedding weights as source of truth since they're always present
+            # and we've already resized them, so they have the correct shape
+            if old_embedding_weights is not None:
+                hidden_size = old_embedding_weights.shape[1]
+                logger.info(f"📏 Using hidden_size={hidden_size} from stored embedding weights")
+            elif old_lm_head_weights is not None:
+                hidden_size = old_lm_head_weights.shape[1]
+                logger.info(f"📏 Using hidden_size={hidden_size} from stored LM head weights")
+            elif hasattr(decoder, 'embed_tokens'):
+                # Use the newly resized embedding as fallback
+                hidden_size = decoder.embed_tokens.weight.shape[1]
+                logger.info(f"📏 Using hidden_size={hidden_size} from resized embedding")
+            else:
+                # Last resort: try to get from old_lm_head (but this might fail if weights were tied)
+                try:
+                    hidden_size = old_lm_head.weight.shape[1]
+                    logger.info(f"📏 Using hidden_size={hidden_size} from old_lm_head (fallback)")
+                except Exception as e:
+                    logger.error(f"❌ Could not determine hidden_size: {e}")
+                    return False
+            
+            if target_weight_tying:
+                # Weight tying should be enabled - tie the new embedding weights to LM head
+                # First, verify the shapes match
+                if decoder.embed_tokens.weight.shape != (new_vocab_size, hidden_size):
+                    logger.error(f"❌ Shape mismatch: embed_tokens.weight.shape={decoder.embed_tokens.weight.shape}, expected=({new_vocab_size}, {hidden_size})")
+                    return False
+                
+                try:
+                    # Store reference to the embedding weight parameter
+                    embed_weight_param = decoder.embed_tokens.weight
+                    
+                    # Assign the embedding weight to lm_head weight
+                    # This works because both are Parameters with matching shapes
+                    decoder.lm_head.weight = embed_weight_param
+                    
+                    # Verify the tie was successful
+                    if decoder.lm_head.weight is decoder.embed_tokens.weight:
+                        logger.info("✅ LM head tied to resized embedding weights (weight tying enabled)")
+                    else:
+                        logger.warning("⚠️ Weight tying assignment completed but objects are not the same - this may cause issues")
+                except Exception as e:
+                    logger.error(f"❌ Failed to tie weights after resize: {e}")
+                    # Fallback: create a new LM head and copy weights
+                    logger.info("🔄 Falling back to creating new LM head with copied weights")
+                    new_lm_head = nn.Linear(hidden_size, new_vocab_size, bias=False)
+                    # Use stored old weights (handles both tied and untied cases)
+                    if old_lm_head_weights is not None:
+                        new_lm_head.weight.data[:current_vocab_size] = old_lm_head_weights
+                    elif old_embedding_weights is not None:
+                        new_lm_head.weight.data[:current_vocab_size] = old_embedding_weights
+                    nn.init.normal_(new_lm_head.weight.data[current_vocab_size:], mean=0.0, std=0.02)
+                    decoder.lm_head = new_lm_head
+                    logger.info(f"✅ Created new LM head: {current_vocab_size} → {new_vocab_size} (weight tying lost)")
+            else:
+                # Weight tying should be disabled - create separate LM head
+                # Create new LM head with larger vocab size
+                new_lm_head = nn.Linear(hidden_size, new_vocab_size, bias=False)
+                
+                # Copy old weights (handle both tied and untied cases)
+                # Use stored weights to ensure we get the correct values before any replacements
+                weights_to_copy = None
+                source_name = None
+                
+                if current_weight_tying:
+                    # If weights were tied, use embedding weights as source (they're the same anyway)
+                    weights_to_copy = old_embedding_weights
+                    source_name = "embedding layer (was tied)"
+                else:
+                    # If weights were separate, use LM head weights
+                    weights_to_copy = old_lm_head_weights
+                    source_name = "LM head (was separate)"
+                
+                if weights_to_copy is not None:
+                    # Verify shapes match
+                    expected_shape = (current_vocab_size, hidden_size)
+                    actual_shape = weights_to_copy.shape
+                    
+                    if actual_shape == expected_shape:
+                        # Copy weights - ensure we're copying the right slice
+                        try:
+                            new_lm_head.weight.data[:current_vocab_size, :] = weights_to_copy
+                            logger.info(f"📋 Copied weights from {source_name}: shape {actual_shape}")
+                        except Exception as e:
+                            logger.error(f"❌ Error copying weights: {e}")
+                            logger.error(f"   Target shape: {new_lm_head.weight.data[:current_vocab_size].shape}")
+                            logger.error(f"   Source shape: {weights_to_copy.shape}")
+                            return False
+                    else:
+                        logger.error(f"❌ Shape mismatch when copying weights from {source_name}")
+                        logger.error(f"   Expected: {expected_shape}")
+                        logger.error(f"   Got: {actual_shape}")
+                        logger.error(f"   current_vocab_size={current_vocab_size}, hidden_size={hidden_size}")
+                        return False
+                else:
+                    logger.warning(f"⚠️ Could not find weights to copy from {source_name}, using random initialization")
+                
+                # Initialize new token weights (use small random values)
+                nn.init.normal_(new_lm_head.weight.data[current_vocab_size:], mean=0.0, std=0.02)
+                
+                # Replace LM head
+                decoder.lm_head = new_lm_head
+                logger.info(f"✅ Resized LM head: {current_vocab_size} → {new_vocab_size} (weight tying disabled)")
+        
+        logger.info("=" * 80)
+        logger.info("✅ Model embeddings resized successfully!")
+        logger.info("=" * 80)
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Error resizing model embeddings: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return False
+
+
 def load_checkpoint_with_fallback(checkpoint_path: str, training_module, logger):
     """
     Load checkpoint with fallback mechanisms to handle parameter mapping issues.
@@ -1420,6 +1704,19 @@ def load_checkpoint_with_fallback(checkpoint_path: str, training_module, logger)
             
             # Load with strict=False to handle parameter mismatches
             missing_keys, unexpected_keys = training_module.load_state_dict(filtered_state_dict, strict=False)
+            
+            # CRITICAL: After loading, check if we need to untie weights based on current config
+            # This handles the case where checkpoint had tied weights but current config says untied
+            if embed_tokens_weight is not None:
+                # Check if weights are currently tied in the model
+                model = training_module.model if hasattr(training_module, 'model') else training_module
+                if hasattr(model, 'model') and hasattr(model.model, 'decoder'):
+                    decoder = model.model.decoder
+                    if hasattr(decoder, 'lm_head') and hasattr(decoder, 'embed_tokens'):
+                        if decoder.lm_head.weight is decoder.embed_tokens.weight:
+                            # Weights are tied, but we need to check if they should be untied
+                            # This will be handled by resize function, but we log it here
+                            logger.info("🔍 Checkpoint loaded with tied weights - resize will handle untie if needed")
             
             if missing_keys:
                 logger.info(f"⚠️ Missing keys (will use random initialization): {len(missing_keys)}")
@@ -2073,26 +2370,74 @@ def train_production_mode(
     logging.info(f"📈 Progress Bar: PyTorch Lightning Default (RichProgressBar disabled due to compatibility issues)")
     logging.info(f"🎯 Instruction SFT: REQUIRES checkpoint from NTP training (cannot start from scratch)")
     
-    # CRITICAL: Find NTP checkpoint FIRST before loading config or creating model
-    # This ensures we fail fast if NTP checkpoint is missing
+    # CRITICAL: Check for instruction SFT checkpoint FIRST before doing anything else
+    # This determines whether we're resuming or starting fresh
     logging.info("=" * 80)
-    logging.info("🔍 STEP 1: Locating NTP checkpoint (REQUIRED for instruction SFT)...")
+    logging.info("🔍 STEP 1: Checking for existing instruction SFT checkpoint...")
     logging.info("=" * 80)
     
     # Load minimal config first just to get checkpoint directory
     # Use stage1_inst_SFT for training config, but model will be created as stage1 (decoder-only)
     temp_config = create_nemo_config_from_existing(model_config_key, stage, base_path)
     
-    # Find NTP checkpoint - this will raise FileNotFoundError if not found
-    try:
-        ntp_checkpoint = find_ntp_checkpoint(ntp_checkpoint_path, temp_config)
-        logging.info(f"✅ NTP checkpoint found: {ntp_checkpoint}")
+    # Check if instruction SFT checkpoint exists (explicit or auto-detect)
+    instruction_sft_checkpoint = resume_from_checkpoint
+    is_resuming = False
+    
+    if instruction_sft_checkpoint is None:
+        # Auto-detect latest instruction SFT checkpoint for resume
+        checkpoint_dir = temp_config.get("checkpoint_dir", f"outputs/checkpoints/{stage}")
+        if os.path.exists(checkpoint_dir):
+            checkpoint_files = [f for f in os.listdir(checkpoint_dir) if f.endswith('.ckpt')]
+            if checkpoint_files:
+                # Sort by modification time and get the latest
+                latest_checkpoint = max(checkpoint_files, key=lambda x: os.path.getmtime(os.path.join(checkpoint_dir, x)))
+                instruction_sft_checkpoint = os.path.join(checkpoint_dir, latest_checkpoint)
+                logging.info(f"🔄 Auto-detected latest instruction SFT checkpoint: {instruction_sft_checkpoint}")
+                logging.info("📋 Auto-resume Mode: Will resume from instruction SFT checkpoint")
+                is_resuming = True
+            else:
+                logging.info("ℹ️  No instruction SFT checkpoints found. Will start fresh instruction SFT training from NTP checkpoint.")
+        else:
+            logging.info("ℹ️  Instruction SFT checkpoint directory not found. Will start fresh instruction SFT training from NTP checkpoint.")
+    else:
+        # Explicit checkpoint provided - check if it exists
+        if os.path.exists(instruction_sft_checkpoint):
+            logging.info(f"🔄 Explicit instruction SFT checkpoint provided: {instruction_sft_checkpoint}")
+            logging.info("📋 Resume Mode: Will resume from instruction SFT checkpoint")
+            is_resuming = True
+        else:
+            logging.warning(f"⚠️  Provided checkpoint does not exist: {instruction_sft_checkpoint}")
+            logging.info("Will start fresh instruction SFT training from NTP checkpoint.")
+            instruction_sft_checkpoint = None
+    
+    logging.info("=" * 80)
+    if is_resuming:
+        logging.info("✅ RESUME MODE: Instruction SFT checkpoint found")
+        logging.info(f"   Checkpoint: {instruction_sft_checkpoint}")
+        logging.info("   Will skip NTP checkpoint load - PyTorch Lightning will load full state")
+    else:
+        logging.info("✅ FRESH START MODE: No instruction SFT checkpoint found")
+        logging.info("   Will load NTP checkpoint first, then resize for instruction tokens")
+    logging.info("=" * 80)
+    
+    # Now find NTP checkpoint (only needed if not resuming)
+    ntp_checkpoint = None
+    if not is_resuming:
         logging.info("=" * 80)
-    except FileNotFoundError as e:
-        # Re-raise with clear error message
-        raise FileNotFoundError(
-            f"Instruction SFT requires an NTP checkpoint. {str(e)}"
-        ) from e
+        logging.info("🔍 STEP 2: Locating NTP checkpoint (REQUIRED for fresh instruction SFT)...")
+        logging.info("=" * 80)
+        
+        # Find NTP checkpoint - this will raise FileNotFoundError if not found
+        try:
+            ntp_checkpoint = find_ntp_checkpoint(ntp_checkpoint_path, temp_config)
+            logging.info(f"✅ NTP checkpoint found: {ntp_checkpoint}")
+            logging.info("=" * 80)
+        except FileNotFoundError as e:
+            # Re-raise with clear error message
+            raise FileNotFoundError(
+                f"Instruction SFT requires an NTP checkpoint for fresh start. {str(e)}"
+            ) from e
     
     # Now load full configuration
     config = temp_config
@@ -2133,14 +2478,91 @@ def train_production_mode(
     logging.info(f"   persistent_workers: {config.get('persistent_workers')}")
     logging.info(f"   prefetch_factor: {config.get('prefetch_factor')}")
     
+    # CRITICAL: Load tokenizer FIRST with instruction format special tokens
+    # This ensures we know the actual vocab size before creating the model
+    logging.info("=" * 80)
+    logging.info("🔤 STEP 1.5: Loading tokenizer with instruction format special tokens...")
+    logging.info("=" * 80)
+    tokenizer_path = config.get("tokenizer_path", "Qwen/Qwen3-Coder-30B-A3B-Instruct")
+    
+    # Load tokenizer with caching support
+    from src.utils.tokenizer_manager import get_tokenizer_with_caching
+    tokenizer = get_tokenizer_with_caching(
+        tokenizer_path=tokenizer_path,
+        custom_tokens=None,  # Use default special tokens
+        force_download=False,
+        cache_dir="tokenizers"
+    )
+    
+    # Add instruction format special tokens if not already present
+    instruction_token = "<|instruction|>"
+    response_token = "<|response|>"
+    end_token = "<|end|>"
+    
+    instruction_tokens = [instruction_token, response_token, end_token]
+    new_tokens = []
+    for token in instruction_tokens:
+        if token not in tokenizer.get_vocab():
+            new_tokens.append(token)
+    
+    # Store original vocab size before adding tokens (for model creation)
+    original_vocab_size = config.get("vocab_size")
+    
+    if new_tokens:
+        logging.info(f"➕ Adding {len(new_tokens)} instruction format tokens: {new_tokens}")
+        tokenizer.add_tokens(new_tokens)
+        actual_vocab_size = len(tokenizer)
+        logging.info(f"✅ Tokenizer vocab size after adding instruction tokens: {actual_vocab_size}")
+        logging.info(f"   Original vocab size: {original_vocab_size}")
+        logging.info(f"   New vocab size: {actual_vocab_size}")
+        logging.info(f"   Added {actual_vocab_size - original_vocab_size} tokens")
+    else:
+        logging.info(f"✅ All instruction format tokens already present in tokenizer")
+        actual_vocab_size = len(tokenizer)
+        logging.info(f"   Tokenizer vocab size: {actual_vocab_size}")
+    
+    # CRITICAL: Set pad_token_id to a token that's NOT eos_token_id
+    # This ensures consistent behavior between training and inference
+    # When padding, we don't want to use eos_token_id as padding token
+    if tokenizer.pad_token_id is None or tokenizer.pad_token_id == tokenizer.eos_token_id:
+        # Try to use unk_token_id, or fallback to 0
+        if tokenizer.unk_token_id is not None:
+            tokenizer.pad_token_id = tokenizer.unk_token_id
+            logging.info(f"🔧 Set pad_token_id to unk_token_id: {tokenizer.unk_token_id} (was: {tokenizer.eos_token_id})")
+        else:
+            tokenizer.pad_token_id = 0  # Use 0 as safe fallback
+            logging.info(f"🔧 Set pad_token_id to 0 (fallback, was: {tokenizer.eos_token_id})")
+    else:
+        logging.info(f"✅ pad_token_id already set correctly: {tokenizer.pad_token_id}")
+    
+    # NOTE: For training, we typically use right padding (default) since we want the model
+    # to see the full sequence up to the padding. Left padding is only needed during
+    # batched inference/generation. However, we ensure pad_token_id != eos_token_id
+    # for consistency with inference.
+    
+    # IMPORTANT: Determine vocab size for model creation based on resume flag
+    # If resuming, use actual vocab size (checkpoint already has it)
+    # If fresh start, use original vocab size (will resize after NTP checkpoint load)
+    if is_resuming:
+        # Resume mode: checkpoint already has correct vocab size
+        model_vocab_size = actual_vocab_size
+        logging.info(f"📦 RESUME MODE: Creating model with vocab size ({model_vocab_size}) to match instruction SFT checkpoint")
+        logging.info("   Checkpoint already has correct vocab size - no resizing needed")
+    else:
+        # Fresh start: create with original vocab size, will resize after NTP checkpoint load
+        model_vocab_size = original_vocab_size
+        logging.info(f"📦 FRESH START MODE: Creating model with original vocab size ({model_vocab_size}) to match NTP checkpoint")
+        logging.info(f"   Will resize to {actual_vocab_size} after loading NTP checkpoint")
+    logging.info("=" * 80)
+    
     # Create model - use stage1 for model architecture (decoder-only)
     # The training config comes from stage1_inst_SFT, but model is decoder-only (stage1)
     config["training_stage"] = "stage1"  # Model is decoder-only (stage1), not full modular model
+    config["vocab_size"] = model_vocab_size  # Set vocab size based on resume mode
     model = create_modular_model_nemo(**config)
     
     # Load instruction datasets for SFT
     vocab_size = config["vocab_size"]
-    tokenizer_path = config.get("tokenizer_path", "Qwen/Qwen3-Coder-30B-A3B-Instruct")
     
     # Load instruction tuning datasets from config
     data_config = config.get("data", {})
@@ -2257,15 +2679,8 @@ def train_production_mode(
         from datasets import concatenate_datasets
         hf_dataset = concatenate_datasets([train_hf_dataset, val_hf_dataset])
         
-        # Load tokenizer with caching support
-        from src.utils.tokenizer_manager import get_tokenizer_with_caching
-        tokenizer = get_tokenizer_with_caching(
-            tokenizer_path=tokenizer_path,
-            custom_tokens=None,  # Use default special tokens
-            force_download=False,
-            cache_dir="tokenizers"
-        )
-        
+        # Tokenizer is already loaded above with instruction format tokens
+        # Just verify it has the tokens we need
         # Get sequence length from config
         seq_length = config.get("sequence_length", 2048)
         
@@ -2436,26 +2851,30 @@ def train_production_mode(
                 # But mask instruction tokens (-100) so loss is only computed on response
                 # 
                 # REQUIREMENTS CHECKLIST:
-                # ✅ Labels are -100 up to (and including) <|response|>
-                # ✅ Labels include the answer and <|end|>
-                # ✅ No stray question tokens appear unmasked in labels
+                # ✅ Labels are -100 for question part (before <|response|>)
+                # ✅ Labels predict first answer token from <|response|> token position
+                # ✅ Labels include all answer tokens and <|end|>
                 # ✅ Padding positions will be set to -100 in collate_fn (attention_mask=0, labels=-100)
-                # ✅ We do NOT learn to emit <|response|> (it's masked)
+                # ✅ We do NOT learn to emit <|response|> (we predict answer from it, but don't learn to emit it)
                 #
                 # CRITICAL: Labels are created ONCE here and marked with labels_shifted=True
                 # The training/validation steps will check this flag and NOT shift again
                 # Note: We're using a custom DecoderOnlyModel, not HF CausalLM, so manual shifting is fine
                 labels = []
+                # Calculate where response token starts
+                response_token_start = response_start_idx - len(response_token_ids)
+                
                 for pos in range(len(input_ids)):
                     if pos < len(input_ids) - 1:
                         # Standard NTP: labels[pos] = input_ids[pos+1]
-                        # Mask everything BEFORE response_start_idx (including <|response|> token itself)
-                        # Only predict tokens AFTER <|response|> (the answer tokens, including <|end|>)
-                        if pos >= response_start_idx:
-                            # Predict next token for answer part only (answer + <|end|>)
+                        # Mask everything BEFORE response token (question part only)
+                        # Predict answer tokens starting from response token position
+                        if pos >= response_token_start:
+                            # Predict next token for answer part (including first answer token from response token)
+                            # This ensures we learn to predict the first answer token when we see <|response|>
                             labels.append(input_ids[pos + 1])
                         else:
-                            # Mask instruction part (question + <|response|> token)
+                            # Mask instruction part (question only, not response token)
                             labels.append(-100)
                     else:
                         # Last position: nothing to predict after it
@@ -2534,15 +2953,8 @@ def train_production_mode(
     from lightning.pytorch import LightningDataModule
     from torch.utils.data import DataLoader
     
-    # Load tokenizer if not already loaded
-    if 'tokenizer' not in locals():
-        from src.utils.tokenizer_manager import get_tokenizer_with_caching
-        tokenizer = get_tokenizer_with_caching(
-            tokenizer_path=tokenizer_path,
-            custom_tokens=None,  # Use default special tokens
-            force_download=False,
-            cache_dir="tokenizers"
-        )
+    # Tokenizer is already loaded above with instruction format tokens
+    # No need to reload it here
 
     # Create the custom DataModule with train/val datasets
     # We need to create separate datasets for train and val
@@ -2779,87 +3191,157 @@ def train_production_mode(
     
     trainer = pl.Trainer(**trainer_kwargs)
     
-    # For instruction SFT, we ALWAYS load from NTP checkpoint first
-    # Then optionally resume from instruction SFT checkpoint if provided
-    initial_checkpoint_path = ntp_checkpoint  # Always start from NTP checkpoint
+    # Auto-detect latest checkpoint for resume if not explicitly provided
+    instruction_sft_checkpoint = resume_from_checkpoint
+    if instruction_sft_checkpoint is None:
+        # Auto-detect latest instruction SFT checkpoint for resume
+        checkpoint_dir = config.get("checkpoint_dir", f"outputs/checkpoints/{stage}")
+        if os.path.exists(checkpoint_dir):
+            checkpoint_files = [f for f in os.listdir(checkpoint_dir) if f.endswith('.ckpt')]
+            if checkpoint_files:
+                # Sort by modification time and get the latest
+                latest_checkpoint = max(checkpoint_files, key=lambda x: os.path.getmtime(os.path.join(checkpoint_dir, x)))
+                instruction_sft_checkpoint = os.path.join(checkpoint_dir, latest_checkpoint)
+                logging.info(f"🔄 Auto-detected latest instruction SFT checkpoint: {instruction_sft_checkpoint}")
+                logging.info("📋 Auto-resume Mode: Will resume from instruction SFT checkpoint")
+            else:
+                logging.info("ℹ️  No instruction SFT checkpoints found. Starting fresh instruction SFT training from NTP checkpoint.")
+        else:
+            logging.info("ℹ️  Instruction SFT checkpoint directory not found. Starting fresh instruction SFT training from NTP checkpoint.")
     
     # Check if we should resume from instruction SFT checkpoint
-    instruction_sft_checkpoint = resume_from_checkpoint
-    if instruction_sft_checkpoint:
-        logging.info(f"🔄 Will resume instruction SFT from: {instruction_sft_checkpoint}")
-        # Load NTP checkpoint first, then resume from instruction SFT checkpoint
-        checkpoint_path = instruction_sft_checkpoint
+    is_resuming = instruction_sft_checkpoint is not None and os.path.exists(instruction_sft_checkpoint) if instruction_sft_checkpoint else False
+    
+    if is_resuming:
+        # RESUME MODE: Let PyTorch Lightning load the checkpoint first
+        # The checkpoint already has the correct vocab size (with instruction tokens)
+        # We'll resize after loading if needed (shouldn't be needed, but check anyway)
+        logging.info("=" * 80)
+        logging.info(f"🔄 RESUME MODE: Resuming instruction SFT from checkpoint")
+        logging.info(f"   Checkpoint: {instruction_sft_checkpoint}")
+        logging.info("=" * 80)
+        logging.info("ℹ️  Skipping NTP checkpoint load - PyTorch Lightning will load full state from instruction SFT checkpoint")
+        logging.info("ℹ️  Checkpoint already has correct vocab size - will verify after loading")
+        
+        # Note: We'll check vocab size AFTER PyTorch Lightning loads the checkpoint
+        # The checkpoint should already have the correct size, so resizing shouldn't be needed
     else:
-        # Start fresh instruction SFT from NTP checkpoint
-        checkpoint_path = initial_checkpoint_path
-        logging.info(f"🔄 Starting instruction SFT from NTP checkpoint: {checkpoint_path}")
-    
-    # CRITICAL: Load NTP checkpoint (always required for instruction SFT)
-    # This ensures we never start from a newly initialized model
-    logging.info("=" * 80)
-    logging.info(f"📥 STEP 2: Loading NTP checkpoint (REQUIRED for instruction SFT)...")
-    logging.info(f"   Checkpoint: {initial_checkpoint_path}")
-    logging.info("=" * 80)
-    
-    if not os.path.exists(initial_checkpoint_path):
-        logging.error(f"❌ NTP checkpoint file does not exist: {initial_checkpoint_path}")
-        raise FileNotFoundError(
-            f"NTP checkpoint file not found: {initial_checkpoint_path}. "
-            "Instruction SFT cannot proceed without a valid NTP checkpoint."
-        )
-    
-    if check_checkpoint_compatibility(initial_checkpoint_path, training_module, logging):
-        logging.info("✅ NTP checkpoint is compatible, loading model weights...")
-        if not load_checkpoint_with_fallback(initial_checkpoint_path, training_module, logging):
-            logging.error("❌ Failed to load NTP checkpoint weights!")
-            raise RuntimeError(
-                f"Could not load NTP checkpoint from {initial_checkpoint_path}. "
-                "Instruction SFT requires a valid NTP checkpoint to proceed."
+        # FRESH START MODE: Load from NTP checkpoint first, then resize
+        initial_checkpoint_path = ntp_checkpoint  # Always start from NTP checkpoint
+        logging.info("=" * 80)
+        logging.info(f"📥 STEP 2: Loading NTP checkpoint (REQUIRED for fresh instruction SFT)...")
+        logging.info(f"   Checkpoint: {initial_checkpoint_path}")
+        logging.info("=" * 80)
+        
+        if not os.path.exists(initial_checkpoint_path):
+            logging.error(f"❌ NTP checkpoint file does not exist: {initial_checkpoint_path}")
+            raise FileNotFoundError(
+                f"NTP checkpoint file not found: {initial_checkpoint_path}. "
+                "Instruction SFT cannot proceed without a valid NTP checkpoint."
             )
-    else:
-        logging.warning("⚠️ NTP checkpoint compatibility check failed, attempting to load anyway...")
-        if not load_checkpoint_with_fallback(initial_checkpoint_path, training_module, logging):
-            logging.error("❌ Failed to load NTP checkpoint weights!")
-            raise RuntimeError(
-                f"Could not load NTP checkpoint from {initial_checkpoint_path}. "
-                "Instruction SFT requires a valid NTP checkpoint to proceed."
-            )
-    
-    logging.info("=" * 80)
-    logging.info("✅ NTP checkpoint loaded successfully!")
-    logging.info("✅ Model initialized from NTP checkpoint (not from scratch)")
-    logging.info("🚀 Ready to start instruction SFT training...")
-    logging.info("=" * 80)
+        
+        # CRITICAL: Load checkpoint FIRST (with original vocab size), then resize
+        # This ensures checkpoint loading works correctly
+        if check_checkpoint_compatibility(initial_checkpoint_path, training_module, logging):
+            logging.info("✅ NTP checkpoint is compatible, loading model weights...")
+            if not load_checkpoint_with_fallback(initial_checkpoint_path, training_module, logging):
+                logging.error("❌ Failed to load NTP checkpoint weights!")
+                raise RuntimeError(
+                    f"Could not load NTP checkpoint from {initial_checkpoint_path}. "
+                    "Instruction SFT requires a valid NTP checkpoint to proceed."
+                )
+        else:
+            logging.warning("⚠️ NTP checkpoint compatibility check failed, attempting to load anyway...")
+            if not load_checkpoint_with_fallback(initial_checkpoint_path, training_module, logging):
+                logging.error("❌ Failed to load NTP checkpoint weights!")
+                raise RuntimeError(
+                    f"Could not load NTP checkpoint from {initial_checkpoint_path}. "
+                    "Instruction SFT requires a valid NTP checkpoint to proceed."
+                )
+        
+        # CRITICAL: Verify weight tying state after checkpoint load
+        # The checkpoint might have tied weights even if current config says untied
+        tie_weights_config = config.get("tie_weights", False)
+        if hasattr(model, 'model') and hasattr(model.model, 'decoder'):
+            decoder = model.model.decoder
+            if hasattr(decoder, 'lm_head') and hasattr(decoder, 'embed_tokens'):
+                weights_are_tied = decoder.lm_head.weight is decoder.embed_tokens.weight
+                if weights_are_tied and not tie_weights_config:
+                    logging.warning("⚠️ Checkpoint has tied weights but config requires untied - will untie during resize")
+                elif not weights_are_tied and tie_weights_config:
+                    logging.warning("⚠️ Checkpoint has untied weights but config requires tied - will tie during resize")
+                else:
+                    logging.info(f"✅ Weight tying state matches config: {'TIED' if weights_are_tied else 'UNTIED'}")
+        
+        # CRITICAL: Resize model embeddings AFTER loading checkpoint
+        # This handles the case where instruction format tokens were added to the tokenizer
+        tokenizer_vocab_size = len(tokenizer)
+        logging.info("=" * 80)
+        logging.info(f"🔍 Checking if model needs resizing after checkpoint load...")
+        logging.info(f"   Tokenizer vocab size: {tokenizer_vocab_size}")
+        logging.info("=" * 80)
+        
+        # Resize model embeddings to accommodate new instruction format tokens
+        # Pass tie_weights config to ensure weights are tied/untied according to current config
+        tie_weights_config = config.get("tie_weights", False)
+        logging.info(f"🔧 Resize will set weight tying to: {'ENABLED' if tie_weights_config else 'DISABLED'}")
+        resize_model_embeddings(model, tokenizer_vocab_size, logging, tie_weights=tie_weights_config)
+        
+        # Update config vocab_size to match tokenizer (for consistency)
+        config["vocab_size"] = tokenizer_vocab_size
+        
+        logging.info("=" * 80)
+        logging.info("✅ NTP checkpoint loaded successfully!")
+        logging.info("✅ Model embeddings resized to accommodate instruction format tokens")
+        logging.info("✅ Model initialized from NTP checkpoint (not from scratch)")
+        logging.info("🚀 Ready to start instruction SFT training...")
+        logging.info("=" * 80)
     
     # Train with resume capability (for instruction SFT checkpoints)
     # Only include validation dataloader if validation is enabled
     if val_check_interval_steps == float('inf'):
         # Validation disabled - don't pass val_loader
-        logging.info("🚀 Starting instruction SFT training without validation...")
-        if instruction_sft_checkpoint and instruction_sft_checkpoint != initial_checkpoint_path:
-            logging.info(f"🔄 Resuming instruction SFT from checkpoint: {instruction_sft_checkpoint}")
-            try:
-                trainer.fit(training_module, train_loader, ckpt_path=instruction_sft_checkpoint)
-            except Exception as e:
-                logging.warning(f"Failed to resume from instruction SFT checkpoint {instruction_sft_checkpoint}: {e}")
-                logging.info("Starting instruction SFT training from NTP checkpoint...")
-                trainer.fit(training_module, train_loader)
+        if is_resuming:
+            logging.info("🚀 Resuming instruction SFT training without validation...")
+            # PyTorch Lightning will load the checkpoint, which already has correct vocab size
+            trainer.fit(training_module, train_loader, ckpt_path=instruction_sft_checkpoint)
+            
+            # After loading, verify vocab size matches tokenizer (should already match)
+            tokenizer_vocab_size = len(tokenizer)
+            if hasattr(training_module, 'model') and hasattr(training_module.model, 'model') and hasattr(training_module.model.model, 'decoder'):
+                current_vocab_size = training_module.model.model.decoder.embed_tokens.weight.shape[0]
+                if current_vocab_size != tokenizer_vocab_size:
+                    logging.warning(f"⚠️  Vocab size mismatch after resume: model={current_vocab_size}, tokenizer={tokenizer_vocab_size}")
+                    logging.info(f"🔧 Resizing model embeddings: {current_vocab_size} → {tokenizer_vocab_size}")
+                    tie_weights_config = config.get("tie_weights", False)
+                    resize_model_embeddings(training_module.model, tokenizer_vocab_size, logging, tie_weights=tie_weights_config)
+                    config["vocab_size"] = tokenizer_vocab_size
+                else:
+                    logging.info(f"✅ Model vocab size ({current_vocab_size}) matches tokenizer vocab size ({tokenizer_vocab_size})")
         else:
-            logging.info("🚀 Starting instruction SFT training from NTP checkpoint...")
+            logging.info("🚀 Starting instruction SFT training without validation...")
             trainer.fit(training_module, train_loader)
     else:
         # Validation enabled - include val_loader
-        logging.info("🚀 Starting instruction SFT training with validation...")
-        if instruction_sft_checkpoint and instruction_sft_checkpoint != initial_checkpoint_path:
-            logging.info(f"🔄 Resuming instruction SFT from checkpoint: {instruction_sft_checkpoint}")
-            try:
-                trainer.fit(training_module, train_loader, val_loader, ckpt_path=instruction_sft_checkpoint)
-            except Exception as e:
-                logging.warning(f"Failed to resume from instruction SFT checkpoint {instruction_sft_checkpoint}: {e}")
-                logging.info("Starting instruction SFT training from NTP checkpoint...")
-                trainer.fit(training_module, train_loader, val_loader)
+        if is_resuming:
+            logging.info("🚀 Resuming instruction SFT training with validation...")
+            # PyTorch Lightning will load the checkpoint, which already has correct vocab size
+            trainer.fit(training_module, train_loader, val_loader, ckpt_path=instruction_sft_checkpoint)
+            
+            # After loading, verify vocab size matches tokenizer (should already match)
+            tokenizer_vocab_size = len(tokenizer)
+            if hasattr(training_module, 'model') and hasattr(training_module.model, 'model') and hasattr(training_module.model.model, 'decoder'):
+                current_vocab_size = training_module.model.model.decoder.embed_tokens.weight.shape[0]
+                if current_vocab_size != tokenizer_vocab_size:
+                    logging.warning(f"⚠️  Vocab size mismatch after resume: model={current_vocab_size}, tokenizer={tokenizer_vocab_size}")
+                    logging.info(f"🔧 Resizing model embeddings: {current_vocab_size} → {tokenizer_vocab_size}")
+                    tie_weights_config = config.get("tie_weights", False)
+                    resize_model_embeddings(training_module.model, tokenizer_vocab_size, logging, tie_weights=tie_weights_config)
+                    config["vocab_size"] = tokenizer_vocab_size
+                else:
+                    logging.info(f"✅ Model vocab size ({current_vocab_size}) matches tokenizer vocab size ({tokenizer_vocab_size})")
         else:
-            logging.info("🚀 Starting instruction SFT training from NTP checkpoint...")
+            logging.info("🚀 Starting instruction SFT training with validation...")
             trainer.fit(training_module, train_loader, val_loader)
     
     logging.info("✅ Instruction SFT training completed successfully!")

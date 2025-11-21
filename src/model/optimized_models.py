@@ -25,7 +25,7 @@ class DecoderOnlyModel(nn.Module):
     This reduces memory usage by ~50% for decoder-only training.
     """
     
-    def __init__(self, config, vocab_size: int, tie_weights: bool = True):
+    def __init__(self, config, vocab_size: int, tie_weights: bool = False):
         super().__init__()
         # Handle both dict and object config formats for compatibility
         if isinstance(config, dict):
@@ -87,21 +87,250 @@ class DecoderOnlyModel(nn.Module):
         )
         return logits
     
-    def generate(self, input_ids, attention_mask=None, max_new_tokens=50, temperature=1.0, 
-                 top_p=1.0, top_k=50, do_sample=True, eos_token_id=None, pad_token_id=None):
-        """Generate text using the decoder-only model."""
-        # Delegate to the decoder's generate method
-        return self.decoder.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            do_sample=do_sample,
-            eos_token_id=eos_token_id,
-            pad_token_id=pad_token_id
-        )
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        max_new_tokens: int = 50,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: int = 50,
+        do_sample: bool = True,
+        pad_token_id: Optional[int] = None,
+        eos_token_id: Optional[int] = None,
+        repetition_penalty: float = 1.0,
+        length_penalty: float = 1.0,
+        early_stopping: bool = False,
+        use_cache: bool = True,
+        **kwargs
+    ):
+        """
+        Generate text using HuggingFace's generation utilities.
+        
+        This method uses HuggingFace's GenerationMixin.generate() which provides
+        optimized generation with support for various decoding strategies, beam search,
+        and advanced sampling techniques.
+        
+        Args:
+            input_ids: Input token IDs of shape (batch_size, seq_len)
+            attention_mask: Attention mask of shape (batch_size, seq_len)
+            max_new_tokens: Maximum number of new tokens to generate
+            temperature: Sampling temperature (1.0 = no change, <1.0 = more focused, >1.0 = more random)
+            top_p: Nucleus sampling parameter (0.0 to 1.0)
+            top_k: Top-k sampling parameter
+            do_sample: Whether to use sampling (True) or greedy decoding (False)
+            pad_token_id: Token ID for padding
+            eos_token_id: Token ID for end of sequence
+            repetition_penalty: Penalty for repetition (1.0 = no penalty, >1.0 = penalty)
+            length_penalty: Length penalty for beam search
+            early_stopping: Whether to stop early when EOS is generated
+            use_cache: Whether to use KV cache for efficiency
+            **kwargs: Additional arguments passed to HuggingFace's generate() method
+            
+        Returns:
+            Generated token IDs of shape (batch_size, original_seq_len + new_tokens)
+        """
+        # Set model to eval mode
+        self.eval()
+        
+        # Prepare generation kwargs for HuggingFace's generate method
+        generation_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature if do_sample else None,
+            "top_p": top_p if do_sample else None,
+            "top_k": top_k if do_sample else None,
+            "do_sample": do_sample,
+            "repetition_penalty": repetition_penalty if repetition_penalty != 1.0 else None,
+            "use_cache": use_cache,
+            **kwargs
+        }
+        
+        # Remove None values to use defaults
+        generation_kwargs = {k: v for k, v in generation_kwargs.items() if v is not None}
+        
+        # Set token IDs if provided
+        # IMPORTANT: Set pad_token_id first, then eos_token_id
+        # Make sure pad_token_id is not the same as eos_token_id to avoid generation issues
+        if pad_token_id is not None:
+            generation_kwargs["pad_token_id"] = pad_token_id
+        elif hasattr(self.decoder.config, 'pad_token_id') and self.decoder.config.pad_token_id is not None:
+            generation_kwargs["pad_token_id"] = self.decoder.config.pad_token_id
+            
+        if eos_token_id is not None:
+            generation_kwargs["eos_token_id"] = eos_token_id
+            # Also update the decoder's generation_config to ensure consistency
+            if hasattr(self.decoder, 'generation_config'):
+                self.decoder.generation_config.eos_token_id = eos_token_id
+        elif hasattr(self.decoder.config, 'eos_token_id') and self.decoder.config.eos_token_id is not None:
+            generation_kwargs["eos_token_id"] = self.decoder.config.eos_token_id
+            # Also update the decoder's generation_config
+            if hasattr(self.decoder, 'generation_config'):
+                self.decoder.generation_config.eos_token_id = self.decoder.config.eos_token_id
+        
+        # Ensure pad_token_id is not the same as eos_token_id
+        if generation_kwargs.get("pad_token_id") == generation_kwargs.get("eos_token_id"):
+            # If they're the same, use a different pad token (e.g., unk_token_id or 0)
+            if hasattr(self.decoder.config, 'unk_token_id') and self.decoder.config.unk_token_id is not None:
+                generation_kwargs["pad_token_id"] = self.decoder.config.unk_token_id
+            else:
+                generation_kwargs["pad_token_id"] = 0  # Use 0 as fallback pad token
+        
+        # Call HuggingFace's generate method via the decoder (which inherits from GenerationMixin)
+        # This provides optimized generation with caching, beam search, and more
+        with torch.no_grad():
+            generated_ids = self.decoder.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                return_dict_in_generate=False,
+                output_scores=False,
+                **generation_kwargs
+            )
+        
+        return generated_ids
+    
+    def generate_custom(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        max_new_tokens: int = 50,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: int = 50,
+        do_sample: bool = True,
+        pad_token_id: Optional[int] = None,
+        eos_token_id: Optional[int] = None,
+        repetition_penalty: float = 1.0,
+        use_cache: bool = True,
+        **kwargs
+    ):
+        """
+        Custom generate function (non-HuggingFace) for comparison.
+        
+        This is a manual implementation of autoregressive generation with KV caching.
+        It provides the same functionality as HuggingFace's generate() but with full
+        control over the generation loop.
+        
+        Args:
+            input_ids: Input token IDs of shape (batch_size, seq_len)
+            attention_mask: Attention mask of shape (batch_size, seq_len)
+            max_new_tokens: Maximum number of new tokens to generate
+            temperature: Sampling temperature (1.0 = no change, <1.0 = more focused, >1.0 = more random)
+            top_p: Nucleus sampling parameter (0.0 to 1.0)
+            top_k: Top-k sampling parameter
+            do_sample: Whether to use sampling (True) or greedy decoding (False)
+            pad_token_id: Token ID for padding (not used in custom generation, but kept for API compatibility)
+            eos_token_id: Token ID for end of sequence
+            repetition_penalty: Penalty for repetition (1.0 = no penalty, >1.0 = penalty)
+            use_cache: Whether to use KV cache for efficiency
+            **kwargs: Additional arguments (ignored for compatibility)
+            
+        Returns:
+            Generated token IDs of shape (batch_size, original_seq_len + new_tokens)
+        """
+        self.eval()
+        device = input_ids.device
+        B = input_ids.size(0)
+        
+        # Prepare attention mask if not provided
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=device)
+        
+        # Prime the cache by running the full prompt once
+        with torch.no_grad():
+            logits, past_key_values = self.decoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=None,
+                use_cache=use_cache,
+                is_causal=True,
+            )
+        
+        # Start with the input_ids
+        generated = [input_ids]  # list of tensors to cat at the end
+        cur_token = input_ids[:, -1:]  # last token of prompt
+        
+        # Track generated tokens for repetition penalty
+        generated_tokens = input_ids.tolist() if repetition_penalty != 1.0 else None
+        
+        # Helper: sample one step with repetition penalty
+        def sample_from_logits(step_logits, prev_tokens=None):
+            # Apply repetition penalty if enabled
+            if repetition_penalty != 1.0 and prev_tokens is not None:
+                # Penalize tokens that have been generated before
+                for token_id in prev_tokens:
+                    if step_logits[0, token_id] > 0:
+                        step_logits[0, token_id] /= repetition_penalty
+                    else:
+                        step_logits[0, token_id] *= repetition_penalty
+            
+            # Apply temperature
+            if temperature != 1.0:
+                step_logits = step_logits / max(1e-6, temperature)
+            
+            probs = torch.softmax(step_logits, dim=-1)
+            
+            # Apply top-k filtering
+            if top_k is not None and top_k > 0:
+                topk_vals, topk_idx = torch.topk(probs, k=min(top_k, probs.size(-1)), dim=-1)
+                mask = torch.full_like(probs, 0.0)
+                mask.scatter_(dim=-1, index=topk_idx, src=topk_vals)
+                probs = mask / (mask.sum(dim=-1, keepdim=True) + 1e-12)
+            
+            # Apply top-p (nucleus) sampling
+            if top_p is not None and 0 < top_p < 1.0:
+                sorted_probs, sorted_idx = torch.sort(probs, descending=True, dim=-1)
+                cumsum = torch.cumsum(sorted_probs, dim=-1)
+                cutoff = (cumsum > top_p).float()
+                # Keep at least 1 token
+                cutoff[..., 0] = 0.0
+                sorted_probs = sorted_probs * (1.0 - cutoff)
+                sorted_probs = sorted_probs / (sorted_probs.sum(dim=-1, keepdim=True) + 1e-12)
+                # Map back
+                probs = torch.zeros_like(probs).scatter(-1, sorted_idx, sorted_probs)
+            
+            if do_sample:
+                return torch.multinomial(probs, num_samples=1)
+            else:
+                return torch.argmax(probs, dim=-1, keepdim=True)
+        
+        # Generate new tokens
+        with torch.no_grad():
+            for step in range(max_new_tokens):
+                # Only feed the last generated token this step
+                step_input = cur_token  # (B, 1)
+                step_mask = torch.ones((B, 1), dtype=torch.long, device=device)
+                
+                # Forward pass with cached key-values
+                step_logits, past_key_values = self.decoder(
+                    input_ids=step_input,
+                    attention_mask=step_mask,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    is_causal=True,
+                )
+                
+                # Get logits for the last position
+                step_logits = step_logits[:, -1, :]  # (B, V)
+                
+                # Sample next token
+                prev_tokens = generated_tokens[0] if generated_tokens is not None else None
+                next_token = sample_from_logits(step_logits, prev_tokens)
+                
+                # Append to generated sequence
+                generated.append(next_token)
+                cur_token = next_token
+                
+                # Update generated tokens for repetition penalty
+                if generated_tokens is not None:
+                    generated_tokens[0].append(next_token[0, 0].item())
+                
+                # Check for EOS token
+                if eos_token_id is not None:
+                    if torch.all(next_token.squeeze(-1) == eos_token_id):
+                        break
+        
+        # Concatenate all generated tokens
+        return torch.cat(generated, dim=1)  # (B, original_seq_len + new_tokens)
     
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory efficiency."""
@@ -231,7 +460,7 @@ def create_optimized_model(model_type: str, config: Dict[str, Any], **kwargs) ->
         nn.Module: Optimized model instance
     """
     if model_type == 'decoder_only':
-        tie_weights = kwargs.get('tie_weights', True)
+        tie_weights = kwargs.get('tie_weights', False)
         return DecoderOnlyModel(config['decoder_config'], config['vocab_size'], tie_weights=tie_weights)
     elif model_type == 'embedder_only':
         pool_type = config.get('pool_type', 'mean')

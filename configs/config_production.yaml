@@ -396,9 +396,9 @@ training_stages:
       training_backend: "lightning"  # Options: "lightning" (PyTorch Lightning) or "megatron" (NeMo Megatron)
       
       # Training duration - optimized for instruction tuning
-      epochs: 3                     # Multiple epochs for instruction tuning
-      batch_size: 16                # Batch size for instruction SFT
-      sequence_length: 2048         # Sequence length for instruction tuning
+      epochs: 1                     # Multiple epochs for instruction tuning
+      batch_size: 20                # Batch size for instruction SFT
+      sequence_length: 1024         # Sequence length for instruction tuning
       learning_rate: 1e-5           # Lower learning rate for fine-tuning
       max_grad_norm: 0.8            # Gradient clipping
       gradient_accumulation_steps: 2 # Gradient accumulation steps
@@ -420,7 +420,7 @@ training_stages:
         
       # Training monitoring and control
       log_every_n_steps: 100        # Log every 100 steps
-      val_check_interval_steps: 1000   # Validate every 1000 steps
+      val_check_interval_steps: 10000   # Validate every 10000 steps
       
       # Early stopping
       patience: 5                    # Early stopping patience
@@ -467,14 +467,14 @@ training_stages:
     data:
       # Processing configuration for instruction tuning datasets
       processing:
-        max_tokens_per_sample: 2048            # Maximum tokens per instruction (shorter for instruction tuning)
+        max_tokens_per_sample: 16384            # Maximum tokens per instruction (shorter for instruction tuning)
         min_tokens_per_sample: 50              # Minimum tokens per training sample
-        overlap_tokens: 0                      # No overlap for instruction tuning
+        overlap_tokens: 200                    # No overlap for instruction tuning
         shuffle_datasets: true                 # Shuffle datasets before mixing
         seed: 42                               # Random seed for reproducibility
-        total_samples: 100000                  # Total samples for instruction tuning (smaller than pretraining)
-        use_processed_datasets: false          # Use HuggingFace datasets directly for instruction tuning
-        save_processed_datasets: false         # Don't save processed datasets for instruction tuning
+        total_samples: 20000000                  # Total samples for instruction tuning (smaller than pretraining)
+        use_processed_datasets: true          # Use HuggingFace datasets directly for instruction tuning
+        save_processed_datasets: true         # Don't save processed datasets for instruction tuning
         test_size_samples: false               # If true, use only 4096 samples for testing
       
       # Output configuration for ds_processing pipeline
@@ -520,13 +520,13 @@ training_stages:
         # Total: 100.0% (ensures proper allocation)
       
       # Data loading performance options (optimized for GH200 with 72 CPU cores)
-      num_workers: 8                # Reduced from 16 to minimize overhead and contention
+      num_workers: 64                # Reduced from 16 to minimize overhead and contention
       pin_memory: true              # Pin memory for faster GPU transfer
       persistent_workers: true      # Keep workers alive between epochs
       prefetch_factor: 2            # Reduced from 4 to minimize memory overhead
 
     checkpoint_dir: "/home/sureshm/nemoACCfiy/outputs/checkpoints/stage1_inst_SFT"
-    model_output_dir: "/home/sureshm/nemoACCfiy/outputs/models"
+    model_output_dir: "/home/sureshm/nemoACCfiy/outputs/models_inst_SFT"
     model_output_name: "stage1_inst_SFT_model.pth"
 
     wandb:
@@ -544,7 +544,7 @@ training_stages:
       enable_profiling: true
       profiler_log_dir: "./profiler_logs/stage1_inst_SFT"
       save_steps: 1000
-      validation_steps: 500
+      validation_steps: 10000
     
     # Environment and reproducibility
     environment:

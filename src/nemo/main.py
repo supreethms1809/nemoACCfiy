@@ -40,7 +40,7 @@ def create_model(
     max_position_embeddings: int = 512,
     num_reasoning_vectors: int = 8,
     pool_type: str = "mean",
-    tie_weights: bool = True,
+    tie_weights: bool = False,
     freeze_embedder_decoder: bool = True,
     embedder_checkpoint_path: Optional[str] = None,
     attention_type: str = "gqa",
@@ -92,7 +92,7 @@ def train_model(
     max_position_embeddings: int = 512,
     num_reasoning_vectors: int = 8,
     pool_type: str = "mean",
-    tie_weights: bool = True,
+    tie_weights: bool = False,
     freeze_embedder_decoder: bool = True,
     embedder_checkpoint_path: Optional[str] = None,
     attention_type: str = "gqa",
@@ -239,7 +239,7 @@ Examples:
     create_parser.add_argument('--max_position_embeddings', type=int, default=512)
     create_parser.add_argument('--num_reasoning_vectors', type=int, default=8)
     create_parser.add_argument('--pool_type', type=str, default='mean')
-    create_parser.add_argument('--tie_weights', action='store_true', default=True)
+    create_parser.add_argument('--tie_weights', action='store_true', default=False)
     create_parser.add_argument('--freeze_embedder_decoder', action='store_true', default=True)
     create_parser.add_argument('--embedder_checkpoint_path', type=str, default=None)
     create_parser.add_argument('--attention_type', type=str, default='gqa', choices=['gqa', 'vanilla'])
@@ -269,7 +269,7 @@ Examples:
     train_parser.add_argument('--max_position_embeddings', type=int, default=512)
     train_parser.add_argument('--num_reasoning_vectors', type=int, default=8)
     train_parser.add_argument('--pool_type', type=str, default='mean')
-    train_parser.add_argument('--tie_weights', action='store_true', default=True)
+    train_parser.add_argument('--tie_weights', action='store_true', default=False)
     train_parser.add_argument('--freeze_embedder_decoder', action='store_true', default=True)
     train_parser.add_argument('--embedder_checkpoint_path', type=str, default=None)
     train_parser.add_argument('--attention_type', type=str, default='gqa', choices=['gqa', 'vanilla'])

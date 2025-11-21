@@ -106,7 +106,7 @@ class MegatronConfigLoader:
             "max_position_embeddings": model_config.get("max_position_embeddings", 512),
             "num_reasoning_vectors": model_config.get("num_reasoning_vectors", 8),
             "pool_type": model_config.get("pool_type", "mean"),
-            "tie_weights": model_config.get("tie_weights", True),
+            "tie_weights": model_config.get("tie_weights", False),
             "freeze_embedder_decoder": model_config.get("freeze_embedder_decoder", True),
             "attention_type": model_config.get("attention_type", "gqa"),
             "mlp_type": model_config.get("mlp_type", "gated"),

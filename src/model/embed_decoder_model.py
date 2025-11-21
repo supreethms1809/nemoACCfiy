@@ -1,9 +1,16 @@
 import math
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple, List
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.generation.utils import GenerationMixin
+from transformers.modeling_outputs import CausalLMOutputWithPast
+try:
+    from transformers import GenerationConfig
+except ImportError:
+    # Fallback for older transformers versions
+    GenerationConfig = None
 
 # Import Flash Attention support
 try:
@@ -643,16 +650,97 @@ class Decoder(nn.Module):
         else:
             return output
 
-class LMHeadDecoder(nn.Module):
-    """A simple token-embedding + Decoder + LM head wrapper with weight tying."""
-    def __init__(self, config, vocab_size: int, tie_weights: bool = True):
-        super().__init__()
+class LMHeadDecoder(GenerationMixin, nn.Module):
+    """A simple token-embedding + Decoder + LM head wrapper with weight tying.
+    
+    Now uses HuggingFace's GenerationMixin for generation capabilities.
+    """
+    def __init__(self, config, vocab_size: int, tie_weights: bool = False):
+        # Initialize nn.Module first, then GenerationMixin
+        nn.Module.__init__(self)
+        GenerationMixin.__init__(self)
+        
         self.config = config
         self.vocab_size = vocab_size
         self.embed_tokens = nn.Embedding(vocab_size, config.hidden_size)
         self.decoder = Decoder(config)
         self.lm_head = nn.Linear(config.hidden_size, vocab_size, bias=False)
         self.gradient_checkpointing = False
+        
+        # Set main_input_name for HuggingFace generation compatibility
+        # This tells HuggingFace which input parameter name to use
+        self.main_input_name = "input_ids"
+        
+        # Set cache support attributes for HuggingFace generation compatibility
+        # This indicates that the model supports the new cache class system
+        self._supports_cache_class = True
+        
+        # Set model config attributes needed for HuggingFace generation
+        if not hasattr(config, 'vocab_size'):
+            config.vocab_size = vocab_size
+        if not hasattr(config, 'pad_token_id'):
+            config.pad_token_id = getattr(config, 'pad_token_id', None)
+        if not hasattr(config, 'eos_token_id'):
+            config.eos_token_id = getattr(config, 'eos_token_id', None)
+        if not hasattr(config, 'bos_token_id'):
+            config.bos_token_id = getattr(config, 'bos_token_id', None)
+        
+        # Add attributes required by HuggingFace's generation code
+        # These are checked by _validate_model_kwargs and other generation methods
+        if not hasattr(config, 'is_encoder_decoder'):
+            config.is_encoder_decoder = False  # We're using decoder-only model
+        if not hasattr(config, 'model_type'):
+            config.model_type = 'causal-lm'  # Causal language model
+        if not hasattr(config, 'use_cache'):
+            config.use_cache = getattr(config, 'use_cache', True)
+        if not hasattr(config, 'tie_word_embeddings'):
+            config.tie_word_embeddings = tie_weights  # Use the tie_weights parameter
+        if not hasattr(config, 'num_hidden_layers'):
+            # Try to get from config.num_layers (fallback if num_hidden_layers not set)
+            config.num_hidden_layers = getattr(config, 'num_layers', None)
+        
+        # Add method required by HuggingFace's generation code
+        # This method returns non-default generation parameters from the config
+        if not hasattr(config, '_get_non_default_generation_parameters'):
+            def _get_non_default_generation_parameters():
+                """Return non-default generation parameters from config."""
+                # Return empty list - we'll use generation_config for actual parameters
+                return []
+            config._get_non_default_generation_parameters = _get_non_default_generation_parameters
+        
+        # Add get_text_config() method for compatibility with some HuggingFace generation code
+        # For decoder-only models, this should return self (the config itself)
+        if not hasattr(config, 'get_text_config'):
+            def get_text_config():
+                """Return the text config (for decoder-only, this is just the config itself)."""
+                return config
+            config.get_text_config = get_text_config
+        
+        # Add generation_config for HuggingFace GenerationMixin compatibility
+        # This is required by HuggingFace's generate() method
+        if GenerationConfig is not None:
+            # Create GenerationConfig with default values
+            # The _from_model_config attribute tells HuggingFace to use model config values
+            self.generation_config = GenerationConfig()
+            # Set token IDs from config if available
+            if hasattr(config, 'pad_token_id') and config.pad_token_id is not None:
+                self.generation_config.pad_token_id = config.pad_token_id
+            if hasattr(config, 'eos_token_id') and config.eos_token_id is not None:
+                self.generation_config.eos_token_id = config.eos_token_id
+            if hasattr(config, 'bos_token_id') and config.bos_token_id is not None:
+                self.generation_config.bos_token_id = config.bos_token_id
+            # Mark that config should be read from model config
+            self.generation_config._from_model_config = True
+            # Set _original_object_hash for HuggingFace compatibility
+            # This tracks if the generation config has been modified
+            if not hasattr(self.generation_config, '_original_object_hash'):
+                self.generation_config._original_object_hash = hash(self.generation_config)
+        else:
+            # Fallback: create a simple object with the required attributes
+            from types import SimpleNamespace
+            self.generation_config = SimpleNamespace()
+            self.generation_config._from_model_config = True
+            self.generation_config._original_object_hash = None
         
         # Initialize weights properly
         self._init_weights_manually()
@@ -734,7 +822,21 @@ class LMHeadDecoder(nn.Module):
         use_cache: bool = False,
         return_hidden_states: bool = False,
         is_causal: bool = True,
+        position_ids: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.Tensor] = None,  # Added for HuggingFace compatibility
+        **kwargs  # Accept any additional arguments from HuggingFace generation
     ):
+        """
+        Forward pass compatible with both custom usage and HuggingFace generation.
+        
+        When return_dict=True (used by HuggingFace generation), returns CausalLMOutputWithPast.
+        Otherwise, returns logits (and optionally past_key_values) for backward compatibility.
+        """
+        return_dict = return_dict if return_dict is not None else False
+        
         hidden = self.embed_tokens(input_ids)
         
         # Use gradient checkpointing if enabled and not using cache
@@ -756,9 +858,51 @@ class LMHeadDecoder(nn.Module):
                 use_reentrant=False
             )
             logits = self.lm_head(hidden)
+            if return_dict:
+                return CausalLMOutputWithPast(
+                    logits=logits,
+                    past_key_values=None,
+                )
             return logits
         
         # Original forward pass
+        # During generation, HuggingFace will call with use_cache=True and return_dict=True
+        # Convert HuggingFace Cache object to tuple format if needed
+        if past_key_values is not None:
+            # Check if it's a HuggingFace Cache object (new cache class system)
+            # Cache objects have a specific structure and can be checked by their type name
+            cache_type_name = type(past_key_values).__name__
+            if 'Cache' in cache_type_name:
+                # It's a HuggingFace Cache object - convert to tuple format
+                # Check if cache is empty (0 layers)
+                if len(past_key_values) == 0:
+                    # Empty cache - pass None (first generation step)
+                    past_key_values = None
+                else:
+                    # Cache has data - convert to tuple format
+                    num_layers = len(self.decoder.layers)
+                    converted_cache = []
+                    for i in range(num_layers):
+                        try:
+                            # Cache object stores key-value pairs per layer
+                            # Access as cache[layer_idx] which returns (key, value) tuple
+                            layer_cache = past_key_values[i]
+                            if isinstance(layer_cache, tuple) and len(layer_cache) == 2:
+                                # Cache format: (key, value) for self-attention
+                                # Our decoder expects: ((self_key, self_value), (cross_key, cross_value))
+                                self_cache = layer_cache
+                                cross_cache = None  # Cross-attention cache not provided by HuggingFace
+                                converted_cache.append((self_cache, cross_cache))
+                            else:
+                                converted_cache.append((None, None))
+                        except (KeyError, IndexError):
+                            # Layer not in cache yet
+                            converted_cache.append((None, None))
+                    past_key_values = tuple(converted_cache) if converted_cache else None
+            elif not isinstance(past_key_values, (tuple, list, type(None))):
+                # Unknown format - try to convert or set to None
+                past_key_values = None
+        
         if use_cache:
             hidden, new_past = self.decoder(
                 hidden_states=hidden,
@@ -781,6 +925,13 @@ class LMHeadDecoder(nn.Module):
             )
             new_past = None
         logits = self.lm_head(hidden)
+        
+        if return_dict:
+            return CausalLMOutputWithPast(
+                logits=logits,
+                past_key_values=new_past,
+            )
+        
         if return_hidden_states:
             if use_cache:
                 return logits, hidden, new_past
@@ -789,138 +940,92 @@ class LMHeadDecoder(nn.Module):
         if use_cache:
             return logits, new_past
         return logits
-
-    def generate(
+    
+    def prepare_inputs_for_generation(
         self,
         input_ids: torch.Tensor,
+        past_key_values: Optional[tuple] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        max_new_tokens: int = 50,
-        temperature: float = 1.0,
-        top_p: float = 1.0,
-        top_k: int = 50,
-        do_sample: bool = True,
-        pad_token_id: Optional[int] = None,
-        eos_token_id: Optional[int] = None,
-        repetition_penalty: float = 1.0,
-        length_penalty: float = 1.0,
-        early_stopping: bool = False,
-        use_cache: bool = True,
-    ):
+        use_cache: Optional[bool] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
         """
-        Generate text using the decoder-only model.
+        Prepare inputs for generation. Required by HuggingFace GenerationMixin.
         
-        Args:
-            input_ids: Input token IDs of shape (batch_size, seq_len)
-            attention_mask: Attention mask of shape (batch_size, seq_len)
-            max_new_tokens: Maximum number of new tokens to generate
-            temperature: Sampling temperature (1.0 = no change, <1.0 = more focused, >1.0 = more random)
-            top_p: Nucleus sampling parameter (0.0 to 1.0)
-            top_k: Top-k sampling parameter
-            do_sample: Whether to use sampling (True) or greedy decoding (False)
-            pad_token_id: Token ID for padding
-            eos_token_id: Token ID for end of sequence
-            repetition_penalty: Penalty for repetition (1.0 = no penalty, >1.0 = penalty)
-            length_penalty: Length penalty for beam search
-            early_stopping: Whether to stop early when EOS is generated
-            use_cache: Whether to use KV cache for efficiency
-            
-        Returns:
-            Generated token IDs of shape (batch_size, original_seq_len + new_tokens)
+        When past_key_values is provided (during generation with caching), we only need
+        to process the last token since previous tokens are cached.
         """
-        self.eval()
-        batch_size, seq_len = input_ids.shape
-        device = input_ids.device
+        # If past_key_values is used, we only need the last token
+        if past_key_values is not None:
+            input_ids = input_ids[:, -1:]
         
-        # Initialize generation
-        generated_ids = input_ids.clone()
-        past_key_values = None
+        # Prepare attention mask - during generation with cache, we only need mask for the new token
+        # HuggingFace's generation utilities handle this automatically, but we ensure compatibility
+        if attention_mask is not None and past_key_values is not None:
+            # When using cache, attention mask should be for the new token only
+            # HuggingFace will handle this, but we ensure it's correct
+            if attention_mask.shape[1] > 1:
+                # Keep only the last position if we have past_key_values
+                attention_mask = attention_mask[:, -1:]
         
-        # Create attention mask if not provided
-        if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        # Set use_cache to True by default during generation
+        if use_cache is None:
+            use_cache = True
         
-        # Generation loop
-        for _ in range(max_new_tokens):
-            # Get logits for the last token
-            with torch.no_grad():
-                if use_cache and past_key_values is not None:
-                    # Use cache for efficiency - only process the last token
-                    last_token_ids = generated_ids[:, -1:]
-                    last_attention_mask = torch.ones_like(last_token_ids, dtype=torch.bool)
-                    
-                    logits, past_key_values = self.forward(
-                        input_ids=last_token_ids,
-                        attention_mask=last_attention_mask,
-                        past_key_values=past_key_values,
-                        use_cache=True,
-                        is_causal=True,
-                    )
-                else:
-                    # Process the entire sequence
-                    logits, past_key_values = self.forward(
-                        input_ids=generated_ids,
-                        attention_mask=attention_mask,
-                        past_key_values=past_key_values,
-                        use_cache=True,
-                        is_causal=True,
-                    )
-                
-                # Get logits for the last position
-                next_token_logits = logits[:, -1, :]  # (batch_size, vocab_size)
-                
-                # Apply repetition penalty
-                if repetition_penalty != 1.0:
-                    for batch_idx in range(batch_size):
-                        for token_id in generated_ids[batch_idx]:
-                            if next_token_logits[batch_idx, token_id] < 0:
-                                next_token_logits[batch_idx, token_id] *= repetition_penalty
-                            else:
-                                next_token_logits[batch_idx, token_id] /= repetition_penalty
-                
-                # Apply temperature
-                if temperature != 1.0:
-                    next_token_logits = next_token_logits / temperature
-                
-                # Apply top-k filtering
-                if top_k > 0:
-                    top_k = min(top_k, next_token_logits.size(-1))
-                    top_k_logits, top_k_indices = torch.topk(next_token_logits, top_k)
-                    next_token_logits = torch.full_like(next_token_logits, float('-inf'))
-                    next_token_logits.scatter_(-1, top_k_indices, top_k_logits)
-                
-                # Apply top-p (nucleus) filtering
-                if top_p < 1.0:
-                    sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-                    cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-                    
-                    # Remove tokens with cumulative probability above the threshold
-                    sorted_indices_to_remove = cumulative_probs > top_p
-                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                    sorted_indices_to_remove[..., 0] = 0
-                    
-                    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                    next_token_logits[indices_to_remove] = float('-inf')
-                
-                # Sample or select the next token
-                if do_sample:
-                    probs = torch.softmax(next_token_logits, dim=-1)
-                    next_token = torch.multinomial(probs, num_samples=1)
-                else:
-                    next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-                
-                # Append the new token
-                generated_ids = torch.cat([generated_ids, next_token], dim=-1)
-                
-                # Update attention mask
-                new_attention_mask = torch.ones((batch_size, 1), dtype=torch.bool, device=device)
-                attention_mask = torch.cat([attention_mask, new_attention_mask], dim=-1)
-                
-                # Check for early stopping
-                if early_stopping and eos_token_id is not None:
-                    if (next_token == eos_token_id).all():
-                        break
+        # Don't include return_dict here - HuggingFace will add it automatically
+        # Including it causes "got multiple values for keyword argument 'return_dict'" error
+        return {
+            "input_ids": input_ids,
+            "past_key_values": past_key_values,
+            "attention_mask": attention_mask,
+            "use_cache": use_cache,
+            **kwargs
+        }
+    
+    def _reorder_cache(self, past_key_values: Tuple[Tuple[torch.Tensor]], beam_idx: torch.Tensor) -> Tuple[Tuple[torch.Tensor]]:
+        """
+        Reorder past_key_values for beam search. Required by HuggingFace GenerationMixin.
+        """
+        return tuple(
+            tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past)
+            for layer_past in past_key_values
+        )
+    
+    def get_input_embeddings(self):
+        """Return input embeddings. Required by some HuggingFace utilities."""
+        return self.embed_tokens
+    
+    def set_input_embeddings(self, value):
+        """Set input embeddings. Required by some HuggingFace utilities."""
+        self.embed_tokens = value
+    
+    def get_output_embeddings(self):
+        """Return output embeddings (LM head). Required by some HuggingFace utilities."""
+        return self.lm_head
+    
+    def set_output_embeddings(self, value):
+        """Set output embeddings (LM head). Required by some HuggingFace utilities."""
+        self.lm_head = value
+    
+    @property
+    def device(self):
+        """Return the device of the model parameters. Required by HuggingFace generation code."""
+        # Get device from the first parameter (embed_tokens)
+        return next(self.parameters()).device
+
+    def generate(self, *args, **kwargs):
+        """
+        Generate method inherited from HuggingFace's GenerationMixin.
         
-        return generated_ids
+        This is a thin wrapper that delegates to HuggingFace's optimized generation.
+        For decoder-only models, use DecoderOnlyModel.generate() in optimized_models.py
+        which provides a more convenient interface.
+        
+        For full ModularModel, a separate generate() method will be implemented
+        in optimized_models.py that handles the embedder-decoder interaction.
+        """
+        # Directly call HuggingFace's generate (from GenerationMixin)
+        return super().generate(*args, **kwargs)
 
 class LatentAttentionPooling(nn.Module):
     def __init__(self, hidden_size):
@@ -1018,7 +1123,7 @@ class Embedder(nn.Module):
     Instead of returning token-level vectors, it extracts N meaningful reasoning components
     from the structured planning tree text.
     """
-    def __init__(self, decoder_config, vocab_size, pool_type='learned_query', tie_weights=True, num_reasoning_vectors=8):
+    def __init__(self, decoder_config, vocab_size, pool_type='learned_query', tie_weights=False, num_reasoning_vectors=8):
         super().__init__()
         self.decoder_model = LMHeadDecoder(decoder_config, vocab_size, tie_weights=tie_weights)
         hidden_size = decoder_config.hidden_size
@@ -1094,7 +1199,7 @@ class ModularModel(nn.Module):
     Combines an Embedder and a Decoder with **always-on cross-attention**.
     The embedder's decoder can be loaded from a checkpoint and frozen.
     """
-    def __init__(self, config, embedder_checkpoint_path=None, freeze_embedder_decoder=True, tie_weights=True, num_reasoning_vectors=8):
+    def __init__(self, config, embedder_checkpoint_path=None, freeze_embedder_decoder=True, tie_weights=False, num_reasoning_vectors=8):
         super().__init__()
         self.embedder = Embedder(
             config['decoder_config'], 
