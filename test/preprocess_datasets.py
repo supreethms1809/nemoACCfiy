@@ -7,6 +7,7 @@ then saves them locally in the data/ directory for fast loading during training.
 
 Usage:
     python test/preprocess_datasets.py --stage stage1 --total_samples 1000000
+    python test/preprocess_datasets.py --stage stage1 --config configs/config_production.yaml --total_samples 1000000
 """
 
 import os
@@ -38,7 +39,7 @@ except ImportError as e:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def preprocess_datasets(stage: str = "stage1", total_samples: int = 1000000, config_path: str = "configs/config.yaml"):
+def preprocess_datasets(stage: str = "stage1", total_samples: int = 1000000, config_path: str = "configs/config_production.yaml"):
     """
     Preprocess datasets for the specified stage and save them locally.
     
@@ -204,8 +205,8 @@ def main():
     parser.add_argument("--total_samples", type=int, default=10000000,
                        help="Total number of samples to process")
     
-    parser.add_argument("--config", type=str, default="configs/config.yaml",
-                       help="Path to config.yaml file")
+    parser.add_argument("--config", type=str, default="configs/config_production.yaml",
+                       help="Path to config.yaml file (default: configs/config_production.yaml)")
     
     parser.add_argument("--load_only", action="store_true",
                        help="Only load and display preprocessed dataset info")

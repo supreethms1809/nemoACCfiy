@@ -2133,33 +2133,54 @@ def load_instruction_datasets_with_percentages(
                 
                 # Handle different dataset formats
                 if "messages" in item:
-                    # Messages format (tulu-v2-sft-mixture, OpenHermes-2.5-H4, etc.)
-                    # Extract user and assistant messages from conversation
+                    # Messages format (tulu-v2-sft-mixture, OpenHermes-2.5-H4, hamishivi datasets, etc.)
+                    # Extract system, user, and assistant messages from conversation
                     messages = item["messages"]
                     if not isinstance(messages, list) or len(messages) < 2:
                         continue
                     
-                    # Find user and assistant messages
+                    # Extract system, user, and assistant messages properly
+                    system_content = None
                     user_content = None
                     assistant_content = None
+                    messages_list = []
                     
                     for msg in messages:
                         if isinstance(msg, dict):
                             role = msg.get("role", "").lower()
                             content = msg.get("content", "")
-                            if role == "user" and user_content is None:
+                            
+                            # Normalize role names
+                            if role == "system":
+                                system_content = content
+                                messages_list.append({"role": "system", "content": content})
+                            elif role == "user":
                                 user_content = content
-                            elif role in ["assistant", "gpt"] and assistant_content is None:
+                                messages_list.append({"role": "user", "content": content})
+                            elif role in ["assistant", "gpt", "model"]:
                                 assistant_content = content
+                                messages_list.append({"role": "assistant", "content": content})
                     
-                    if user_content and assistant_content:
+                    # For datasets with messages format, preserve the full messages structure
+                    if messages_list and assistant_content:
+                        # If we have a user message (or can infer from messages), create sample
+                        if not user_content:
+                            # Try to find user message in messages_list
+                            for msg in messages_list:
+                                if msg.get("role") == "user":
+                                    user_content = msg.get("content", "")
+                                    break
+                        
+                        # Create sample with messages format for proper chat formatting
                         sample = {
-                            "question": str(user_content),
+                            "messages": messages_list,  # Preserve full messages structure
+                            "system": str(system_content) if system_content else None,
+                            "question": str(user_content) if user_content else "",
                             "answer": str(assistant_content),
                             "dataset": dataset_name
                         }
                     else:
-                        # Skip if we can't extract user/assistant pair
+                        # Fallback: Skip if we can't extract proper structure
                         continue
                         
                 elif "problem" in item and "expected_answer" in item:
@@ -2695,6 +2716,58 @@ def train_production_mode(
         # - During inference, <|response|> should be provided in the prompt
         # - This is consistent with standard instruction tuning practices
         
+        # Helper function to format messages with chat template or fallback
+        def format_messages_with_chat_template(messages, question, answer, system=None, tokenizer=None):
+            """
+            Format messages using tokenizer's chat template if available, otherwise use fallback format.
+            
+            Args:
+                messages: List of message dicts with 'role' and 'content' keys
+                question: User question (fallback)
+                answer: Assistant answer (fallback)
+                system: System prompt (optional)
+                tokenizer: Tokenizer instance (optional, for chat template)
+            
+            Returns:
+                Formatted text string
+            """
+            # Try to use tokenizer's chat template if available
+            if tokenizer and hasattr(tokenizer, 'apply_chat_template') and messages:
+                try:
+                    # Use tokenizer's chat template (handles system/user/assistant properly)
+                    formatted = tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=False  # Don't add assistant prompt, we have the full conversation
+                    )
+                    return formatted
+                except Exception as e:
+                    logging.debug(f"Failed to use chat template: {e}, using fallback format")
+                    # Fall through to fallback
+            
+            # Fallback format: <|instruction|> {system} {question} <|response|> {answer} <|end|>
+            instruction_token = "<|instruction|>"
+            response_token = "<|response|>"
+            end_token = "<|end|>"
+            
+            parts = [instruction_token]
+            
+            # Add system prompt if available
+            if system:
+                parts.append(str(system).strip())
+            
+            # Add user question
+            if question:
+                parts.append(str(question).strip())
+            
+            # Add response token and answer
+            parts.append(response_token)
+            if answer:
+                parts.append(str(answer).strip())
+            parts.append(end_token)
+            
+            return " ".join(parts)
+        
         # Define tokenization function for instruction format
         def tokenize_instruction_function(examples):
             """Tokenize instruction examples with proper masking for instruction SFT.
@@ -2704,7 +2777,8 @@ def train_production_mode(
             - Truncates from question side if needed
             - Only truncates answer as last resort
             """
-            batch_size = len(examples['question'])
+            # Handle both messages format and question/answer format
+            batch_size = len(examples.get('question', examples.get('messages', [])))
             input_ids_list = []
             attention_mask_list = []
             labels_list = []
@@ -2719,79 +2793,112 @@ def train_production_mode(
             }
             
             for i in range(batch_size):
-                question = str(examples['question'][i]) if examples['question'][i] else ""
-                answer = str(examples['answer'][i]) if examples['answer'][i] else ""
-                
-                # Format: <|instruction|> {question} <|response|> {answer} <|end|>
-                # SMART TRUNCATION: Prioritize keeping the answer (what we're training on)
-                # If sequence is too long, truncate from the question side, not the answer side
-                
-                # First, tokenize components separately to understand their lengths
-                instruction_token_ids = tokenizer.encode(instruction_token, add_special_tokens=False)
-                response_token_ids = tokenizer.encode(response_token, add_special_tokens=False)
-                end_token_ids = tokenizer.encode(end_token, add_special_tokens=False)
-                
-                # Tokenize answer part (this is critical - we need to keep this)
-                answer_text = f"{response_token} {answer} {end_token}"
-                answer_ids = tokenizer.encode(answer_text, add_special_tokens=False)
-                
-                # Calculate available space for question
-                # Reserve space for: instruction_token + question + answer_part
-                reserved_space = len(instruction_token_ids) + len(answer_ids)
-                max_question_length = max(0, seq_length - reserved_space - 10)  # Extra 10 tokens buffer
-                
-                # Tokenize question with truncation if needed
-                if max_question_length > 0:
-                    question_ids = tokenizer.encode(
-                        question,
-                        add_special_tokens=False,
-                        truncation=True,
-                        max_length=max_question_length
-                    )
+                # Extract data - support both messages format and question/answer format
+                messages = examples.get('messages', [None] * batch_size)[i] if 'messages' in examples else None
+                question = str(examples.get('question', [''] * batch_size)[i]) if examples.get('question', [''] * batch_size)[i] else ""
+                answer = str(examples.get('answer', [''] * batch_size)[i]) if examples.get('answer', [''] * batch_size)[i] else ""
+                system = examples.get('system', [None] * batch_size)[i] if 'system' in examples else None
+                if system:
+                    system = str(system)
                 else:
-                    # If answer itself is too long, we'll truncate it (last resort)
-                    question_ids = []
-                    # Truncate answer to fit
-                    max_answer_length = seq_length - len(instruction_token_ids) - len(response_token_ids) - len(end_token_ids) - 10
-                    if max_answer_length > 0:
-                        answer_ids = tokenizer.encode(
-                            answer,
+                    system = None
+                
+                # Use chat template if messages are available, otherwise use fallback format
+                if messages and isinstance(messages, list):
+                    # Use chat template formatting
+                    formatted_text = format_messages_with_chat_template(
+                        messages=messages,
+                        question=question,
+                        answer=answer,
+                        system=system,
+                        tokenizer=tokenizer
+                    )
+                    # For chat template format, tokenize the full text
+                    input_ids = tokenizer.encode(
+                        formatted_text,
+                        add_special_tokens=True,
+                        truncation=True,
+                        max_length=seq_length
+                    )
+                    attention_mask = [1] * len(input_ids)
+                    
+                    # Find where assistant response starts (heuristic for chat templates)
+                    # Use 70% of sequence as conservative estimate
+                    response_start_idx = max(len(input_ids) // 10, int(len(input_ids) * 0.7))
+                else:
+                    # Use fallback format: <|instruction|> {system} {question} <|response|> {answer} <|end|>
+                    # SMART TRUNCATION: Prioritize keeping the answer (what we're training on)
+                    # If sequence is too long, truncate from the question side, not the answer side
+                    
+                    # First, tokenize components separately to understand their lengths
+                    instruction_token_ids = tokenizer.encode(instruction_token, add_special_tokens=False)
+                    response_token_ids = tokenizer.encode(response_token, add_special_tokens=False)
+                    end_token_ids = tokenizer.encode(end_token, add_special_tokens=False)
+                
+                    # Tokenize answer part (this is critical - we need to keep this)
+                    answer_text = f"{response_token} {answer} {end_token}"
+                    answer_ids = tokenizer.encode(answer_text, add_special_tokens=False)
+                    
+                    # Calculate available space for question/system
+                    # Reserve space for: instruction_token + question/system + answer_part
+                    reserved_space = len(instruction_token_ids) + len(answer_ids)
+                    max_question_length = max(0, seq_length - reserved_space - 10)  # Extra 10 tokens buffer
+                    
+                    # Tokenize question/system with truncation if needed
+                    question_system_text = ""
+                    if system:
+                        question_system_text = f"{system} {question}" if question else system
+                    else:
+                        question_system_text = question
+                    
+                    if max_question_length > 0 and question_system_text:
+                        question_ids = tokenizer.encode(
+                            question_system_text,
                             add_special_tokens=False,
                             truncation=True,
-                            max_length=max_answer_length
+                            max_length=max_question_length
                         )
-                        answer_ids = response_token_ids + answer_ids + end_token_ids
                     else:
-                        # Answer is extremely long, use minimal truncation
-                        answer_ids = response_token_ids + tokenizer.encode(
-                            answer,
-                            add_special_tokens=False,
-                            truncation=True,
-                            max_length=seq_length - len(instruction_token_ids) - len(response_token_ids) - len(end_token_ids) - 5
-                        ) + end_token_ids
-                
-                # Combine: instruction_token + question + answer_part
-                input_ids = instruction_token_ids + question_ids + answer_ids
-                
-                # Truncate to max_length if still too long (shouldn't happen, but safety check)
-                if len(input_ids) > seq_length:
-                    # Last resort: truncate from question side
-                    excess = len(input_ids) - seq_length
-                    if excess < len(question_ids):
-                        # Can truncate from question
-                        question_ids = question_ids[excess:]
-                        input_ids = instruction_token_ids + question_ids + answer_ids
-                    else:
-                        # Question is completely truncated, keep only instruction + answer
-                        input_ids = instruction_token_ids + answer_ids[:seq_length - len(instruction_token_ids)]
-                
-                attention_mask = [1] * len(input_ids)
-                
-                # Find where response starts (after response_token)
-                # Since we built input_ids as: instruction_token + question_ids + answer_ids
-                # And answer_ids starts with response_token, we know exactly where it starts
-                # response_start_idx = len(instruction_token_ids) + len(question_ids) + len(response_token_ids)
-                response_start_idx = len(instruction_token_ids) + len(question_ids) + len(response_token_ids)
+                        # If answer itself is too long, we'll truncate it (last resort)
+                        question_ids = []
+                        # Truncate answer to fit
+                        max_answer_length = seq_length - len(instruction_token_ids) - len(response_token_ids) - len(end_token_ids) - 10
+                        if max_answer_length > 0:
+                            answer_ids = tokenizer.encode(
+                                answer,
+                                add_special_tokens=False,
+                                truncation=True,
+                                max_length=max_answer_length
+                            )
+                            answer_ids = response_token_ids + answer_ids + end_token_ids
+                        else:
+                            # Answer is extremely long, use minimal truncation
+                            answer_ids = response_token_ids + tokenizer.encode(
+                                answer,
+                                add_special_tokens=False,
+                                truncation=True,
+                                max_length=seq_length - len(instruction_token_ids) - len(response_token_ids) - len(end_token_ids) - 5
+                            ) + end_token_ids
+                    
+                    # Combine: instruction_token + question_ids + answer_ids
+                    input_ids = instruction_token_ids + question_ids + answer_ids
+                    
+                    # Truncate to max_length if still too long (shouldn't happen, but safety check)
+                    if len(input_ids) > seq_length:
+                        # Last resort: truncate from question side
+                        excess = len(input_ids) - seq_length
+                        if excess < len(question_ids):
+                            # Can truncate from question
+                            question_ids = question_ids[excess:]
+                            input_ids = instruction_token_ids + question_ids + answer_ids
+                        else:
+                            # Question is completely truncated, keep only instruction + answer
+                            input_ids = instruction_token_ids + answer_ids[:seq_length - len(instruction_token_ids)]
+                    
+                    attention_mask = [1] * len(input_ids)
+                    
+                    # Find where response starts (after response_token)
+                    response_start_idx = len(instruction_token_ids) + len(question_ids) + len(response_token_ids)
                 
                 # Verify response_start_idx is correct by checking if response_token is at expected position
                 if response_start_idx <= len(input_ids):

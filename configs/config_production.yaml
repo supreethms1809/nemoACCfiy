@@ -284,46 +284,76 @@ training_stages:
       # Reference: https://huggingface.co/blog/codelion/optimal-dataset-mixing
       # This mix achieves 90%+ performance with 1/10th the data compared to naive approaches
       pretraining_datasets:
-        # ===== OPTIMAL MIX DATASETS (from research) =====
-        # High-quality textbook-style PDFs (50% recommended)
-        "codelion/finepdfs-1B":
-          percentage: 33.0                     # High-quality textbook-style PDFs (primary source for 50% finePDFs target)
-          subset: null                         # Full 1B token dataset
+        # ===== PRIORITY DATASETS (USE ALL SAMPLES FIRST) =====
+        # These 6 datasets are prioritized - they will contribute the majority of samples
+        # All samples from these datasets will be used first before moving to remaining datasets
+        # Percentages are based on actual sample counts (total: 4,639,172 samples)
+        # Allocation scaled to 87% total for priority datasets
         
-        # Filtered, diverse web content (30% recommended)
-        "codelion/dclm-baseline-1B":
-          percentage: 19.0                     # DCLM-baseline: filtered, diverse web content (primary source for 30% DCLM target)
-          subset: null                         # Full 1B token dataset
+        # Essential web content sample (1,833,333 samples - 39.52% of priority datasets)
+        "sumuks/essential-web-v1.0-sample-1B":
+          percentage: 34.38                    # Priority dataset - Essential web content sample
+          subset: null                         # Full 1B token dataset - use all available samples (1,833,333 samples)
+          # Reference: https://huggingface.co/datasets/sumuks/essential-web-v1.0-sample-1B
         
-        # Curated educational web resources (20% recommended)
+        # Curated educational web resources (970,397 samples - 20.92% of priority datasets)
         "codelion/fineweb-edu-1B":
-          percentage: 11.0                     # FineWeb-Edu: curated educational web resources (primary source for 20% FineWeb-Edu target)
-          subset: null                         # Full 1B token dataset
+          percentage: 18.20                    # Priority dataset - FineWeb-Edu: curated educational web resources
+          subset: null                         # Full 1B token dataset - use all available samples (970,397 samples)
+          # Reference: https://huggingface.co/datasets/codelion/fineweb-edu-1B
         
-        # ===== EXISTING DATASETS (kept for diversity and additional coverage) =====
+        # Synthetic educational content (822,230 samples - 17.72% of priority datasets)
+        "codelion/synth-1B":
+          percentage: 15.42                    # Priority dataset - Synthetic content dataset
+          subset: null                         # Full 1B token dataset - use all available samples (822,230 samples)
+          # Reference: https://huggingface.co/datasets/codelion/synth-1B
+        
+        # Filtered, diverse web content (774,229 samples - 16.69% of priority datasets)
+        "codelion/dclm-baseline-1B":
+          percentage: 14.52                    # Priority dataset - DCLM-baseline: filtered, diverse web content
+          subset: null                         # Full 1B token dataset - use all available samples (774,229 samples)
+          # Reference: https://huggingface.co/datasets/codelion/dclm-baseline-1B
+        
+        # High-quality textbook-style PDFs (186,262 samples - 4.01% of priority datasets)
+        "codelion/finepdfs-1B":
+          percentage: 3.49                     # Priority dataset - High-quality textbook-style PDFs
+          subset: null                         # Full 1B token dataset - use all available samples (186,262 samples)
+          # Reference: https://huggingface.co/datasets/codelion/finepdfs-1B
+        
+        # High-quality Wikipedia content (52,721 samples - 1.14% of priority datasets)
+        "codelion/finewiki-1B":
+          percentage: 0.99                     # Priority dataset - High-quality Wikipedia content
+          subset: null                         # Full 1B token dataset - use all available samples (52,721 samples)
+          # Reference: https://huggingface.co/datasets/codelion/finewiki-1B
+        
+        # Priority datasets total: 87.0% (these will contribute most samples)
+        # Based on actual sample counts: 4,639,172 total samples
+        
+        # ===== REMAINING DATASETS (FILL REMAINING ALLOCATION) =====
+        # These datasets will contribute samples after priority datasets are used
         # Hugging Face pretraining datasets with percentage allocation
         "HuggingFaceFW/fineweb":
-          percentage: 5.0                      # High-quality web content dataset (FineWeb-Edu category)
+          percentage: 3.0                      # High-quality web content dataset (FineWeb-Edu category)
           subset: "sample-10BT"               # 10 billion token sample
         
         # Math and reasoning datasets (finePDFs-like educational content)
         "HuggingFaceTB/finemath":
-          percentage: 7.0                      # Math content subset (finePDFs category - educational/math content)
+          percentage: 2.0                      # Math content subset (finePDFs category - educational/math content)
           subset: "finemath-3plus"             # Math content subset
         
         # Curated content (DCLM-baseline variant)
         "mlfoundations/dclm-baseline-1.0":
-          percentage: 9.0                      # DCLM-baseline variant: curated content (DCLM-baseline category)
+          percentage: 2.5                      # DCLM-baseline variant: curated content (DCLM-baseline category)
           subset: null                         # 187k tokens - Curated content
         
         # Synthetic educational content (finePDFs-like)
         "HuggingFaceTB/cosmopedia":
-          percentage: 6.0                      # Synthetic textbooks subset (finePDFs category - synthetic educational)
+          percentage: 2.0                      # Synthetic textbooks subset (finePDFs category - synthetic educational)
           subset: "auto_math_text"             # Synthetic textbooks subset
 
         # FineWeb-Edu variant (nanochat dataset)
         "karpathy/fineweb-edu-100b-shuffle":
-          percentage: 3.0                      # FineWeb-Edu variant: educational web content (FineWeb-Edu category)
+          percentage: 1.0                      # FineWeb-Edu variant: educational web content (FineWeb-Edu category)
           subset: null                         # 100 billion token sample
         
         # ===== CODE DATASETS (high-quality structured content) =====
@@ -331,19 +361,26 @@ training_stages:
         # Includes code question-answer pairs in 11 programming languages
         # Note: Dataset may use 'code', 'content', or 'text' fields - dataset loader handles all
         "nvidia/Nemotron-Pretraining-Code-v1":
-          percentage: 7.0                      # High-quality code dataset (finePDFs category - structured/educational)
+          percentage: 2.5                      # High-quality code dataset (finePDFs category - structured/educational)
           subset: Synthetic_Code                         # Full dataset (174.9B tokens of synthetic code + curated GitHub code)
           # Note: This dataset requires accepting NVIDIA Data Agreement for Model Training
           # The dataset includes both raw code and code Q&A pairs
           # Dataset loader will extract text from 'code', 'content', or 'text' fields automatically
           # Reference: https://huggingface.co/datasets/nvidia/Nemotron-Pretraining-Code-v1
         
-        # Total: 100.0% (ensures proper allocation)
-        # Breakdown by category (aligned with optimal 50-30-20 mix):
-        # - finePDFs category: 33% (codelion/finepdfs-1B) + 7% (finemath) + 6% (cosmopedia) + 7% (Nemotron-Code) = 53%
-        # - DCLM-baseline category: 19% (codelion/dclm-baseline-1B) + 9% (mlfoundations/dclm-baseline-1.0) = 28%
-        # - FineWeb-Edu category: 11% (codelion/fineweb-edu-1B) + 5% (fineweb) + 3% (karpathy/fineweb-edu) = 19%
-        # Note: Code dataset (7%) added to finePDFs category as structured/educational content
+        # Remaining datasets total: 13.0%
+        # Total: 100.0% (87.0% priority + 13.0% remaining)
+        
+        # ===== ALLOCATION STRATEGY =====
+        # Priority datasets (87.0%): These 6 datasets will be used exhaustively first
+        # Percentages are based on actual sample counts (total: 4,639,172 samples)
+        # - sumuks/essential-web-v1.0-sample-1B: 34.38% (1,833,333 samples - largest)
+        # - codelion/fineweb-edu-1B: 18.20% (970,397 samples)
+        # - codelion/synth-1B: 15.42% (822,230 samples)
+        # - codelion/dclm-baseline-1B: 14.52% (774,229 samples)
+        # - codelion/finepdfs-1B: 3.49% (186,262 samples)
+        # - codelion/finewiki-1B: 0.99% (52,721 samples - smallest)
+        # Remaining datasets (13.0%): Used to fill remaining allocation after priority datasets
       
       # Data loading performance options (optimized for GH200 with 72 CPU cores)
       num_workers: 64                # Reduced from 16 to minimize overhead and contention
@@ -351,16 +388,16 @@ training_stages:
       persistent_workers: true      # Keep workers alive between batches
       prefetch_factor: 2            # Reduced from 4 to minimize memory overhead
 
-    checkpoint_dir: "/home/sureshm/nemoACCfiy/outputs/checkpoints/stage1_v2"
-    model_output_dir: "/home/sureshm/nemoACCfiy/outputs/models_v2"
-    model_output_name: "stage1_model_v2.pth"
+    checkpoint_dir: "/home/sureshm/nemoACCfiy/outputs/checkpoints/stage1_opt"
+    model_output_dir: "/home/sureshm/nemoACCfiy/outputs/models_opt"
+    model_output_name: "stage1_model_opt.pth"
 
     wandb:
       use_wandb: false
-      project: "accfiy-stage1-v2"
+      project: "accfiy-stage1-opt"
       entity: null
       run_name: null
-      tags: ["stage1", "pretraining", "v2"]
+      tags: ["stage1", "pretraining", "opt"]
       group: null
       notes: null
 
@@ -368,7 +405,7 @@ training_stages:
       debug: false
       log_file: null
       enable_profiling: true
-      profiler_log_dir: "./profiler_logs/stage1_v2"
+      profiler_log_dir: "./profiler_logs/stage1_opt"
       save_steps: 10000
       validation_steps: 10000
     
@@ -485,39 +522,103 @@ training_stages:
       
       # Stage 1 Instruction SFT: Instruction tuning datasets
       pretraining_datasets:
+        # ===== PRIORITY DATASETS (USE ALL SAMPLES FIRST) =====
+        # These 10 new datasets are prioritized - they will contribute the majority of samples
+        # All samples from these datasets will be used first before moving to remaining datasets
+        # Percentages are based on actual sample counts (total: 4,486,000 samples)
+        # Allocation scaled to 87% total for priority datasets
+        
+        # Tulu-3 multitask datasets (largest - 939k samples each, 20.93% of priority datasets)
+        "hamishivi/rds-sels-tulu-3-multitask-rrmax-939k":
+          percentage: 18.21                    # Priority dataset - Tulu-3 multitask with influence scores (939,000 samples)
+          subset: null                         # Full dataset - use all available samples
+          # Reference: https://huggingface.co/datasets/hamishivi/rds-sels-tulu-3-multitask-rrmax-939k
+        
+        "hamishivi/rds-sels-tulu-3-arena-hard-939k":
+          percentage: 18.21                    # Priority dataset - Tulu-3 arena hard with influence scores (939,000 samples)
+          subset: null                         # Full dataset - use all available samples
+          # Reference: https://huggingface.co/datasets/hamishivi/rds-sels-tulu-3-arena-hard-939k
+        
+        # 326k sample datasets (7.27% of priority datasets each)
+        "hamishivi/rds-sels-multitask-rrmax-top326k":
+          percentage: 6.29                     # Priority dataset - Multitask with influence scores (326,000 samples)
+          subset: null                         # Full dataset - use all available samples
+          # Reference: https://huggingface.co/datasets/hamishivi/rds-sels-multitask-rrmax-top326k
+        
+        "hamishivi/rds-sels-alpacafarm-top326k":
+          percentage: 6.31                     # Priority dataset - AlpacaFarm top samples (326,000 samples)
+          subset: null                         # Full dataset - use all available samples
+          # Reference: https://huggingface.co/datasets/hamishivi/rds-sels-alpacafarm-top326k
+        
+        "hamishivi/rds-sels-gsm8k-shots-top326k":
+          percentage: 6.33                     # Priority dataset - GSM8K math problems with few-shot examples (326,000 samples)
+          subset: null                         # Full dataset - use all available samples
+          # Reference: https://huggingface.co/datasets/hamishivi/rds-sels-gsm8k-shots-top326k
+        
+        "hamishivi/rds-sels-codex-top326k":
+          percentage: 6.33                     # Priority dataset - CodeX code instruction dataset (326,000 samples)
+          subset: null                         # Full dataset - use all available samples
+          # Reference: https://huggingface.co/datasets/hamishivi/rds-sels-codex-top326k
+        
+        "hamishivi/rds-sels-bbh-shots-top326k":
+          percentage: 6.33                     # Priority dataset - Big Bench Hard reasoning tasks with few-shot (326,000 samples)
+          subset: null                         # Full dataset - use all available samples
+          # Reference: https://huggingface.co/datasets/hamishivi/rds-sels-bbh-shots-top326k
+        
+        "hamishivi/rds-sels-mmlu-shots-top326k":
+          percentage: 6.33                     # Priority dataset - MMLU knowledge tasks with few-shot (326,000 samples)
+          subset: null                         # Full dataset - use all available samples
+          # Reference: https://huggingface.co/datasets/hamishivi/rds-sels-mmlu-shots-top326k
+        
+        "hamishivi/rds-sels-squad-top326k":
+          percentage: 6.33                     # Priority dataset - SQuAD question answering (326,000 samples)
+          subset: null                         # Full dataset - use all available samples
+          # Reference: https://huggingface.co/datasets/hamishivi/rds-sels-squad-top326k
+        
+        "hamishivi/rds-sels-tydiqa-shots-top326k":
+          percentage: 6.33                     # Priority dataset - TyDiQA multilingual QA with few-shot (326,000 samples)
+          subset: null                         # Full dataset - use all available samples
+          # Reference: https://huggingface.co/datasets/hamishivi/rds-sels-tydiqa-shots-top326k
+        
+        # Priority datasets total: 87.0% (these will contribute most samples)
+        # Based on actual sample counts: 4,486,000 total samples
+        
+        # ===== EXISTING DATASETS (FILL REMAINING ALLOCATION) =====
+        # These datasets will contribute samples after priority datasets are used
         # General instruction tuning datasets
         "allenai/tulu-v2-sft-mixture":
-          percentage: 20.0                     # Tulu V2 SFT mixture - comprehensive instruction dataset
+          percentage: 3.0                      # Tulu V2 SFT mixture - comprehensive instruction dataset
           subset: null                         # Full dataset
         
         "HuggingFaceTB/OpenHermes-2.5-H4":
-          percentage: 20.0                     # OpenHermes 2.5 - high-quality instruction dataset
+          percentage: 2.5                      # OpenHermes 2.5 - high-quality instruction dataset
           subset: null                         # Full dataset
         
         # Math-focused datasets
         "nvidia/OpenMathInstruct-1":
-          percentage: 15.0                     # NVIDIA OpenMathInstruct - math instruction dataset
+          percentage: 2.0                      # NVIDIA OpenMathInstruct - math instruction dataset
           subset: null                         # Full dataset
         
         "meta-math/MetaMathQA":
-          percentage: 15.0                     # MetaMathQA - math question answering dataset
+          percentage: 2.0                      # MetaMathQA - math question answering dataset
           subset: null                         # Full dataset
         
         # Code-focused datasets
         "m-a-p/CodeFeedback-Filtered-Instruction":
-          percentage: 10.0                     # CodeFeedback - filtered code instruction dataset
+          percentage: 1.5                      # CodeFeedback - filtered code instruction dataset
           subset: null                         # Full dataset
         
         # HPC-focused datasets
         "hpcgroup/hpc-instruct":
-          percentage: 10.0                     # HPC Instruct - HPC instruction dataset
+          percentage: 1.0                      # HPC Instruct - HPC instruction dataset
           subset: null                         # Full dataset
         
         "HPC-GPT/HPC":
-          percentage: 10.0                     # HPC-GPT HPC dataset
+          percentage: 1.0                      # HPC-GPT HPC dataset
           subset: null                         # Full dataset
           
-        # Total: 100.0% (ensures proper allocation)
+        # Remaining datasets total: 13.0%
+        # Total: 100.0% (87.0% priority + 13.0% remaining)
       
       # Data loading performance options (optimized for GH200 with 72 CPU cores)
       num_workers: 64                # Reduced from 16 to minimize overhead and contention
@@ -525,24 +626,24 @@ training_stages:
       persistent_workers: true      # Keep workers alive between epochs
       prefetch_factor: 2            # Reduced from 4 to minimize memory overhead
 
-    checkpoint_dir: "/home/sureshm/nemoACCfiy/outputs/checkpoints/stage1_inst_SFT"
-    model_output_dir: "/home/sureshm/nemoACCfiy/outputs/models_inst_SFT"
-    model_output_name: "stage1_inst_SFT_model.pth"
+    checkpoint_dir: "/home/sureshm/nemoACCfiy/outputs/checkpoints/stage1_inst_SFT_opt"
+    model_output_dir: "/home/sureshm/nemoACCfiy/outputs/models_inst_SFT_opt"
+    model_output_name: "stage1_inst_SFT_opt_model.pth"
 
     wandb:
       use_wandb: false
-      project: "accfiy-stage1-inst-sft"
+      project: "accfiy-stage1-inst-sft-opt"
       entity: null
       run_name: null
-      tags: ["stage1_inst_sft", "instruction_tuning", "decoder_only"]
+      tags: ["stage1_inst_sft_opt", "instruction_tuning", "decoder_only"]
       group: null
-      notes: "Stage 1 Instruction SFT: Decoder-only instruction fine-tuning after NTP training"
+      notes: "Stage 1 Instruction SFT Opt: Decoder-only instruction fine-tuning after NTP training"
 
     logging:
       debug: false
       log_file: null
       enable_profiling: true
-      profiler_log_dir: "./profiler_logs/stage1_inst_SFT"
+      profiler_log_dir: "./profiler_logs/stage1_inst_SFT_opt"
       save_steps: 1000
       validation_steps: 10000
     

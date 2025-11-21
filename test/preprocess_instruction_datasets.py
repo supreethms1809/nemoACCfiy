@@ -5,6 +5,8 @@ Instruction Dataset Preprocessing Script
 This script downloads and processes instruction tuning datasets for stage1_inst_SFT,
 then saves them locally in the data/ directory for fast loading during instruction SFT training.
 
+The script automatically uses configs/config_production.yaml by default (or configs/config.yaml if production doesn't exist).
+
 Usage:
     python test/preprocess_instruction_datasets.py --stage stage1_inst_SFT --total_samples 100000
     python test/preprocess_instruction_datasets.py --stage stage1_inst_SFT --total_samples 100000 --config configs/config_production.yaml
