@@ -2645,6 +2645,7 @@ def train_production_mode(
         }
     
     max_samples = data_config.get("processing", {}).get("total_samples", 100000)
+    validation_split_ratio = data_config.get("processing", {}).get("validation_split_ratio", 0.1)  # Default 10%
     
     # Check if we should use preprocessed datasets
     use_processed = data_config.get("processing", {}).get("use_processed_datasets", False)
@@ -2673,6 +2674,10 @@ def train_production_mode(
         logging.info(f"📚 Loading instruction tuning datasets from HuggingFace")
         logging.info(f"   Datasets: {list(pretraining_datasets.keys())}")
         logging.info(f"   Max samples: {max_samples}")
+        logging.info(f"   Validation split ratio: {validation_split_ratio:.1%}")
+        
+        # Calculate validation samples based on configurable ratio
+        val_samples = max(int(max_samples * validation_split_ratio), 100)  # At least 100 validation samples
         
         # Load instruction datasets
         train_instruction_data = load_instruction_datasets_with_percentages(
@@ -2682,7 +2687,7 @@ def train_production_mode(
         )
         val_instruction_data = load_instruction_datasets_with_percentages(
             pretraining_datasets, 
-            max(max_samples // 10, 100),  # At least 100 validation samples
+            val_samples,
             "validation"
         )
         
@@ -2850,6 +2855,9 @@ def train_production_mode(
                 else:
                     system = None
                 
+                # Initialize response_token_ids for both code paths
+                response_token_ids = tokenizer.encode(response_token, add_special_tokens=False)
+                
                 # Use chat template if messages are available, otherwise use fallback format
                 if messages and isinstance(messages, list):
                     # Use chat template formatting
@@ -2869,9 +2877,20 @@ def train_production_mode(
                     )
                     attention_mask = [1] * len(input_ids)
                     
-                    # Find where assistant response starts (heuristic for chat templates)
-                    # Use 70% of sequence as conservative estimate
-                    response_start_idx = max(len(input_ids) // 10, int(len(input_ids) * 0.7))
+                    # Find where assistant response starts by searching for response_token
+                    # Search from the end backwards (response token should be near the end)
+                    response_start_idx = None
+                    for idx in range(len(input_ids) - len(response_token_ids), -1, -1):
+                        if input_ids[idx:idx+len(response_token_ids)] == response_token_ids:
+                            response_start_idx = idx + len(response_token_ids)
+                            break
+                    
+                    # Fallback heuristic if response token not found (shouldn't happen, but safety)
+                    if response_start_idx is None:
+                        # Use 70% of sequence as conservative estimate
+                        response_start_idx = max(len(input_ids) // 10, int(len(input_ids) * 0.7))
+                        if i == 0:
+                            logging.warning(f"⚠️ Response token not found in chat template format, using heuristic position")
                 else:
                     # Use fallback format: <|instruction|> {system} {question} <|response|> {answer} <|end|>
                     # SMART TRUNCATION: Prioritize keeping the answer (what we're training on)
@@ -2879,12 +2898,14 @@ def train_production_mode(
                     
                     # First, tokenize components separately to understand their lengths
                     instruction_token_ids = tokenizer.encode(instruction_token, add_special_tokens=False)
-                    response_token_ids = tokenizer.encode(response_token, add_special_tokens=False)
+                    # response_token_ids already initialized above
                     end_token_ids = tokenizer.encode(end_token, add_special_tokens=False)
                 
-                    # Tokenize answer part (this is critical - we need to keep this)
-                    answer_text = f"{response_token} {answer} {end_token}"
-                    answer_ids = tokenizer.encode(answer_text, add_special_tokens=False)
+                    # Tokenize answer separately to ensure response_token is at exact position
+                    # This prevents tokenization boundary issues when encoding as a single string
+                    answer_only_ids = tokenizer.encode(answer, add_special_tokens=False) if answer else []
+                    # Construct answer_ids explicitly: response_token + answer + end_token
+                    answer_ids = response_token_ids + answer_only_ids + end_token_ids
                     
                     # Calculate available space for question/system
                     # Reserve space for: instruction_token + question/system + answer_part
@@ -2948,19 +2969,27 @@ def train_production_mode(
                     response_start_idx = len(instruction_token_ids) + len(question_ids) + len(response_token_ids)
                 
                 # Verify response_start_idx is correct by checking if response_token is at expected position
+                # Since we construct answer_ids explicitly, the response token should be at the expected position
+                # But we verify as a safety check
                 if response_start_idx <= len(input_ids):
                     # Verify: response_token should be at position (response_start_idx - len(response_token_ids))
                     expected_response_pos = response_start_idx - len(response_token_ids)
                     if expected_response_pos >= 0 and expected_response_pos + len(response_token_ids) <= len(input_ids):
                         actual_response_tokens = input_ids[expected_response_pos:expected_response_pos + len(response_token_ids)]
                         if actual_response_tokens != response_token_ids:
-                            # Mismatch - fallback to search
-                            logging.warning(f"⚠️ Response token mismatch at expected position, searching...")
+                            # Mismatch - this shouldn't happen with explicit construction, but search as fallback
+                            # Only log once per batch to reduce spam
+                            if i == 0:
+                                logging.warning(f"⚠️ Response token mismatch at expected position (sample {i}), searching...")
                             # Search from the end backwards
+                            found = False
                             for idx in range(len(input_ids) - len(response_token_ids), -1, -1):
                                 if input_ids[idx:idx+len(response_token_ids)] == response_token_ids:
                                     response_start_idx = idx + len(response_token_ids)
+                                    found = True
                                     break
+                            if not found and i == 0:
+                                logging.warning(f"⚠️ Response token not found in sequence (sample {i})")
                 
                 # Safety check: ensure response_start_idx is valid
                 if response_start_idx >= len(input_ids):
@@ -2982,7 +3011,7 @@ def train_production_mode(
                 
                 # Log truncation statistics (only for first sample to avoid spam)
                 if i == 0:
-                    question_tokens = len(question_ids)
+                    question_tokens = len(question_ids) if 'question_ids' in locals() else 0
                     answer_tokens = answer_tokens_count
                     total_tokens = len(input_ids)
                     logging.info(f"📊 Tokenization stats (first sample): question={question_tokens}, answer={answer_tokens}, total={total_tokens}, response_start_idx={response_start_idx}")
@@ -2993,9 +3022,9 @@ def train_production_mode(
                 
                 # Update statistics
                 stats['total'] += 1
-                if len(question_ids) < len(tokenizer.encode(question, add_special_tokens=False, truncation=False)):
+                if 'question_ids' in locals() and len(question_ids) < len(tokenizer.encode(question, add_special_tokens=False, truncation=False)):
                     stats['question_truncated'] += 1
-                if len(answer_ids) < len(tokenizer.encode(f"{response_token} {answer} {end_token}", add_special_tokens=False, truncation=False)):
+                if 'answer_ids' in locals() and len(answer_ids) < len(tokenizer.encode(f"{response_token} {answer} {end_token}", add_special_tokens=False, truncation=False)):
                     stats['answer_truncated'] += 1
                 stats['min_answer_tokens'] = min(stats['min_answer_tokens'], answer_tokens_count)
                 stats['max_answer_tokens'] = max(stats['max_answer_tokens'], answer_tokens_count)

@@ -94,7 +94,11 @@ def preprocess_instruction_datasets(
             logger.error("💡 Please configure pretraining_datasets in the config file for stage1_inst_SFT")
             return False
         
+        # Get validation split ratio from config (default 0.1 = 10%)
+        validation_split_ratio = data_config.get("processing", {}).get("validation_split_ratio", 0.1)
+        
         logger.info(f"📚 Found {len(pretraining_datasets)} instruction datasets in config")
+        logger.info(f"📊 Validation split ratio: {validation_split_ratio:.1%}")
         
         # Categorize datasets by allocation strategy
         priority_datasets = []
@@ -111,6 +115,9 @@ def preprocess_instruction_datasets(
         
         logger.info(f"📊 Allocation strategy: {len(priority_datasets)} priority datasets, {len(percentage_datasets)} percentage-based datasets")
         
+        # Calculate validation samples based on configurable ratio
+        val_samples = max(int(total_samples * validation_split_ratio), 100)  # At least 100 validation samples
+        
         # Load instruction datasets
         logger.info("📥 Loading instruction datasets...")
         start_time = time.time()
@@ -123,7 +130,7 @@ def preprocess_instruction_datasets(
         
         val_instruction_data = load_instruction_datasets_with_percentages(
             pretraining_datasets, 
-            max(total_samples // 10, 100),  # At least 100 validation samples
+            val_samples,
             "validation"
         )
         
@@ -226,7 +233,7 @@ def preprocess_instruction_datasets(
                 config_data = pretraining_datasets[dataset_name]
                 # Calculate based on normalized percentage of remaining samples
                 expected_train_samples = int(remaining_samples * (percentage / total_percentage))
-                expected_val_samples = max(int(expected_train_samples // 10), 10)
+                expected_val_samples = max(int(expected_train_samples * validation_split_ratio), 10)
                 individual_datasets[dataset_name] = {
                     "allocation_strategy": "percentage",
                     "percentage": percentage,
