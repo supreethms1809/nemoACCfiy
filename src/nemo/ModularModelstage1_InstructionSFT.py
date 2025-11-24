@@ -1991,291 +1991,338 @@ def load_instruction_datasets_with_percentages(
     max_samples: int = 10000,
     split: str = "train"
 ) -> List[Dict[str, Any]]:
-    """Load instruction tuning datasets with percentage-based sampling from config."""
+    """Load instruction tuning datasets with flexible allocation (use_all_available or percentage-based)."""
     if not DATASETS_AVAILABLE:
         raise RuntimeError("datasets library not available")
     
     all_data = []
-    total_percentage = sum(dataset_config.get("percentage", 0) for dataset_config in pretraining_datasets.values())
     
-    if total_percentage == 0:
-        logging.warning("No valid dataset percentages found in config. Using equal distribution.")
-        total_percentage = 100.0
-        equal_percentage = 100.0 / len(pretraining_datasets) if pretraining_datasets else 100.0
-        for dataset_name in pretraining_datasets:
-            pretraining_datasets[dataset_name]["percentage"] = equal_percentage
+    # Separate datasets by allocation strategy (similar to HuggingFaceDatasetLoader)
+    priority_datasets = {}  # use_all_available
+    percentage_datasets = {}  # percentage-based
     
     for dataset_name, dataset_config in pretraining_datasets.items():
+        if dataset_config.get("use_all_available", False):
+            priority_datasets[dataset_name] = dataset_config
+        elif dataset_config.get("percentage", 0) > 0:
+            percentage_datasets[dataset_name] = dataset_config
+    
+    priority_samples_used = 0
+    
+    # First pass: Load priority datasets (use_all_available)
+    for dataset_name, dataset_config in priority_datasets.items():
         try:
-            percentage = dataset_config.get("percentage", 0)
             subset = dataset_config.get("subset", None)
+            logging.info(f"Loading priority instruction dataset: {dataset_name} (using ALL available samples)")
             
-            # Calculate samples for this dataset based on percentage
-            dataset_samples = int(max_samples * (percentage / 100.0))
+            # Load dataset with all available samples
+            dataset = _load_instruction_dataset_with_split(dataset_name, subset, split)
             
-            if dataset_samples == 0:
-                logging.info(f"Skipping {dataset_name} (0% allocation)")
-                continue
-                
-            logging.info(f"Loading instruction dataset: {dataset_name} ({percentage}% = {dataset_samples} samples)")
-            
-            # Handle different split names for different datasets
-            # Some datasets use "train_sft" instead of "train"
-            actual_split = split
-            if split == "train":
-                # Try train_sft first for datasets like OpenHermes-2.5-H4
-                try:
-                    if subset:
-                        dataset = load_dataset(dataset_name, subset, split="train_sft")
-                    else:
-                        dataset = load_dataset(dataset_name, split="train_sft")
-                    actual_split = "train_sft"
-                    logging.info(f"  Using split 'train_sft' for {dataset_name}")
-                except (ValueError, KeyError):
-                    # Fall back to regular train split
-                    if subset:
-                        dataset = load_dataset(dataset_name, subset, split=split)
-                    else:
-                        dataset = load_dataset(dataset_name, split=split)
-            elif split == "validation":
-                # Try validation splits with different names
-                try:
-                    if subset:
-                        dataset = load_dataset(dataset_name, subset, split="test_sft")
-                    else:
-                        dataset = load_dataset(dataset_name, split="test_sft")
-                    actual_split = "test_sft"
-                    logging.info(f"  Using split 'test_sft' for {dataset_name}")
-                except Exception as e1:
-                    error_msg1 = str(e1).lower()
-                    if "unknown split" not in error_msg1 and "not available" not in error_msg1 and "should be one of" not in error_msg1:
-                        # Not a split error, re-raise
-                        raise
-                    try:
-                        if subset:
-                            dataset = load_dataset(dataset_name, subset, split="validation")
-                        else:
-                            dataset = load_dataset(dataset_name, split="validation")
-                        actual_split = "validation"
-                    except Exception as e2:
-                        error_msg2 = str(e2).lower()
-                        if "unknown split" not in error_msg2 and "not available" not in error_msg2 and "should be one of" not in error_msg2:
-                            # Not a split error, re-raise
-                            raise
-                        # Fall back to test split
-                        try:
-                            if subset:
-                                dataset = load_dataset(dataset_name, subset, split="test")
-                            else:
-                                dataset = load_dataset(dataset_name, split="test")
-                            actual_split = "test"
-                        except Exception as test_error:
-                            # If test also doesn't exist, fall back to train
-                            error_msg = str(test_error).lower()
-                            if "unknown split" in error_msg or "not available" in error_msg or "should be one of" in error_msg:
-                                logging.warning(f"  Split 'test' not available for {dataset_name}, falling back to 'train'")
-                                if subset:
-                                    dataset = load_dataset(dataset_name, subset, split="train")
-                                else:
-                                    dataset = load_dataset(dataset_name, split="train")
-                                actual_split = "train"
-                            else:
-                                raise
-            else:
-                # Load dataset with optional subset
-                # Try the requested split first, fall back to train if it doesn't exist
-                try:
-                    if subset:
-                        dataset = load_dataset(dataset_name, subset, split=split)
-                    else:
-                        dataset = load_dataset(dataset_name, split=split)
-                except Exception as e:
-                    # If the requested split doesn't exist, try train as fallback
-                    error_msg = str(e).lower()
-                    if "unknown split" in error_msg or "not available" in error_msg or "should be one of" in error_msg:
-                        logging.warning(f"  Split '{split}' not available for {dataset_name}, falling back to 'train'")
-                        try:
-                            if subset:
-                                dataset = load_dataset(dataset_name, subset, split="train")
-                            else:
-                                dataset = load_dataset(dataset_name, split="train")
-                            actual_split = "train"
-                        except Exception:
-                            # Re-raise the original error if train also doesn't exist
-                            raise e
-                    else:
-                        raise
-            
-            # Check dataset size and adjust if needed
-            try:
-                # Try to get dataset length (works for non-streaming datasets)
-                dataset_size = len(dataset)
-                if dataset_size < dataset_samples:
-                    logging.warning(
-                        f"  Dataset {dataset_name} has only {dataset_size:,} samples, "
-                        f"less than requested {dataset_samples:,} ({percentage}%). "
-                        f"Using all available samples."
-                    )
-                    dataset_samples = dataset_size
-                elif dataset_size == dataset_samples:
-                    logging.info(f"  Dataset {dataset_name} has exactly {dataset_size:,} samples")
-                else:
-                    logging.info(f"  Dataset {dataset_name} has {dataset_size:,} samples, taking {dataset_samples:,}")
-            except (TypeError, AttributeError):
-                # Streaming dataset or unknown size - proceed with requested limit
-                logging.info(f"  Dataset size unknown (streaming?), will take up to {dataset_samples:,} samples")
+            # Get all samples (no limit for priority datasets)
+            dataset_samples = len(dataset)
+            priority_samples_used += dataset_samples
+            logging.info(f"  Priority dataset {dataset_name} has {dataset_samples:,} samples (using all)")
             
             # Convert to our format
-            dataset_data = []
-            for i, item in enumerate(dataset):
-                if i >= dataset_samples:
-                    break
-                
-                # Handle different dataset formats
-                if "messages" in item:
-                    # Messages format (tulu-v2-sft-mixture, OpenHermes-2.5-H4, hamishivi datasets, etc.)
-                    # Extract system, user, and assistant messages from conversation
-                    messages = item["messages"]
-                    if not isinstance(messages, list) or len(messages) < 2:
-                        continue
-                    
-                    # Extract system, user, and assistant messages properly
-                    system_content = None
-                    user_content = None
-                    assistant_content = None
-                    messages_list = []
-                    
-                    for msg in messages:
-                        if isinstance(msg, dict):
-                            role = msg.get("role", "").lower()
-                            content = msg.get("content", "")
-                            
-                            # Normalize role names
-                            if role == "system":
-                                system_content = content
-                                messages_list.append({"role": "system", "content": content})
-                            elif role == "user":
-                                user_content = content
-                                messages_list.append({"role": "user", "content": content})
-                            elif role in ["assistant", "gpt", "model"]:
-                                assistant_content = content
-                                messages_list.append({"role": "assistant", "content": content})
-                    
-                    # For datasets with messages format, preserve the full messages structure
-                    if messages_list and assistant_content:
-                        # If we have a user message (or can infer from messages), create sample
-                        if not user_content:
-                            # Try to find user message in messages_list
-                            for msg in messages_list:
-                                if msg.get("role") == "user":
-                                    user_content = msg.get("content", "")
-                                    break
-                        
-                        # Create sample with messages format for proper chat formatting
-                        sample = {
-                            "messages": messages_list,  # Preserve full messages structure
-                            "system": str(system_content) if system_content else None,
-                            "question": str(user_content) if user_content else "",
-                            "answer": str(assistant_content),
-                            "dataset": dataset_name
-                        }
-                    else:
-                        # Fallback: Skip if we can't extract proper structure
-                        continue
-                        
-                elif "problem" in item and "expected_answer" in item:
-                    # nvidia/OpenMathReasoning format
-                    sample = {
-                        "question": item["problem"],
-                        "answer": item["expected_answer"],
-                        "dataset": dataset_name
-                    }
-                elif "question" in item and "expected_answer" in item:
-                    # nvidia/OpenMathInstruct format
-                    sample = {
-                        "question": item["question"],
-                        "answer": item["expected_answer"],
-                        "dataset": dataset_name
-                    }
-                elif "question" in item and "answer" in item:
-                    # Generic question-answer format
-                    sample = {
-                        "question": item["question"],
-                        "answer": item["answer"],
-                        "dataset": dataset_name
-                    }
-                elif "input" in item and "output" in item:
-                    # Generic instruction format
-                    sample = {
-                        "question": item["input"],
-                        "answer": item["output"],
-                        "dataset": dataset_name
-                    }
-                elif "instruction" in item and "response" in item:
-                    # Instruction-response format (some datasets use this)
-                    sample = {
-                        "question": item["instruction"],
-                        "answer": item["response"],
-                        "dataset": dataset_name
-                    }
-                elif "prompt" in item and "completion" in item:
-                    # Prompt-completion format
-                    sample = {
-                        "question": item["prompt"],
-                        "answer": item["completion"],
-                        "dataset": dataset_name
-                    }
-                elif "query" in item and "answer" in item:
-                    # Query-answer format (m-a-p/CodeFeedback-Filtered-Instruction)
-                    sample = {
-                        "question": item["query"],
-                        "answer": item["answer"],
-                        "dataset": dataset_name
-                    }
-                elif "query" in item and "response" in item:
-                    # Query-response format (meta-math/MetaMathQA)
-                    sample = {
-                        "question": item["query"],
-                        "answer": item["response"],
-                        "dataset": dataset_name
-                    }
-                elif "problem statement" in item and "solution" in item:
-                    # Problem statement-solution format (hpcgroup/hpc-instruct)
-                    problem_stmt = item.get("problem statement", "")
-                    solution = item.get("solution", "")
-                    if problem_stmt and solution:
-                        sample = {
-                            "question": str(problem_stmt),
-                            "answer": str(solution),
-                            "dataset": dataset_name
-                        }
-                    else:
-                        # Skip if fields are empty
-                        continue
-                else:
-                    # Log unknown format for debugging (first time only per dataset)
-                    if i == 0:
-                        logging.warning(f"Unknown format in {dataset_name}: {list(item.keys())}. Skipping this dataset.")
-                    continue
-                
-                dataset_data.append(sample)
-            
+            dataset_data = _convert_instruction_dataset_to_format(dataset, dataset_samples, dataset_name)
             all_data.extend(dataset_data)
-            requested_samples = int(max_samples * (percentage / 100.0))
-            if len(dataset_data) < requested_samples:
-                logging.info(
-                    f"Loaded {len(dataset_data):,} samples from {dataset_name} "
-                    f"(requested {requested_samples:,}, {len(dataset_data)/requested_samples*100:.1f}% of requested)"
-                )
-            else:
-                logging.info(f"Loaded {len(dataset_data):,} samples from {dataset_name}")
             
         except Exception as e:
-            logging.warning(f"Failed to load dataset {dataset_name}: {e}")
+            logging.error(f"Failed to load priority dataset {dataset_name}: {e}")
             continue
     
-    logging.info(f"Total instruction samples loaded: {len(all_data)}")
+    # Calculate remaining samples for percentage-based allocation
+    remaining_samples = max_samples - priority_samples_used
+    
+    if remaining_samples < 0:
+        logging.warning(
+            f"Priority datasets used {priority_samples_used:,} samples, "
+            f"exceeding max_samples ({max_samples:,}). "
+            f"Percentage-based datasets will get 0 samples."
+        )
+        remaining_samples = 0
+    
+    # Second pass: Load percentage-based datasets
+    if remaining_samples > 0 and percentage_datasets:
+        total_percentage = sum(config.get("percentage", 0) for config in percentage_datasets.values())
+        
+        if total_percentage == 0:
+            logging.warning("No valid dataset percentages found. Skipping percentage-based datasets.")
+        else:
+            for dataset_name, dataset_config in percentage_datasets.items():
+                try:
+                    percentage = dataset_config.get("percentage", 0)
+                    subset = dataset_config.get("subset", None)
+                    
+                    # Calculate samples based on normalized percentage of remaining samples
+                    dataset_samples = int(remaining_samples * (percentage / total_percentage))
+                    
+                    if dataset_samples == 0:
+                        logging.info(f"Skipping {dataset_name} (0 samples after priority allocation)")
+                        continue
+                        
+                    logging.info(f"Loading instruction dataset: {dataset_name} ({percentage}% of remaining {remaining_samples:,} = {dataset_samples:,} samples)")
+                    
+                    # Load dataset
+                    dataset = _load_instruction_dataset_with_split(dataset_name, subset, split)
+                    
+                    # Check dataset size and adjust if needed
+                    try:
+                        dataset_size = len(dataset)
+                        if dataset_size < dataset_samples:
+                            logging.warning(
+                                f"  Dataset {dataset_name} has only {dataset_size:,} samples, "
+                                f"less than requested {dataset_samples:,}. "
+                                f"Using all available samples."
+                            )
+                            dataset_samples = dataset_size
+                        elif dataset_size == dataset_samples:
+                            logging.info(f"  Dataset {dataset_name} has exactly {dataset_size:,} samples")
+                        else:
+                            logging.info(f"  Dataset {dataset_name} has {dataset_size:,} samples, taking {dataset_samples:,}")
+                    except (TypeError, AttributeError):
+                        # Streaming dataset or unknown size - proceed with requested limit
+                        logging.info(f"  Dataset size unknown (streaming?), will take up to {dataset_samples:,} samples")
+                    
+                    # Convert to our format
+                    dataset_data = _convert_instruction_dataset_to_format(dataset, dataset_samples, dataset_name)
+                    all_data.extend(dataset_data)
+                    
+                except Exception as e:
+                    logging.error(f"Failed to load dataset {dataset_name}: {e}")
+                    continue
+    elif remaining_samples == 0:
+        logging.info("No remaining samples after priority datasets - skipping percentage-based datasets")
+    
     return all_data
+
+
+def _load_instruction_dataset_with_split(dataset_name: str, subset: Optional[str], split: str):
+    """Helper function to load instruction dataset with appropriate split handling."""
+    # Handle different split names for different datasets
+    actual_split = split
+    if split == "train":
+        # Try train_sft first for datasets like OpenHermes-2.5-H4
+        try:
+            if subset:
+                dataset = load_dataset(dataset_name, subset, split="train_sft")
+            else:
+                dataset = load_dataset(dataset_name, split="train_sft")
+            actual_split = "train_sft"
+            logging.info(f"  Using split 'train_sft' for {dataset_name}")
+        except (ValueError, KeyError):
+            # Fall back to regular train split
+            if subset:
+                dataset = load_dataset(dataset_name, subset, split=split)
+            else:
+                dataset = load_dataset(dataset_name, split=split)
+    elif split == "validation":
+        # Try validation splits with different names
+        try:
+            if subset:
+                dataset = load_dataset(dataset_name, subset, split="test_sft")
+            else:
+                dataset = load_dataset(dataset_name, split="test_sft")
+            actual_split = "test_sft"
+            logging.info(f"  Using split 'test_sft' for {dataset_name}")
+        except Exception as e1:
+            error_msg1 = str(e1).lower()
+            if "unknown split" not in error_msg1 and "not available" not in error_msg1 and "should be one of" not in error_msg1:
+                raise
+            try:
+                if subset:
+                    dataset = load_dataset(dataset_name, subset, split="validation")
+                else:
+                    dataset = load_dataset(dataset_name, split="validation")
+                actual_split = "validation"
+            except Exception as e2:
+                error_msg2 = str(e2).lower()
+                if "unknown split" not in error_msg2 and "not available" not in error_msg2 and "should be one of" not in error_msg2:
+                    raise
+                # Fall back to test split
+                try:
+                    if subset:
+                        dataset = load_dataset(dataset_name, subset, split="test")
+                    else:
+                        dataset = load_dataset(dataset_name, split="test")
+                    actual_split = "test"
+                except Exception as test_error:
+                    # If test also doesn't exist, fall back to train
+                    error_msg = str(test_error).lower()
+                    if "unknown split" in error_msg or "not available" in error_msg or "should be one of" in error_msg:
+                        logging.warning(f"  Split 'test' not available for {dataset_name}, falling back to 'train'")
+                        if subset:
+                            dataset = load_dataset(dataset_name, subset, split="train")
+                        else:
+                            dataset = load_dataset(dataset_name, split="train")
+                        actual_split = "train"
+                    else:
+                        raise
+    else:
+        # Load dataset with optional subset
+        # Try the requested split first, fall back to train if it doesn't exist
+        try:
+            if subset:
+                dataset = load_dataset(dataset_name, subset, split=split)
+            else:
+                dataset = load_dataset(dataset_name, split=split)
+        except Exception as e:
+            # If the requested split doesn't exist, try train as fallback
+            error_msg = str(e).lower()
+            if "unknown split" in error_msg or "not available" in error_msg or "should be one of" in error_msg:
+                logging.warning(f"  Split '{split}' not available for {dataset_name}, falling back to 'train'")
+                try:
+                    if subset:
+                        dataset = load_dataset(dataset_name, subset, split="train")
+                    else:
+                        dataset = load_dataset(dataset_name, split="train")
+                    actual_split = "train"
+                except Exception:
+                    # Re-raise the original error if train also doesn't exist
+                    raise e
+            else:
+                raise
+    
+    return dataset
+
+
+def _convert_instruction_dataset_to_format(dataset, max_samples: int, dataset_name: str = "unknown") -> List[Dict[str, Any]]:
+    """Helper function to convert instruction dataset to our format."""
+    dataset_data = []
+    for i, item in enumerate(dataset):
+        if i >= max_samples:
+            break
+        
+        # Handle different dataset formats
+        if "messages" in item:
+            # Messages format (tulu-v2-sft-mixture, OpenHermes-2.5-H4, hamishivi datasets, etc.)
+            # Extract system, user, and assistant messages from conversation
+            messages = item["messages"]
+            if not isinstance(messages, list) or len(messages) < 2:
+                continue
+            
+            # Extract system, user, and assistant messages properly
+            system_content = None
+            user_content = None
+            assistant_content = None
+            messages_list = []
+            
+            for msg in messages:
+                if isinstance(msg, dict):
+                    role = msg.get("role", "").lower()
+                    content = msg.get("content", "")
+                    
+                    # Normalize role names
+                    if role == "system":
+                        system_content = content
+                        messages_list.append({"role": "system", "content": content})
+                    elif role == "user":
+                        user_content = content
+                        messages_list.append({"role": "user", "content": content})
+                    elif role in ["assistant", "gpt", "model"]:
+                        assistant_content = content
+                        messages_list.append({"role": "assistant", "content": content})
+            
+            # For datasets with messages format, preserve the full messages structure
+            if messages_list and assistant_content:
+                # If we have a user message (or can infer from messages), create sample
+                if not user_content:
+                    # Try to find user message in messages_list
+                    for msg in messages_list:
+                        if msg.get("role") == "user":
+                            user_content = msg.get("content", "")
+                            break
+                
+                # Create sample with messages format for proper chat formatting
+                sample = {
+                    "messages": messages_list,  # Preserve full messages structure
+                    "system": str(system_content) if system_content else None,
+                    "question": str(user_content) if user_content else "",
+                    "answer": str(assistant_content),
+                    "dataset": dataset_name
+                }
+            else:
+                # Fallback: Skip if we can't extract proper structure
+                continue
+                
+        elif "problem" in item and "expected_answer" in item:
+            # nvidia/OpenMathReasoning format
+            sample = {
+                "question": item["problem"],
+                "answer": item["expected_answer"],
+                "dataset": dataset_name
+            }
+        elif "question" in item and "expected_answer" in item:
+            # nvidia/OpenMathInstruct format
+            sample = {
+                "question": item["question"],
+                "answer": item["expected_answer"],
+                "dataset": dataset_name
+            }
+        elif "question" in item and "answer" in item:
+            # Generic question-answer format
+            sample = {
+                "question": item["question"],
+                "answer": item["answer"],
+                "dataset": dataset_name
+            }
+        elif "input" in item and "output" in item:
+            # Generic instruction format
+            sample = {
+                "question": item["input"],
+                "answer": item["output"],
+                "dataset": dataset_name
+            }
+        elif "instruction" in item and "response" in item:
+            # Instruction-response format (some datasets use this)
+            sample = {
+                "question": item["instruction"],
+                "answer": item["response"],
+                "dataset": dataset_name
+            }
+        elif "prompt" in item and "completion" in item:
+            # Prompt-completion format
+            sample = {
+                "question": item["prompt"],
+                "answer": item["completion"],
+                "dataset": dataset_name
+            }
+        elif "query" in item and "answer" in item:
+            # Query-answer format (m-a-p/CodeFeedback-Filtered-Instruction)
+            sample = {
+                "question": item["query"],
+                "answer": item["answer"],
+                "dataset": dataset_name
+            }
+        elif "query" in item and "response" in item:
+            # Query-response format (meta-math/MetaMathQA)
+            sample = {
+                "question": item["query"],
+                "answer": item["response"],
+                "dataset": dataset_name
+            }
+        elif "problem statement" in item and "solution" in item:
+            # Problem statement-solution format (hpcgroup/hpc-instruct)
+            problem_stmt = item.get("problem statement", "")
+            solution = item.get("solution", "")
+            if problem_stmt and solution:
+                sample = {
+                    "question": str(problem_stmt),
+                    "answer": str(solution),
+                    "dataset": dataset_name
+                }
+            else:
+                # Skip if fields are empty
+                continue
+        else:
+            # Log unknown format for debugging (first time only per dataset)
+            if i == 0:
+                logging.warning(f"Unknown format in {dataset_name}: {list(item.keys())}. Skipping this dataset.")
+            continue
+        
+        dataset_data.append(sample)
+    
+    return dataset_data
 
 
 def find_ntp_checkpoint(ntp_checkpoint_path: Optional[str] = None, config: Dict[str, Any] = None) -> str:

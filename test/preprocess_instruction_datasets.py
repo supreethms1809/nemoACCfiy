@@ -95,9 +95,21 @@ def preprocess_instruction_datasets(
             return False
         
         logger.info(f"📚 Found {len(pretraining_datasets)} instruction datasets in config")
+        
+        # Categorize datasets by allocation strategy
+        priority_datasets = []
+        percentage_datasets = []
         for dataset_name, dataset_config in pretraining_datasets.items():
-            percentage = dataset_config.get("percentage", 0)
-            logger.info(f"  - {dataset_name}: {percentage}%")
+            if dataset_config.get("use_all_available", False):
+                priority_datasets.append(dataset_name)
+                logger.info(f"  - {dataset_name}: use_all_available (priority dataset)")
+            elif dataset_config.get("percentage", 0) > 0:
+                percentage_datasets.append(dataset_name)
+                logger.info(f"  - {dataset_name}: {dataset_config.get('percentage')}% (scales with remaining samples)")
+            else:
+                logger.warning(f"  - {dataset_name}: No allocation strategy specified!")
+        
+        logger.info(f"📊 Allocation strategy: {len(priority_datasets)} priority datasets, {len(percentage_datasets)} percentage-based datasets")
         
         # Load instruction datasets
         logger.info("📥 Loading instruction datasets...")
@@ -116,7 +128,9 @@ def preprocess_instruction_datasets(
         )
         
         load_time = time.time() - start_time
-        logger.info(f"✅ Loaded {len(train_instruction_data)} training and {len(val_instruction_data)} validation samples in {load_time:.2f} seconds")
+        actual_train_samples = len(train_instruction_data)
+        actual_val_samples = len(val_instruction_data)
+        logger.info(f"✅ Loaded {actual_train_samples:,} training and {actual_val_samples:,} validation samples in {load_time:.2f} seconds")
         
         # Save the datasets
         logger.info("💾 Saving instruction datasets...")
@@ -168,16 +182,71 @@ def preprocess_instruction_datasets(
             json.dump(metadata, f, indent=2)
         
         # Save individual dataset information
+        # Calculate expected samples based on allocation strategy (similar to preprocess_datasets.py)
         individual_datasets = {}
+        fixed_samples_total = 0
+        
+        # First pass: calculate fixed samples (use_all_available)
         for dataset_name, config_data in pretraining_datasets.items():
-            percentage = config_data.get("percentage", 0)
-            expected_samples = int(total_samples * (percentage / 100.0))
-            individual_datasets[dataset_name] = {
-                "percentage": percentage,
-                "expected_train_samples": expected_samples,
-                "expected_val_samples": max(int(expected_samples // 10), 10),
-                "subset": config_data.get("subset"),
-            }
+            if config_data.get("use_all_available", False):
+                # Will use all available - we don't know exact count, but note it
+                individual_datasets[dataset_name] = {
+                    "allocation_strategy": "use_all_available",
+                    "expected_train_samples": "all_available",  # Unknown until processed
+                    "expected_val_samples": "all_available",  # Unknown until processed
+                    "subset": config_data.get("subset"),
+                    "task_type": "instruction"
+                }
+            elif config_data.get("percentage", 0) > 0:
+                # Will be calculated in second pass based on remaining samples
+                pass
+        
+        # Estimate fixed samples for priority datasets (rough estimate for metadata)
+        # Note: Actual counts will be determined when datasets are loaded
+        priority_estimate = 4_486_000  # From config comments
+        fixed_samples_total = priority_estimate
+        
+        # Second pass: calculate percentage-based allocations
+        remaining_samples = total_samples - fixed_samples_total
+        if remaining_samples < 0:
+            remaining_samples = 0
+            logger.warning(f"⚠️  Priority datasets ({fixed_samples_total:,}) may exceed total_samples ({total_samples:,})")
+        
+        percentage_datasets_dict = {}
+        for dataset_name, config_data in pretraining_datasets.items():
+            if dataset_name not in individual_datasets:  # Not already processed
+                percentage = config_data.get("percentage", 0)
+                if percentage > 0:
+                    percentage_datasets_dict[dataset_name] = percentage
+        
+        # Normalize percentages and calculate expected samples
+        total_percentage = sum(percentage_datasets_dict.values())
+        if total_percentage > 0 and remaining_samples > 0:
+            for dataset_name, percentage in percentage_datasets_dict.items():
+                config_data = pretraining_datasets[dataset_name]
+                # Calculate based on normalized percentage of remaining samples
+                expected_train_samples = int(remaining_samples * (percentage / total_percentage))
+                expected_val_samples = max(int(expected_train_samples // 10), 10)
+                individual_datasets[dataset_name] = {
+                    "allocation_strategy": "percentage",
+                    "percentage": percentage,
+                    "expected_train_samples": expected_train_samples,
+                    "expected_val_samples": expected_val_samples,
+                    "subset": config_data.get("subset"),
+                    "task_type": "instruction"
+                }
+        elif total_percentage > 0:
+            # No remaining samples after fixed allocations
+            for dataset_name, percentage in percentage_datasets_dict.items():
+                config_data = pretraining_datasets[dataset_name]
+                individual_datasets[dataset_name] = {
+                    "allocation_strategy": "percentage",
+                    "percentage": percentage,
+                    "expected_train_samples": 0,  # No samples available
+                    "expected_val_samples": 0,
+                    "subset": config_data.get("subset"),
+                    "task_type": "instruction"
+                }
         
         with open(metadata_dir / "individual_datasets.json", 'w') as f:
             json.dump(individual_datasets, f, indent=2)
@@ -185,13 +254,24 @@ def preprocess_instruction_datasets(
         logger.info("📋 Saved metadata files")
         
         # Print summary
+        actual_total_samples = actual_train_samples + actual_val_samples
+        samples_difference = actual_total_samples - total_samples
+        
         logger.info("=" * 60)
         logger.info("📊 PREPROCESSING SUMMARY")
         logger.info("=" * 60)
         logger.info(f"Stage: {stage}")
-        logger.info(f"Training samples: {len(train_instruction_data):,}")
-        logger.info(f"Validation samples: {len(val_instruction_data):,}")
-        logger.info(f"Total samples: {len(combined_dataset):,}")
+        logger.info(f"Target samples: {total_samples:,}")
+        logger.info(f"Training samples: {actual_train_samples:,}")
+        logger.info(f"Validation samples: {actual_val_samples:,}")
+        logger.info(f"Total samples: {actual_total_samples:,}")
+        if samples_difference != 0:
+            diff_percent = (samples_difference / total_samples) * 100 if total_samples > 0 else 0
+            logger.info(f"Difference: {samples_difference:+,} ({diff_percent:+.2f}%)")
+            if abs(diff_percent) > 1.0:  # More than 1% difference
+                logger.warning(f"⚠️  Sample count differs from target by {abs(diff_percent):.2f}%")
+        else:
+            logger.info("✅ Sample count matches target exactly!")
         logger.info(f"Loading time: {load_time:.2f} seconds")
         logger.info(f"Saving time: {save_time:.2f} seconds")
         logger.info(f"Total time: {load_time + save_time:.2f} seconds")
@@ -201,7 +281,21 @@ def preprocess_instruction_datasets(
         # Print individual dataset breakdown
         logger.info("📈 DATASET BREAKDOWN:")
         for dataset_name, info in individual_datasets.items():
-            logger.info(f"  - {dataset_name}: {info['expected_train_samples']:,} train + {info['expected_val_samples']:,} val ({info['percentage']}%)")
+            strategy = info.get("allocation_strategy", "unknown")
+            if strategy == "use_all_available":
+                logger.info(f"  - {dataset_name}: all available samples ({strategy})")
+            elif strategy == "percentage":
+                pct = info.get("percentage", 0)
+                train_samples = info.get("expected_train_samples", 0)
+                val_samples = info.get("expected_val_samples", 0)
+                if isinstance(train_samples, int) and isinstance(val_samples, int):
+                    logger.info(f"  - {dataset_name}: {train_samples:,} train + {val_samples:,} val ({pct}% of remaining)")
+                else:
+                    logger.info(f"  - {dataset_name}: {train_samples} train + {val_samples} val ({pct}% of remaining)")
+            else:
+                train_samples = info.get("expected_train_samples", "unknown")
+                val_samples = info.get("expected_val_samples", "unknown")
+                logger.info(f"  - {dataset_name}: {train_samples} train + {val_samples} val")
         
         logger.info("=" * 60)
         logger.info("✅ Instruction dataset preprocessing completed successfully!")
@@ -253,7 +347,7 @@ def main():
                        choices=["stage1_inst_SFT"],
                        help="Training stage to preprocess (currently only stage1_inst_SFT supported)")
     
-    parser.add_argument("--total_samples", type=int, default=100000,
+    parser.add_argument("--total_samples", type=int, default=10000000,
                        help="Total number of samples to process")
     
     parser.add_argument("--config", type=str, default="configs/config_production.yaml",
