@@ -284,76 +284,80 @@ training_stages:
       # Reference: https://huggingface.co/blog/codelion/optimal-dataset-mixing
       # This mix achieves 90%+ performance with 1/10th the data compared to naive approaches
       pretraining_datasets:
-        # ===== PRIORITY DATASETS (USE ALL SAMPLES FIRST) =====
-        # These 6 datasets are prioritized - they will contribute the majority of samples
-        # All samples from these datasets will be used first before moving to remaining datasets
-        # Percentages are based on actual sample counts (total: 4,639,172 samples)
-        # Allocation scaled to 87% total for priority datasets
+        # ===== PRIORITY DATASETS (USE ALL AVAILABLE SAMPLES) =====
+        # These 6 datasets are prioritized - they will use ALL available samples
+        # Total priority samples: 4,639,172 samples
+        # These are fixed and don't scale with total_samples
+        # Remaining samples (total_samples - 4,639,172) will be allocated to remaining datasets
         
-        # Essential web content sample (1,833,333 samples - 39.52% of priority datasets)
+        # Essential web content sample (1,833,333 samples)
         "sumuks/essential-web-v1.0-sample-1B":
-          percentage: 34.38                    # Priority dataset - Essential web content sample
-          subset: null                         # Full 1B token dataset - use all available samples (1,833,333 samples)
+          use_all_available: true              # Priority dataset - Use all available samples (1,833,333 samples)
+          subset: null                         # Full 1B token dataset
           # Reference: https://huggingface.co/datasets/sumuks/essential-web-v1.0-sample-1B
         
-        # Curated educational web resources (970,397 samples - 20.92% of priority datasets)
+        # Curated educational web resources (970,397 samples)
         "codelion/fineweb-edu-1B":
-          percentage: 18.20                    # Priority dataset - FineWeb-Edu: curated educational web resources
-          subset: null                         # Full 1B token dataset - use all available samples (970,397 samples)
+          use_all_available: true              # Priority dataset - Use all available samples (970,397 samples)
+          subset: null                         # Full 1B token dataset
           # Reference: https://huggingface.co/datasets/codelion/fineweb-edu-1B
         
-        # Synthetic educational content (822,230 samples - 17.72% of priority datasets)
+        # Synthetic educational content (822,230 samples)
         "codelion/synth-1B":
-          percentage: 15.42                    # Priority dataset - Synthetic content dataset
-          subset: null                         # Full 1B token dataset - use all available samples (822,230 samples)
+          use_all_available: true              # Priority dataset - Use all available samples (822,230 samples)
+          subset: null                         # Full 1B token dataset
           # Reference: https://huggingface.co/datasets/codelion/synth-1B
         
-        # Filtered, diverse web content (774,229 samples - 16.69% of priority datasets)
+        # Filtered, diverse web content (774,229 samples)
         "codelion/dclm-baseline-1B":
-          percentage: 14.52                    # Priority dataset - DCLM-baseline: filtered, diverse web content
-          subset: null                         # Full 1B token dataset - use all available samples (774,229 samples)
+          use_all_available: true              # Priority dataset - Use all available samples (774,229 samples)
+          subset: null                         # Full 1B token dataset
           # Reference: https://huggingface.co/datasets/codelion/dclm-baseline-1B
         
-        # High-quality textbook-style PDFs (186,262 samples - 4.01% of priority datasets)
+        # High-quality textbook-style PDFs (186,262 samples)
         "codelion/finepdfs-1B":
-          percentage: 3.49                     # Priority dataset - High-quality textbook-style PDFs
-          subset: null                         # Full 1B token dataset - use all available samples (186,262 samples)
+          use_all_available: true              # Priority dataset - Use all available samples (186,262 samples)
+          subset: null                         # Full 1B token dataset
           # Reference: https://huggingface.co/datasets/codelion/finepdfs-1B
         
-        # High-quality Wikipedia content (52,721 samples - 1.14% of priority datasets)
+        # High-quality Wikipedia content (52,721 samples)
         "codelion/finewiki-1B":
-          percentage: 0.99                     # Priority dataset - High-quality Wikipedia content
-          subset: null                         # Full 1B token dataset - use all available samples (52,721 samples)
+          use_all_available: true              # Priority dataset - Use all available samples (52,721 samples)
+          subset: null                         # Full 1B token dataset
           # Reference: https://huggingface.co/datasets/codelion/finewiki-1B
         
-        # Priority datasets total: 87.0% (these will contribute most samples)
-        # Based on actual sample counts: 4,639,172 total samples
+        # Priority datasets total: 4,639,172 samples (fixed, doesn't scale with total_samples)
+        # For 20M total_samples: priority = 23.20%, remaining = 76.80% (15,360,828 samples)
         
-        # ===== REMAINING DATASETS (FILL REMAINING ALLOCATION) =====
-        # These datasets will contribute samples after priority datasets are used
-        # Hugging Face pretraining datasets with percentage allocation
+        # ===== REMAINING DATASETS (PERCENTAGE-BASED ALLOCATION) =====
+        # These datasets use percentage allocation that scales with remaining samples
+        # Percentages are calculated from remaining samples (total_samples - priority_samples)
+        # For 20M total_samples: remaining = 15,360,828 samples
+        # Percentages are normalized automatically to sum to 100% of remaining samples
+        
+        # High-quality web content dataset (FineWeb-Edu category)
         "HuggingFaceFW/fineweb":
-          percentage: 3.0                      # High-quality web content dataset (FineWeb-Edu category)
+          percentage: 23.08                    # ~23% of remaining samples (scales with total_samples)
           subset: "sample-10BT"               # 10 billion token sample
         
         # Math and reasoning datasets (finePDFs-like educational content)
         "HuggingFaceTB/finemath":
-          percentage: 2.0                      # Math content subset (finePDFs category - educational/math content)
+          percentage: 15.38                    # ~15% of remaining samples (scales with total_samples)
           subset: "finemath-3plus"             # Math content subset
         
         # Curated content (DCLM-baseline variant)
         "mlfoundations/dclm-baseline-1.0":
-          percentage: 2.5                      # DCLM-baseline variant: curated content (DCLM-baseline category)
+          percentage: 19.23                    # ~19% of remaining samples (scales with total_samples)
           subset: null                         # 187k tokens - Curated content
         
         # Synthetic educational content (finePDFs-like)
         "HuggingFaceTB/cosmopedia":
-          percentage: 2.0                      # Synthetic textbooks subset (finePDFs category - synthetic educational)
+          percentage: 15.38                    # ~15% of remaining samples (scales with total_samples)
           subset: "auto_math_text"             # Synthetic textbooks subset
 
         # FineWeb-Edu variant (nanochat dataset)
         "karpathy/fineweb-edu-100b-shuffle":
-          percentage: 1.0                      # FineWeb-Edu variant: educational web content (FineWeb-Edu category)
+          percentage: 7.69                     # ~8% of remaining samples (scales with total_samples)
           subset: null                         # 100 billion token sample
         
         # ===== CODE DATASETS (high-quality structured content) =====
@@ -361,26 +365,31 @@ training_stages:
         # Includes code question-answer pairs in 11 programming languages
         # Note: Dataset may use 'code', 'content', or 'text' fields - dataset loader handles all
         "nvidia/Nemotron-Pretraining-Code-v1":
-          percentage: 2.5                      # High-quality code dataset (finePDFs category - structured/educational)
-          subset: Synthetic_Code                         # Full dataset (174.9B tokens of synthetic code + curated GitHub code)
+          percentage: 19.23                    # ~19% of remaining samples (scales with total_samples)
+          subset: Synthetic-Code               # Full dataset (174.9B tokens of synthetic code + curated GitHub code)
           # Note: This dataset requires accepting NVIDIA Data Agreement for Model Training
           # The dataset includes both raw code and code Q&A pairs
           # Dataset loader will extract text from 'code', 'content', or 'text' fields automatically
           # Reference: https://huggingface.co/datasets/nvidia/Nemotron-Pretraining-Code-v1
         
-        # Remaining datasets total: 13.0%
-        # Total: 100.0% (87.0% priority + 13.0% remaining)
+        # Remaining datasets percentages total: ~100% (normalized automatically)
+        # These percentages scale with total_samples - if you change total_samples, 
+        # the remaining samples will be distributed proportionally
         
         # ===== ALLOCATION STRATEGY =====
-        # Priority datasets (87.0%): These 6 datasets will be used exhaustively first
-        # Percentages are based on actual sample counts (total: 4,639,172 samples)
-        # - sumuks/essential-web-v1.0-sample-1B: 34.38% (1,833,333 samples - largest)
-        # - codelion/fineweb-edu-1B: 18.20% (970,397 samples)
-        # - codelion/synth-1B: 15.42% (822,230 samples)
-        # - codelion/dclm-baseline-1B: 14.52% (774,229 samples)
-        # - codelion/finepdfs-1B: 3.49% (186,262 samples)
-        # - codelion/finewiki-1B: 0.99% (52,721 samples - smallest)
-        # Remaining datasets (13.0%): Used to fill remaining allocation after priority datasets
+        # Priority datasets: Use ALL available samples (fixed: 4,639,172 samples)
+        # - sumuks/essential-web-v1.0-sample-1B: 1,833,333 samples (largest)
+        # - codelion/fineweb-edu-1B: 970,397 samples
+        # - codelion/synth-1B: 822,230 samples
+        # - codelion/dclm-baseline-1B: 774,229 samples
+        # - codelion/finepdfs-1B: 186,262 samples
+        # - codelion/finewiki-1B: 52,721 samples (smallest)
+        # 
+        # Remaining datasets: Percentage-based allocation (scales with total_samples)
+        # - Percentages are calculated from: remaining_samples = total_samples - 4,639,172
+        # - For 20M total_samples: remaining = 15,360,828 samples
+        # - Percentages are automatically normalized to sum to 100% of remaining samples
+        # - If you change total_samples, remaining datasets will scale proportionally
       
       # Data loading performance options (optimized for GH200 with 72 CPU cores)
       num_workers: 64                # Reduced from 16 to minimize overhead and contention

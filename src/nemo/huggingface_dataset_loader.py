@@ -737,29 +737,73 @@ class HuggingFaceDatasetLoader:
             List of training samples
         """
         try:
-            # Calculate samples per dataset based on percentages
+            # Calculate samples per dataset using flexible allocation (same as standard streaming)
+            # 1. max_samples: absolute count (doesn't scale with total_samples)
+            # 2. use_all_available: use all samples from dataset (will be determined at runtime)
+            # 3. percentage: proportional allocation (scales with total_samples)
             dataset_samples = {}
+            fixed_samples = {}  # Datasets with fixed counts
+            percentage_datasets = {}  # Datasets using percentages
+            all_available_datasets = []  # Datasets that should use all available
+            
+            # First pass: identify allocation strategy for each dataset
             for dataset_name, config in self.datasets_config.items():
-                percentage = config.get("percentage", 0)
-                samples = int(total_samples * (percentage / 100.0))
-                dataset_samples[dataset_name] = samples
-                logger.info(f"Allocated {samples} samples ({percentage}%) for {dataset_name}")
+                if config.get("use_all_available", False):
+                    all_available_datasets.append(dataset_name)
+                    logger.info(f"{dataset_name}: Will use all available samples")
+                elif "max_samples" in config:
+                    max_samples = config.get("max_samples")
+                    fixed_samples[dataset_name] = max_samples
+                    dataset_samples[dataset_name] = max_samples
+                    logger.info(f"Allocated {max_samples:,} samples (fixed max_samples) for {dataset_name}")
+                elif config.get("percentage", 0) > 0:
+                    percentage_datasets[dataset_name] = config.get("percentage")
+                else:
+                    logger.warning(f"{dataset_name}: No allocation strategy specified (percentage, max_samples, or use_all_available)")
+            
+            # Calculate remaining samples for percentage-based allocation
+            fixed_total = sum(fixed_samples.values())
+            remaining_samples = total_samples - fixed_total
+            
+            if remaining_samples < 0:
+                logger.warning(f"Fixed samples ({fixed_total:,}) exceed total_samples ({total_samples:,}). "
+                             f"Percentage-based datasets will get 0 samples.")
+                remaining_samples = 0
+            
+            # Calculate percentage-based allocations
+            total_percentage = sum(percentage_datasets.values())
+            if total_percentage > 0 and remaining_samples > 0:
+                for dataset_name, percentage in percentage_datasets.items():
+                    samples = int(remaining_samples * (percentage / total_percentage))
+                    dataset_samples[dataset_name] = samples
+                    logger.info(f"Allocated {samples:,} samples ({percentage}% of remaining {remaining_samples:,}) for {dataset_name}")
+            elif total_percentage > 0:
+                logger.warning("Percentage-based datasets specified but no remaining samples after fixed allocations")
             
             training_data = []
             total_processed = 0
             
             for dataset_name, config in self.datasets_config.items():
-                percentage = config.get("percentage", 0)
                 subset = config.get("subset")
                 subsets = config.get("subsets")
                 task_type = config.get("task_type", "general")
-                target_samples = dataset_samples[dataset_name]
+                use_all_available = config.get("use_all_available", False)
                 
-                if target_samples == 0:
-                    logger.info(f"Skipping {dataset_name} (0 samples allocated)")
+                # Determine target samples
+                if use_all_available:
+                    # Will use all available samples (no limit)
+                    target_samples = None  # None means use all available
+                    logger.info(f"🚀 Buffered streaming {dataset_name} for {self.stage} - {task_type} (using ALL available samples)")
+                elif dataset_name in dataset_samples:
+                    target_samples = dataset_samples[dataset_name]
+                    if target_samples == 0:
+                        logger.info(f"Skipping {dataset_name} (0 samples allocated)")
+                        continue
+                    allocation_type = "max_samples" if dataset_name in fixed_samples else "percentage"
+                    logger.info(f"🚀 Buffered streaming {dataset_name} for {self.stage} - {task_type} (target: {target_samples:,} samples, {allocation_type})")
+                else:
+                    logger.warning(f"Skipping {dataset_name} (no allocation strategy)")
                     continue
-                
-                logger.info(f"🚀 Buffered streaming {dataset_name} ({percentage}%) for {self.stage} - {task_type} (target: {target_samples} samples)")
                 
                 try:
                     # Load streaming dataset
@@ -771,16 +815,31 @@ class HuggingFaceDatasetLoader:
                         # For multiple subsets, we'll process them one by one
                         for sub in subsets:
                             sub_dataset = load_dataset(dataset_name, sub, split="train", streaming=True, cache_dir=cache_dir)
-                            sub_target = target_samples // len(subsets)
-                            self._process_buffered_streaming_dataset(sub_dataset, training_data, sub_target, task_type, total_processed, buffer_samples, refill_threshold)
-                            total_processed += sub_target
+                            if target_samples is not None:
+                                sub_target = target_samples // len(subsets)
+                            else:
+                                sub_target = None  # Use all available
+                            effective_sub_target = sub_target if sub_target is not None else 10**9
+                            self._process_buffered_streaming_dataset(
+                                sub_dataset, training_data, effective_sub_target, task_type, total_processed, buffer_samples, refill_threshold,
+                                dataset_name=dataset_name, subset=sub, cache_dir=cache_dir
+                            )
+                            if sub_target is not None:
+                                total_processed += sub_target
                         continue
                     else:
                         dataset = load_dataset(dataset_name, split="train", streaming=True, cache_dir=cache_dir)
                     
                     # Process streaming dataset with buffer
-                    self._process_buffered_streaming_dataset(dataset, training_data, target_samples, task_type, total_processed, buffer_samples, refill_threshold)
-                    total_processed += target_samples
+                    # If target_samples is None, use a very large number to get all samples
+                    effective_target = target_samples if target_samples is not None else 10**9
+                    self._process_buffered_streaming_dataset(
+                        dataset, training_data, effective_target, task_type, total_processed, buffer_samples, refill_threshold,
+                        dataset_name=dataset_name, subset=subset, cache_dir=cache_dir
+                    )
+                    # Update total_processed based on actual samples collected
+                    if target_samples is not None:
+                        total_processed += target_samples
                     
                 except Exception as dataset_error:
                     logger.error(f"Failed to load dataset {dataset_name}: {dataset_error}")
@@ -804,29 +863,73 @@ class HuggingFaceDatasetLoader:
             List of training samples
         """
         try:
-            # Calculate samples per dataset based on percentages
+            # Calculate samples per dataset using flexible allocation (same as buffered streaming)
+            # 1. max_samples: absolute count (doesn't scale with total_samples)
+            # 2. use_all_available: use all samples from dataset (will be determined at runtime)
+            # 3. percentage: proportional allocation (scales with total_samples)
             dataset_samples = {}
+            fixed_samples = {}  # Datasets with fixed counts
+            percentage_datasets = {}  # Datasets using percentages
+            all_available_datasets = []  # Datasets that should use all available
+            
+            # First pass: identify allocation strategy for each dataset
             for dataset_name, config in self.datasets_config.items():
-                percentage = config.get("percentage", 0)
-                samples = int(total_samples * (percentage / 100.0))
-                dataset_samples[dataset_name] = samples
-                logger.info(f"Allocated {samples} samples ({percentage}%) for {dataset_name}")
+                if config.get("use_all_available", False):
+                    all_available_datasets.append(dataset_name)
+                    logger.info(f"{dataset_name}: Will use all available samples")
+                elif "max_samples" in config:
+                    max_samples = config.get("max_samples")
+                    fixed_samples[dataset_name] = max_samples
+                    dataset_samples[dataset_name] = max_samples
+                    logger.info(f"Allocated {max_samples:,} samples (fixed max_samples) for {dataset_name}")
+                elif config.get("percentage", 0) > 0:
+                    percentage_datasets[dataset_name] = config.get("percentage")
+                else:
+                    logger.warning(f"{dataset_name}: No allocation strategy specified (percentage, max_samples, or use_all_available)")
+            
+            # Calculate remaining samples for percentage-based allocation
+            fixed_total = sum(fixed_samples.values())
+            remaining_samples = total_samples - fixed_total
+            
+            if remaining_samples < 0:
+                logger.warning(f"Fixed samples ({fixed_total:,}) exceed total_samples ({total_samples:,}). "
+                             f"Percentage-based datasets will get 0 samples.")
+                remaining_samples = 0
+            
+            # Calculate percentage-based allocations
+            total_percentage = sum(percentage_datasets.values())
+            if total_percentage > 0 and remaining_samples > 0:
+                for dataset_name, percentage in percentage_datasets.items():
+                    samples = int(remaining_samples * (percentage / total_percentage))
+                    dataset_samples[dataset_name] = samples
+                    logger.info(f"Allocated {samples:,} samples ({percentage}% of remaining {remaining_samples:,}) for {dataset_name}")
+            elif total_percentage > 0:
+                logger.warning("Percentage-based datasets specified but no remaining samples after fixed allocations")
             
             training_data = []
             total_processed = 0
             
             for dataset_name, config in self.datasets_config.items():
-                percentage = config.get("percentage", 0)
                 subset = config.get("subset")
                 subsets = config.get("subsets")
                 task_type = config.get("task_type", "general")
-                target_samples = dataset_samples[dataset_name]
+                use_all_available = config.get("use_all_available", False)
                 
-                if target_samples == 0:
-                    logger.info(f"Skipping {dataset_name} (0 samples allocated)")
+                # Determine target samples
+                if use_all_available:
+                    # Will use all available samples (no limit)
+                    target_samples = None  # None means use all available
+                    logger.info(f"📊 Streaming {dataset_name} for {self.stage} - {task_type} (using ALL available samples)")
+                elif dataset_name in dataset_samples:
+                    target_samples = dataset_samples[dataset_name]
+                    if target_samples == 0:
+                        logger.info(f"Skipping {dataset_name} (0 samples allocated)")
+                        continue
+                    allocation_type = "max_samples" if dataset_name in fixed_samples else "percentage"
+                    logger.info(f"📊 Streaming {dataset_name} for {self.stage} - {task_type} (target: {target_samples:,} samples, {allocation_type})")
+                else:
+                    logger.warning(f"Skipping {dataset_name} (no allocation strategy)")
                     continue
-                
-                logger.info(f"Streaming {dataset_name} ({percentage}%) for {self.stage} - {task_type} (target: {target_samples} samples)")
                 
                 try:
                     # Load streaming dataset
@@ -838,16 +941,35 @@ class HuggingFaceDatasetLoader:
                         # For multiple subsets, we'll process them one by one
                         for sub in subsets:
                             sub_dataset = load_dataset(dataset_name, sub, split="train", streaming=True, cache_dir=cache_dir)
-                            sub_target = target_samples // len(subsets)
-                            self._process_streaming_dataset(sub_dataset, training_data, sub_target, task_type, total_processed)
-                            total_processed += sub_target
+                            if target_samples is not None:
+                                sub_target = target_samples // len(subsets)
+                            else:
+                                sub_target = None  # Use all available
+                            effective_sub_target = sub_target if sub_target is not None else 10**9
+                            self._process_streaming_dataset(
+                                sub_dataset, training_data, effective_sub_target, task_type, total_processed,
+                                dataset_name=dataset_name, subset=sub, cache_dir=cache_dir
+                            )
+                            if sub_target is not None:
+                                total_processed += sub_target
                         continue
                     else:
                         dataset = load_dataset(dataset_name, split="train", streaming=True, cache_dir=cache_dir)
                     
                     # Process streaming dataset
-                    self._process_streaming_dataset(dataset, training_data, target_samples, task_type, total_processed)
-                    total_processed += target_samples
+                    # If target_samples is None, use a very large number to get all samples
+                    effective_target = target_samples if target_samples is not None else 10**9
+                    self._process_streaming_dataset(
+                        dataset, training_data, effective_target, task_type, total_processed,
+                        dataset_name=dataset_name, subset=subset, cache_dir=cache_dir
+                    )
+                    # Update total_processed based on actual samples collected
+                    if target_samples is not None:
+                        total_processed += target_samples
+                    else:
+                        # For use_all_available, we'll count after processing
+                        # (approximate - actual count is in training_data)
+                        pass
                     
                 except Exception as dataset_error:
                     logger.error(f"Failed to load dataset {dataset_name}: {dataset_error}")
@@ -860,20 +982,25 @@ class HuggingFaceDatasetLoader:
             logger.error(f"Failed to create standard streaming training data: {e}")
             raise
     
-    def _process_streaming_dataset(self, dataset, training_data: List, target_samples: int, task_type: str, start_id: int):
+    def _process_streaming_dataset(self, dataset, training_data: List, target_samples: int, task_type: str, start_id: int,
+                                   dataset_name: Optional[str] = None, subset: Optional[str] = None, cache_dir: Optional[str] = None):
         """
         Process a streaming dataset and add samples to training_data.
+        Stops when dataset is exhausted (percentages should be set to match available samples).
         
         Args:
             dataset: Streaming dataset
             training_data: List to append samples to
-            target_samples: Number of samples to process
+            target_samples: Number of samples to process (target based on percentage)
             task_type: Type of task for processing
             start_id: Starting ID for samples
+            dataset_name: Dataset name (for logging)
+            subset: Dataset subset (for logging)
+            cache_dir: Cache directory (for logging)
         """
         processed_count = 0
         
-        for i, example in enumerate(dataset):
+        for example in dataset:
             if processed_count >= target_samples:
                 break
             
@@ -892,28 +1019,42 @@ class HuggingFaceDatasetLoader:
                     logger.info(f"Processed {processed_count}/{target_samples} samples...")
                     
             except Exception as e:
-                logger.warning(f"Failed to process sample {i}: {e}")
+                logger.warning(f"Failed to process sample: {e}")
                 continue
         
-        logger.info(f"Processed {processed_count} samples from streaming dataset")
+        # Log final status
+        if processed_count < target_samples:
+            logger.warning(
+                f"⚠️  Dataset {dataset_name} exhausted: Only processed {processed_count:,}/{target_samples:,} samples "
+                f"({(processed_count/target_samples)*100:.1f}%). "
+                f"This suggests the percentage allocation may exceed available samples. "
+                f"Consider adjusting percentages in config to match actual dataset sizes."
+            )
+        else:
+            logger.info(f"✅ Successfully processed {processed_count:,}/{target_samples:,} samples from {dataset_name}")
     
-    def _process_buffered_streaming_dataset(self, dataset, training_data: List, target_samples: int, task_type: str, start_id: int, buffer_samples: int, refill_threshold: float):
+    def _process_buffered_streaming_dataset(self, dataset, training_data: List, target_samples: int, task_type: str, start_id: int, buffer_samples: int, refill_threshold: float,
+                                            dataset_name: Optional[str] = None, subset: Optional[str] = None, cache_dir: Optional[str] = None):
         """
         Process a streaming dataset using buffered approach optimized for GH200.
+        Stops when dataset is exhausted (percentages should be set to match available samples).
         
         Args:
             dataset: Streaming dataset
             training_data: List to append samples to
-            target_samples: Number of samples to process
+            target_samples: Number of samples to process (target based on percentage)
             task_type: Type of task for processing
             start_id: Starting ID for samples
             buffer_samples: Number of samples to keep in buffer
             refill_threshold: Refill buffer when this fraction is consumed
+            dataset_name: Dataset name (for logging)
+            subset: Dataset subset (for logging)
+            cache_dir: Cache directory (for logging)
         """
         try:
             # Create buffered streaming dataset
             buffered_dataset = BufferedStreamingDataset(
-                dataset=dataset,  # Pass the dataset, not iterator
+                dataset=dataset,
                 buffer_size=buffer_samples,
                 refill_threshold=refill_threshold
             )
@@ -945,7 +1086,16 @@ class HuggingFaceDatasetLoader:
             # Clean up buffered dataset
             buffered_dataset.close()
             
-            logger.info(f"✅ Buffered processed {processed_count} samples from streaming dataset")
+            # Log final status
+            if processed_count < target_samples:
+                logger.warning(
+                    f"⚠️  Dataset {dataset_name} exhausted: Only processed {processed_count:,}/{target_samples:,} samples "
+                    f"({(processed_count/target_samples)*100:.1f}%). "
+                    f"This suggests the percentage allocation may exceed available samples. "
+                    f"Consider adjusting percentages in config to match actual dataset sizes."
+                )
+            else:
+                logger.info(f"✅ Successfully processed {processed_count:,}/{target_samples:,} samples from {dataset_name}")
             
         except Exception as e:
             logger.error(f"Failed to process buffered streaming dataset: {e}")
