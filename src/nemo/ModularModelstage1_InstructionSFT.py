@@ -2748,6 +2748,11 @@ def train_production_mode(
         datasets_already_tokenized = False
     
     if not datasets_already_tokenized:
+        # Save original sizes before concatenation (needed for split after filtering)
+        original_train_size = len(train_hf_dataset)
+        original_val_size = len(val_hf_dataset)
+        original_total_size = original_train_size + original_val_size
+        
         # Combine train and val for processing, then split later
         from datasets import concatenate_datasets
         hf_dataset = concatenate_datasets([train_hf_dataset, val_hf_dataset])
@@ -2756,6 +2761,36 @@ def train_production_mode(
         # Just verify it has the tokens we need
         # Get sequence length from config
         seq_length = config.get("sequence_length", 2048)
+        
+        # Check if truncation should be disabled (better for instruction tuning)
+        # When disabled, we preserve full answers but skip extremely long samples
+        data_config = config.get("data", {})
+        processing_config = data_config.get("processing", {})
+        enable_truncation_raw = processing_config.get("enable_truncation", True)
+        max_tokens_per_sample = processing_config.get("max_tokens_per_sample", 16384)
+        
+        # Handle YAML boolean parsing (sometimes "false" string instead of False boolean)
+        if isinstance(enable_truncation_raw, str):
+            enable_truncation = enable_truncation_raw.lower() in ('true', '1', 'yes', 'on')
+            logging.warning(f"⚠️ enable_truncation was a string '{enable_truncation_raw}', converted to {enable_truncation}")
+        else:
+            enable_truncation = bool(enable_truncation_raw)
+        
+        # Log the raw config value for debugging
+        logging.info(f"📋 Config check - enable_truncation: {enable_truncation} (raw: {enable_truncation_raw}, type: {type(enable_truncation_raw).__name__})")
+        logging.info(f"📋 Config check - max_tokens_per_sample: {max_tokens_per_sample}")
+        
+        # If truncation is disabled, use a very high limit to preserve full sequences
+        # But still have a safety limit to prevent OOM (skip samples above this)
+        if not enable_truncation:
+            seq_length = max_tokens_per_sample  # Use max_tokens_per_sample as the limit
+            safety_limit = 32768  # Skip samples longer than this to prevent OOM
+            logging.info(f"🔄 Truncation DISABLED: Using max_tokens_per_sample={max_tokens_per_sample}, safety_limit={safety_limit}")
+            logging.info(f"   - Samples > {safety_limit} tokens will be SKIPPED (not truncated)")
+        else:
+            safety_limit = seq_length  # When truncation enabled, safety limit equals seq_length
+            logging.info(f"🔄 Truncation ENABLED: Using sequence_length={seq_length}")
+            logging.info(f"   - Samples will be TRUNCATED (smart truncation prioritizes answer tokens)")
         
         # Special tokens for instruction format (simpler than stage2 - no reasoning token)
         instruction_token = "<|instruction|>"
@@ -2824,13 +2859,37 @@ def train_production_mode(
         def tokenize_instruction_function(examples):
             """Tokenize instruction examples with proper masking for instruction SFT.
             
-            Uses SMART TRUNCATION:
-            - Prioritizes keeping answer tokens (what we're training on)
+            When truncation is ENABLED:
+            - Uses SMART TRUNCATION: Prioritizes keeping answer tokens
             - Truncates from question side if needed
             - Only truncates answer as last resort
+            
+            When truncation is DISABLED:
+            - Preserves full sequences (no truncation)
+            - Skips samples that exceed safety_limit to prevent OOM
+            - Better for instruction tuning (preserves full answers)
             """
-            # Handle both messages format and question/answer format
-            batch_size = len(examples.get('question', examples.get('messages', [])))
+            # Verify closure captured the correct values (log once per batch)
+            if not hasattr(tokenize_instruction_function, '_logged_config'):
+                #logging.info(f"🔍 Tokenization function - enable_truncation={enable_truncation}, seq_length={seq_length}, safety_limit={safety_limit}")
+                tokenize_instruction_function._logged_config = True
+            
+            # Handle both batched and non-batched modes
+            # When batched=True, examples is a dict with lists
+            # When batched=False, examples is a dict with single values
+            if isinstance(examples.get('question', examples.get('messages', [])), list):
+                # Batched mode
+                batch_size = len(examples.get('question', examples.get('messages', [])))
+                is_batched = True
+            else:
+                # Non-batched mode - convert to list format for uniform processing
+                batch_size = 1
+                is_batched = False
+                # Convert single values to lists
+                for key in examples:
+                    if not isinstance(examples[key], list):
+                        examples[key] = [examples[key]]
+            
             input_ids_list = []
             attention_mask_list = []
             labels_list = []
@@ -2838,6 +2897,7 @@ def train_production_mode(
             # Track statistics for logging
             stats = {
                 'total': 0,
+                'skipped': 0,
                 'question_truncated': 0,
                 'answer_truncated': 0,
                 'min_answer_tokens': float('inf'),
@@ -2855,42 +2915,138 @@ def train_production_mode(
                 else:
                     system = None
                 
+                # Skip samples with empty or very short answers early
+                if not answer or len(answer.strip()) < 3:
+                    if i == 0:
+                        #logging.debug(f"⚠️ Skipping sample {i}: empty or very short answer")
+                        pass
+                    stats['skipped'] += 1
+                    continue
+                
                 # Initialize response_token_ids for both code paths
                 response_token_ids = tokenizer.encode(response_token, add_special_tokens=False)
                 
                 # Use chat template if messages are available, otherwise use fallback format
                 if messages and isinstance(messages, list):
-                    # Use chat template formatting
-                    formatted_text = format_messages_with_chat_template(
-                        messages=messages,
-                        question=question,
-                        answer=answer,
-                        system=system,
-                        tokenizer=tokenizer
-                    )
-                    # For chat template format, tokenize the full text
-                    input_ids = tokenizer.encode(
-                        formatted_text,
-                        add_special_tokens=True,
-                        truncation=True,
-                        max_length=seq_length
-                    )
+                    # Use chat template formatting with SMART TRUNCATION
+                    # Tokenize answer separately to ensure it's preserved
+                    answer_only_ids = tokenizer.encode(answer, add_special_tokens=False) if answer else []
+                    end_token_ids = tokenizer.encode(end_token, add_special_tokens=False)
+                    
+                    # Reserve space for answer + end token (minimum 50 tokens for answer)
+                    min_answer_tokens = 50
+                    reserved_for_answer = max(len(answer_only_ids) + len(end_token_ids), min_answer_tokens)
+                    
+                    # Format and tokenize the prompt part (without answer)
+                    # Find the last assistant message to separate prompt from answer
+                    prompt_messages = []
+                    assistant_answer = ""
+                    for msg in messages:
+                        if msg.get('role') == 'assistant':
+                            assistant_answer = msg.get('content', '')
+                            break
+                        prompt_messages.append(msg)
+                    
+                    # If we couldn't find assistant message, use fallback
+                    if not assistant_answer and answer:
+                        assistant_answer = answer
+                    
+                    # Format prompt part (without assistant answer)
+                    if prompt_messages:
+                        try:
+                            prompt_text = tokenizer.apply_chat_template(
+                                prompt_messages,
+                                tokenize=False,
+                                add_generation_prompt=True  # Add assistant prompt
+                            )
+                        except:
+                            # Fallback: construct prompt manually
+                            prompt_parts = []
+                            for msg in prompt_messages:
+                                role = msg.get('role', 'user')
+                                content = msg.get('content', '')
+                                if role == 'system':
+                                    prompt_parts.append(f"System: {content}")
+                                elif role == 'user':
+                                    prompt_parts.append(f"User: {content}")
+                            prompt_text = "\n".join(prompt_parts) + "\nAssistant: "
+                    else:
+                        # No messages, use question/answer format
+                        prompt_text = question if question else ""
+                    
+                    # CRITICAL BUG FIX: Use add_special_tokens=False to match inference
+                    # Inference uses add_special_tokens=False for stage1_inst_SFT
+                    # Adding BOS/EOS tokens during training but not inference causes token sequence mismatch
+                    # Tokenize prompt (with or without truncation based on config)
+                    if enable_truncation:
+                        max_prompt_length = max(0, seq_length - reserved_for_answer - 10)  # Buffer
+                        prompt_ids = tokenizer.encode(
+                            prompt_text,
+                            add_special_tokens=False,  # FIXED: Changed from True to False to match inference
+                            truncation=True,
+                            max_length=max_prompt_length
+                        ) if prompt_text else []
+                    else:
+                        # No truncation: tokenize full prompt
+                        prompt_ids = tokenizer.encode(
+                            prompt_text,
+                            add_special_tokens=False,  # FIXED: Changed from True to False to match inference
+                            truncation=False
+                        ) if prompt_text else []
+                    
+                    # Tokenize answer (with or without truncation)
+                    if enable_truncation:
+                        max_answer_length = seq_length - len(prompt_ids) - len(end_token_ids) - 5
+                        if max_answer_length > 0 and answer:
+                            answer_ids = tokenizer.encode(
+                                answer,
+                                add_special_tokens=False,
+                                truncation=True,
+                                max_length=max_answer_length
+                            )
+                        else:
+                            answer_ids = answer_only_ids[:max(0, max_answer_length)] if answer else []
+                    else:
+                        # No truncation: tokenize full answer
+                        answer_ids = tokenizer.encode(
+                            answer,
+                            add_special_tokens=False,
+                            truncation=False
+                        ) if answer else []
+                    
+                    # Combine: prompt + answer + end_token
+                    input_ids = prompt_ids + answer_ids + end_token_ids
+                    
+                    # Check if sample exceeds limits
+                    if not enable_truncation and len(input_ids) > safety_limit:
+                        # Skip extremely long samples when truncation is disabled
+                        if i == 0:
+                            #logging.debug(f"⚠️ Skipping sample {i}: too long ({len(input_ids)} > {safety_limit} tokens) when truncation disabled")
+                            pass
+                        stats['skipped'] += 1
+                        continue
+                    
+                    # Final truncation if still too long (only when truncation enabled)
+                    if enable_truncation and len(input_ids) > seq_length:
+                        # Truncate from prompt side to preserve answer
+                        excess = len(input_ids) - seq_length
+                        if excess < len(prompt_ids):
+                            prompt_ids = prompt_ids[excess:]
+                            input_ids = prompt_ids + answer_ids + end_token_ids
+                        else:
+                            # Prompt completely truncated, keep only answer
+                            input_ids = answer_ids[:seq_length - len(end_token_ids)] + end_token_ids
+                    
                     attention_mask = [1] * len(input_ids)
                     
-                    # Find where assistant response starts by searching for response_token
-                    # Search from the end backwards (response token should be near the end)
-                    response_start_idx = None
+                    # Find where assistant response starts (after prompt)
+                    response_start_idx = len(prompt_ids)
+                    
+                    # Also try to find response_token in case it's present
                     for idx in range(len(input_ids) - len(response_token_ids), -1, -1):
                         if input_ids[idx:idx+len(response_token_ids)] == response_token_ids:
                             response_start_idx = idx + len(response_token_ids)
                             break
-                    
-                    # Fallback heuristic if response token not found (shouldn't happen, but safety)
-                    if response_start_idx is None:
-                        # Use 70% of sequence as conservative estimate
-                        response_start_idx = max(len(input_ids) // 10, int(len(input_ids) * 0.7))
-                        if i == 0:
-                            logging.warning(f"⚠️ Response token not found in chat template format, using heuristic position")
                 else:
                     # Use fallback format: <|instruction|> {system} {question} <|response|> {answer} <|end|>
                     # SMART TRUNCATION: Prioritize keeping the answer (what we're training on)
@@ -2907,52 +3063,67 @@ def train_production_mode(
                     # Construct answer_ids explicitly: response_token + answer + end_token
                     answer_ids = response_token_ids + answer_only_ids + end_token_ids
                     
-                    # Calculate available space for question/system
-                    # Reserve space for: instruction_token + question/system + answer_part
-                    reserved_space = len(instruction_token_ids) + len(answer_ids)
-                    max_question_length = max(0, seq_length - reserved_space - 10)  # Extra 10 tokens buffer
-                    
-                    # Tokenize question/system with truncation if needed
+                    # Tokenize question/system (with or without truncation)
                     question_system_text = ""
                     if system:
                         question_system_text = f"{system} {question}" if question else system
                     else:
                         question_system_text = question
                     
-                    if max_question_length > 0 and question_system_text:
+                    if enable_truncation:
+                        # SMART TRUNCATION: Calculate available space for question/system
+                        reserved_space = len(instruction_token_ids) + len(answer_ids)
+                        max_question_length = max(0, seq_length - reserved_space - 10)  # Extra 10 tokens buffer
+                        
+                        if max_question_length > 0 and question_system_text:
+                            question_ids = tokenizer.encode(
+                                question_system_text,
+                                add_special_tokens=False,
+                                truncation=True,
+                                max_length=max_question_length
+                            )
+                        else:
+                            # If answer itself is too long, we'll truncate it (last resort)
+                            question_ids = []
+                            max_answer_length = seq_length - len(instruction_token_ids) - len(response_token_ids) - len(end_token_ids) - 10
+                            if max_answer_length > 0:
+                                answer_ids = tokenizer.encode(
+                                    answer,
+                                    add_special_tokens=False,
+                                    truncation=True,
+                                    max_length=max_answer_length
+                                )
+                                answer_ids = response_token_ids + answer_ids + end_token_ids
+                            else:
+                                # Answer is extremely long, use minimal truncation
+                                answer_ids = response_token_ids + tokenizer.encode(
+                                    answer,
+                                    add_special_tokens=False,
+                                    truncation=True,
+                                    max_length=seq_length - len(instruction_token_ids) - len(response_token_ids) - len(end_token_ids) - 5
+                                ) + end_token_ids
+                    else:
+                        # No truncation: tokenize full question/system
                         question_ids = tokenizer.encode(
                             question_system_text,
                             add_special_tokens=False,
-                            truncation=True,
-                            max_length=max_question_length
-                        )
-                    else:
-                        # If answer itself is too long, we'll truncate it (last resort)
-                        question_ids = []
-                        # Truncate answer to fit
-                        max_answer_length = seq_length - len(instruction_token_ids) - len(response_token_ids) - len(end_token_ids) - 10
-                        if max_answer_length > 0:
-                            answer_ids = tokenizer.encode(
-                                answer,
-                                add_special_tokens=False,
-                                truncation=True,
-                                max_length=max_answer_length
-                            )
-                            answer_ids = response_token_ids + answer_ids + end_token_ids
-                        else:
-                            # Answer is extremely long, use minimal truncation
-                            answer_ids = response_token_ids + tokenizer.encode(
-                                answer,
-                                add_special_tokens=False,
-                                truncation=True,
-                                max_length=seq_length - len(instruction_token_ids) - len(response_token_ids) - len(end_token_ids) - 5
-                            ) + end_token_ids
+                            truncation=False
+                        ) if question_system_text else []
                     
                     # Combine: instruction_token + question_ids + answer_ids
                     input_ids = instruction_token_ids + question_ids + answer_ids
                     
-                    # Truncate to max_length if still too long (shouldn't happen, but safety check)
-                    if len(input_ids) > seq_length:
+                    # Check if sample exceeds limits (when truncation disabled)
+                    if not enable_truncation and len(input_ids) > safety_limit:
+                        # Skip extremely long samples when truncation is disabled
+                        if i == 0:
+                            #logging.debug(f"⚠️ Skipping sample {i}: too long ({len(input_ids)} > {safety_limit} tokens) when truncation disabled")
+                            pass
+                        stats['skipped'] += 1
+                        continue
+                    
+                    # Final truncation if still too long (only when truncation enabled)
+                    if enable_truncation and len(input_ids) > seq_length:
                         # Last resort: truncate from question side
                         excess = len(input_ids) - seq_length
                         if excess < len(question_ids):
@@ -3000,25 +3171,39 @@ def train_production_mode(
                 
                 # Ensure we have at least some answer tokens
                 answer_tokens_count = len(input_ids) - response_start_idx
-                if answer_tokens_count < 3:  # Less than 3 tokens for answer (including <|end|>)
-                    logging.warning(f"⚠️ Very few answer tokens ({answer_tokens_count}), response_start_idx={response_start_idx}, seq_len={len(input_ids)}")
+                min_required_answer_tokens = 5  # Minimum tokens for answer (excluding end token)
+                
+                if answer_tokens_count < min_required_answer_tokens:
                     # Try to find response_token and adjust
+                    found_better_idx = False
                     for idx in range(len(input_ids) - len(response_token_ids), max(0, len(input_ids) - 100), -1):
                         if input_ids[idx:idx+len(response_token_ids)] == response_token_ids:
-                            response_start_idx = idx + len(response_token_ids)
-                            if len(input_ids) - response_start_idx >= 3:
+                            new_response_start = idx + len(response_token_ids)
+                            new_answer_count = len(input_ids) - new_response_start
+                            if new_answer_count >= min_required_answer_tokens:
+                                response_start_idx = new_response_start
+                                answer_tokens_count = new_answer_count
+                                found_better_idx = True
                                 break
+                    
+                    # If still too few answer tokens, skip this sample
+                    if answer_tokens_count < min_required_answer_tokens:
+                        if i == 0:
+                            #logging.warning(f"⚠️ Skipping sample {i}: too few answer tokens ({answer_tokens_count}), response_start_idx={response_start_idx}, seq_len={len(input_ids)}")
+                            pass
+                        stats['skipped'] += 1
+                        continue  # Skip this sample
                 
                 # Log truncation statistics (only for first sample to avoid spam)
                 if i == 0:
                     question_tokens = len(question_ids) if 'question_ids' in locals() else 0
                     answer_tokens = answer_tokens_count
                     total_tokens = len(input_ids)
-                    logging.info(f"📊 Tokenization stats (first sample): question={question_tokens}, answer={answer_tokens}, total={total_tokens}, response_start_idx={response_start_idx}")
-                    if question_tokens == 0:
-                        logging.warning(f"⚠️ Question was completely truncated (answer too long)")
-                    if answer_tokens < 10:
-                        logging.warning(f"⚠️ Very few answer tokens ({answer_tokens}), may cause training issues")
+                    # logging.info(f"📊 Tokenization stats (first sample): question={question_tokens}, answer={answer_tokens}, total={total_tokens}, response_start_idx={response_start_idx}")
+                    # if question_tokens == 0:
+                    #     logging.warning(f"⚠️ Question was completely truncated (answer too long)")
+                    # if answer_tokens < 10:
+                    #     logging.warning(f"⚠️ Very few answer tokens ({answer_tokens}), may cause training issues")
                 
                 # Update statistics
                 stats['total'] += 1
@@ -3071,13 +3256,39 @@ def train_production_mode(
             if stats['total'] > 0:
                 # Only log if we have meaningful stats
                 if stats['min_answer_tokens'] != float('inf'):
-                    logging.debug(f"📊 Batch tokenization stats: total={stats['total']}, question_truncated={stats['question_truncated']}, answer_truncated={stats['answer_truncated']}, answer_tokens=[{stats['min_answer_tokens']:.0f}, {stats['max_answer_tokens']:.0f}]")
+                    skipped_info = f", skipped={stats['skipped']}" if stats['skipped'] > 0 else ""
+                    #logging.debug(f"📊 Batch tokenization stats: total={stats['total']}{skipped_info}, question_truncated={stats['question_truncated']}, answer_truncated={stats['answer_truncated']}, answer_tokens=[{stats['min_answer_tokens']:.0f}, {stats['max_answer_tokens']:.0f}]")
             
+            # Use actual list length in case some samples were skipped
+            actual_batch_size = len(input_ids_list)
+            
+            # When batched=False, return single values instead of lists
+            if not is_batched:
+                if actual_batch_size == 1:
+                    # Sample was processed successfully
+                    return {
+                        'input_ids': input_ids_list[0],
+                        'attention_mask': attention_mask_list[0],
+                        'labels': labels_list[0],
+                        'labels_shifted': True  # Labels are already shifted
+                    }
+                else:
+                    # Sample was skipped - return empty lists to be filtered out later
+                    return {
+                        'input_ids': [],
+                        'attention_mask': [],
+                        'labels': [],
+                        'labels_shifted': True
+                    }
+            
+            # Batched mode - return lists (must match input batch size)
+            # If we skipped samples, the lists will be shorter - this causes the error
+            # So we only use batched mode when truncation is enabled (no skipping)
             return {
                 'input_ids': input_ids_list,
                 'attention_mask': attention_mask_list,
                 'labels': labels_list,
-                'labels_shifted': [True] * batch_size  # Labels are already shifted
+                'labels_shifted': [True] * actual_batch_size  # Labels are already shifted
             }
     
         # Tokenize the instruction dataset
@@ -3087,23 +3298,66 @@ def train_production_mode(
         tokenization_workers = min(48, config.get('num_workers', 8) * 4)
         logging.info(f"   - Using {tokenization_workers} workers for tokenization")
         
+        # Use batched=False when truncation is disabled to handle skipped samples properly
+        # When batched=True, all returned columns must have the same length as input batch
+        # When samples are skipped (too long), this causes length mismatches
+        use_batched = enable_truncation  # Only use batched mode when truncation is enabled
+        batch_size = 2000 if use_batched else 1
+        
+        if not use_batched:
+            logging.info("⚠️ Using batched=False mode because enable_truncation=False (samples may be skipped)")
+            logging.info("   This is slower but necessary to handle variable batch sizes when skipping long samples")
+        
         hf_dataset = hf_dataset.map(
             tokenize_instruction_function,
-            batched=True,
-            batch_size=2000,
+            batched=use_batched,
+            batch_size=batch_size,
             num_proc=tokenization_workers,
             remove_columns=['question', 'answer', 'dataset'] if 'dataset' in hf_dataset.column_names else ['question', 'answer'],
             desc='Tokenizing instruction dataset',
             load_from_cache_file=False  # Disable HF cache to ensure fresh tokenization
         )
         
+        # Filter out empty samples (skipped samples) when using batched=False
+        if not use_batched:
+            initial_size = len(hf_dataset)
+            # Filter out samples where input_ids is empty (skipped samples)
+            hf_dataset = hf_dataset.filter(lambda x: len(x.get('input_ids', [])) > 0)
+            final_size = len(hf_dataset)
+            skipped_count = initial_size - final_size
+            if skipped_count > 0:
+                logging.info(f"📊 Filtered out {skipped_count:,} skipped samples (too long when truncation disabled)")
+                logging.info(f"   Dataset size: {initial_size:,} -> {final_size:,} samples")
+            else:
+                logging.info(f"✅ All {initial_size:,} samples processed successfully")
+        
         logging.info("✅ Instruction dataset tokenization completed!")
         logging.info(f"📊 Dataset features: {list(hf_dataset.features.keys())}")
         
         # Split back into train and val
-        train_size = len(train_hf_dataset)
-        train_hf_dataset = hf_dataset.select(range(train_size))
-        val_hf_dataset = hf_dataset.select(range(train_size, len(hf_dataset)))
+        # IMPORTANT: After filtering, the dataset size may be smaller than original
+        # Recalculate split based on actual filtered dataset size and validation_split_ratio
+        actual_total_size = len(hf_dataset)
+        # original_train_size, original_val_size, original_total_size were saved before concatenation
+        
+        # Calculate new split sizes based on validation_split_ratio
+        # This preserves the ratio even after samples were filtered out
+        validation_split_ratio = config.get("data", {}).get("processing", {}).get("validation_split_ratio", 0.1)
+        new_val_size = max(int(actual_total_size * validation_split_ratio), 100)  # At least 100 validation samples
+        new_train_size = actual_total_size - new_val_size
+        
+        if new_train_size <= 0:
+            logging.warning(f"⚠️ After filtering, not enough samples for training. Total: {actual_total_size}, Val: {new_val_size}")
+            new_train_size = max(actual_total_size - 100, 0)  # Keep at least 100 for val, rest for train
+            new_val_size = actual_total_size - new_train_size
+        
+        logging.info(f"📊 Dataset split after filtering:")
+        logging.info(f"   Original: {original_train_size:,} train + {original_val_size:,} val = {original_total_size:,} total")
+        logging.info(f"   Filtered:  {new_train_size:,} train + {new_val_size:,} val = {actual_total_size:,} total")
+        logging.info(f"   Validation ratio: {validation_split_ratio:.1%} (maintained)")
+        
+        train_hf_dataset = hf_dataset.select(range(new_train_size))
+        val_hf_dataset = hf_dataset.select(range(new_train_size, actual_total_size))
         
         # Save tokenized datasets to cache for future runs
         logging.info(f"💾 Saving tokenized datasets to cache: {tokenized_cache_path}")

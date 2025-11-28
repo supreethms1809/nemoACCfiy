@@ -448,6 +448,18 @@ def run_batched_inference(
             # Get the input and generated sequences
             input_seq = input_ids[i]
             generated_seq = generated_ids[i]
+            attn_mask = attention_mask[i]
+            
+            # CRITICAL BUG FIX: With left padding, we need to extract only the actual prompt tokens
+            # (excluding padding) before decoding. Use attention_mask to find actual prompt tokens.
+            # attention_mask[i] = 1 for actual tokens, 0 for padding
+            if isinstance(attn_mask, torch.Tensor):
+                actual_prompt_mask = attn_mask.bool()
+            else:
+                actual_prompt_mask = torch.tensor(attn_mask, dtype=torch.bool)
+            
+            # Extract only the actual prompt tokens (excluding padding)
+            actual_prompt_ids = input_seq[actual_prompt_mask]
             
             # Get lengths
             input_len = input_seq.shape[0] if isinstance(input_seq, torch.Tensor) else len(input_seq)
@@ -462,9 +474,9 @@ def run_batched_inference(
             else:
                 generated_text = ""
             
-            # Decode the full input sequence (including padding) for prompt text
+            # CRITICAL BUG FIX: Decode only the actual prompt tokens (without padding)
             # This is needed for extract_response_text to work correctly
-            prompt_text = tokenizer.decode(input_seq, skip_special_tokens=False)
+            prompt_text = tokenizer.decode(actual_prompt_ids, skip_special_tokens=False)
             
             # Debug: Print first example to see what's being generated
             if i == 0:
@@ -573,7 +585,12 @@ def run_single_inference(model, tokenizer, prompt: str, args, device, use_mixed_
                 else:
                     generated_ids = actual_model.generate(**generate_kwargs)
         
-        # Decode the generated text (keep special tokens for stage1_inst_SFT)
+        # CRITICAL BUG FIX: HuggingFace's generate() returns FULL sequence (input + new tokens)
+        # Extract only the newly generated tokens
+        input_len = input_ids[0].shape[0] if isinstance(input_ids[0], torch.Tensor) else len(input_ids[0])
+        generated_len = generated_ids[0].shape[0] if isinstance(generated_ids[0], torch.Tensor) else len(generated_ids[0])
+        
+        # Decode the full sequences for extraction (needed for extract_response_text)
         generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=False)
         prompt_text = tokenizer.decode(input_ids[0], skip_special_tokens=False)
         
@@ -678,7 +695,7 @@ def main():
                        help="Sampling temperature (0.1-2.0, use 0.0 for greedy decoding)")
     parser.add_argument("--top_k", type=int, default=50,
                        help="Number of top tokens to sample from (default: 50, use 0 for no limit)")
-    parser.add_argument("--repetition_penalty", type=float, default=1.1,
+    parser.add_argument("--repetition_penalty", type=float, default=1.3,
                        help="Repetition penalty (1.0 = no penalty, >1.0 = reduce repetition)")
     parser.add_argument("--greedy", action="store_true", default=False,
                        help="Use greedy decoding instead of sampling (temperature=0, top_k=1)")
@@ -833,16 +850,29 @@ def main():
         # When padding on the left, we don't want to use eos_token_id as padding
         # This prevents the model from seeing <|endoftext|> tokens at the start
         # The tokenizer's default pad_token_id (151643) decodes to <|endoftext|>, which is problematic
+        # MATCH TRAINING: Try unk_token_id first, then fallback to 0 (same as training code)
         pad_decoded = tokenizer.decode([tokenizer.pad_token_id], skip_special_tokens=False) if tokenizer.pad_token_id is not None else None
         eos_decoded = tokenizer.decode([tokenizer.eos_token_id], skip_special_tokens=False) if tokenizer.eos_token_id is not None else None
         
         if tokenizer.pad_token_id is None or tokenizer.pad_token_id == tokenizer.eos_token_id or (pad_decoded and '<|endoftext|>' in pad_decoded):
-            # Use token 0 which decodes to '!' - safe for padding
+            # MATCH TRAINING: Try unk_token_id first, then fallback to 0
             old_pad_token_id = tokenizer.pad_token_id
-            tokenizer.pad_token_id = 0
-            print(f"🔧 Set pad_token_id to 0 (was: {old_pad_token_id})")
-            print(f"   Reason: pad_token_id decoded to '{pad_decoded}' which contains <|endoftext|>")
-            print(f"   Token 0 decodes to: '{tokenizer.decode([0], skip_special_tokens=False)}'")
+            if tokenizer.unk_token_id is not None:
+                tokenizer.pad_token_id = tokenizer.unk_token_id
+                print(f"🔧 Set pad_token_id to unk_token_id: {tokenizer.unk_token_id} (was: {old_pad_token_id})")
+                if pad_decoded and '<|endoftext|>' in pad_decoded:
+                    print(f"   Reason: pad_token_id decoded to '{pad_decoded}' which contains <|endoftext|>")
+                else:
+                    print(f"   Reason: pad_token_id was None or equal to eos_token_id")
+            else:
+                # Use token 0 which decodes to '!' - safe for padding (fallback)
+                tokenizer.pad_token_id = 0
+                print(f"🔧 Set pad_token_id to 0 (fallback, was: {old_pad_token_id})")
+                if pad_decoded and '<|endoftext|>' in pad_decoded:
+                    print(f"   Reason: pad_token_id decoded to '{pad_decoded}' which contains <|endoftext|>")
+                else:
+                    print(f"   Reason: pad_token_id was None or equal to eos_token_id, and unk_token_id not available")
+                print(f"   Token 0 decodes to: '{tokenizer.decode([0], skip_special_tokens=False)}'")
         else:
             print(f"✅ pad_token_id already set correctly: {tokenizer.pad_token_id}")
             print(f"   pad_token_id decodes to: '{pad_decoded}'")
@@ -1086,10 +1116,98 @@ def main():
                 if model_vocab_size != tokenizer_vocab_size:
                     print(f"⚠️ WARNING: Model vocab size ({model_vocab_size}) doesn't match tokenizer vocab size ({tokenizer_vocab_size})")
                     if args.stage == "stage1_inst_SFT":
+                        print(f"   🔧 CRITICAL FIX: Resizing model to match tokenizer vocab size (includes instruction tokens)...")
+                        print(f"      This ensures the model can generate <|end|> token even if checkpoint was trained without it")
+                        
+                        # Import resize function from training module
+                        try:
+                            from src.nemo.ModularModelstage1_InstructionSFT import resize_model_embeddings
+                            import logging
+                            
+                            # Resize model embeddings to match tokenizer vocab size (which includes instruction tokens)
+                            tie_weights_config = config.get("tie_weights", False)
+                            resize_success = resize_model_embeddings(
+                                model, 
+                                tokenizer_vocab_size,  # Resize to tokenizer vocab (with instruction tokens)
+                                logging, 
+                                tie_weights=tie_weights_config
+                            )
+                            
+                            if resize_success:
+                                print(f"   ✅ Model resized successfully to vocab size: {tokenizer_vocab_size}")
+                                # Verify resize worked
+                                try:
+                                    if hasattr(model, 'modular_model') and hasattr(model.modular_model, 'model'):
+                                        if hasattr(model.modular_model.model, 'decoder') and hasattr(model.modular_model.model.decoder, 'embed_tokens'):
+                                            new_model_vocab_size = model.modular_model.model.decoder.embed_tokens.weight.shape[0]
+                                            if new_model_vocab_size == tokenizer_vocab_size:
+                                                print(f"   ✅ Verified: Model vocab size now matches tokenizer: {new_model_vocab_size}")
+                                            else:
+                                                print(f"   ⚠️  Resize verification failed: model={new_model_vocab_size}, tokenizer={tokenizer_vocab_size}")
+                                except Exception as e:
+                                    print(f"   ⚠️  Could not verify resize: {e}")
+                            else:
+                                print(f"   ⚠️ Model resize failed - this may cause issues with <|end|> token generation")
+                        except Exception as e:
+                            print(f"   ❌ CRITICAL: Could not resize model embeddings: {e}")
+                            print(f"   ❌ The model will NOT be able to generate <|end|> token!")
+                            import traceback
+                            traceback.print_exc()
+                    else:
                         print(f"   Note: For inference, model was resized to match checkpoint vocab size before loading")
                         print(f"   If sizes still don't match, there may be an issue with the checkpoint or tokenizer")
                 else:
                     print(f"✅ Model and tokenizer vocab sizes match: {model_vocab_size}")
+            
+            # CRITICAL FIX: For stage1_inst_SFT, ALWAYS ensure model vocab matches tokenizer (with instruction tokens)
+            # This is needed even if sizes matched above, because the checkpoint might have been trained without tokens
+            # and we need to add them so the model can generate <|end|>
+            if args.stage == "stage1_inst_SFT" and actual_vocab_size is not None:
+                # Re-check model vocab size after potential resize above
+                current_model_vocab_size = None
+                try:
+                    if hasattr(model, 'modular_model') and hasattr(model.modular_model, 'model'):
+                        if hasattr(model.modular_model.model, 'decoder') and hasattr(model.modular_model.model.decoder, 'embed_tokens'):
+                            current_model_vocab_size = model.modular_model.model.decoder.embed_tokens.weight.shape[0]
+                    elif hasattr(model, 'model') and hasattr(model.model, 'decoder'):
+                        if hasattr(model.model.decoder, 'embed_tokens'):
+                            current_model_vocab_size = model.model.decoder.embed_tokens.weight.shape[0]
+                except Exception:
+                    pass
+                
+                if current_model_vocab_size is not None and current_model_vocab_size != actual_vocab_size:
+                    print("=" * 80)
+                    print(f"🔧 CRITICAL: Ensuring model vocab matches tokenizer (with instruction tokens)...")
+                    print(f"   Model vocab size: {current_model_vocab_size}")
+                    print(f"   Tokenizer vocab size (with instruction tokens): {actual_vocab_size}")
+                    print(f"   Resizing model to include instruction tokens...")
+                    print("=" * 80)
+                    
+                    try:
+                        from src.nemo.ModularModelstage1_InstructionSFT import resize_model_embeddings
+                        import logging
+                        
+                        tie_weights_config = config.get("tie_weights", False)
+                        resize_success = resize_model_embeddings(
+                            model, 
+                            actual_vocab_size,  # Resize to tokenizer vocab (with instruction tokens)
+                            logging, 
+                            tie_weights=tie_weights_config
+                        )
+                        
+                        if resize_success:
+                            print(f"✅ Model resized to include instruction tokens: {current_model_vocab_size} → {actual_vocab_size}")
+                            print(f"   Model can now generate <|end|> token!")
+                        else:
+                            print(f"⚠️ Model resize failed - model may not be able to generate <|end|> token")
+                    except Exception as e:
+                        print(f"❌ CRITICAL: Could not resize model to include instruction tokens: {e}")
+                        print(f"   Model will NOT be able to generate <|end|> token!")
+                        import traceback
+                        traceback.print_exc()
+                elif current_model_vocab_size == actual_vocab_size:
+                    print(f"✅ Model vocab size matches tokenizer (with instruction tokens): {current_model_vocab_size}")
+                    print(f"   Model can generate <|end|> token!")
             
             # Move model to device first
             model = model.to(device)
@@ -1372,6 +1490,11 @@ def generate_optimized(model, input_ids, attention_mask, tokenizer, args, device
         # Get appropriate EOS token for the stage
         eos_token_id = get_eos_token_id(tokenizer, args.stage)
         
+        # CRITICAL: Ensure pad_token_id is different from eos_token_id
+        pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        if pad_token_id == eos_token_id:
+            pad_token_id = tokenizer.unk_token_id if tokenizer.unk_token_id is not None else 0
+        
         generate_kwargs = {
             'input_ids': input_ids,
             'attention_mask': attention_mask,
@@ -1382,8 +1505,19 @@ def generate_optimized(model, input_ids, attention_mask, tokenizer, args, device
             'do_sample': do_sample,
             'repetition_penalty': args.repetition_penalty,
             'eos_token_id': eos_token_id,
-            'pad_token_id': tokenizer.eos_token_id if tokenizer.pad_token_id is None else tokenizer.pad_token_id
+            'pad_token_id': pad_token_id
         }
+        
+        # Debug: Print generation parameters
+        print(f"🔍 Generation kwargs:")
+        print(f"   max_new_tokens: {args.max_tokens}")
+        print(f"   temperature: {temperature}")
+        print(f"   top_k: {top_k}")
+        print(f"   top_p: 0.95")
+        print(f"   do_sample: {do_sample}")
+        print(f"   repetition_penalty: {args.repetition_penalty}")
+        print(f"   eos_token_id: {eos_token_id} (decoded: '{tokenizer.decode([eos_token_id], skip_special_tokens=False)}')")
+        print(f"   pad_token_id: {pad_token_id}")
         
         if use_mixed_precision:
             with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):

@@ -544,6 +544,13 @@ def load_instruction_datasets(
                         "reasoning": item.get("generated_solution", ""),
                         "answer": item["expected_answer"]
                     }
+                elif "question" in item and "expected_answer" in item:
+                    # nvidia/OpenMathInstruct format
+                    sample = {
+                        "question": item["question"],
+                        "reasoning": item.get("generated_solution", item.get("reasoning", item.get("analysis", ""))),
+                        "answer": item["expected_answer"]
+                    }
                 elif "question" in item and "answer" in item:
                     # Generic question-answer format (OpenCodeReasoning or other)
                     sample = {
@@ -557,6 +564,27 @@ def load_instruction_datasets(
                         "question": item["input"],
                         "reasoning": item.get("reasoning", item.get("analysis", "")),
                         "answer": item["output"]
+                    }
+                elif "query" in item and "answer" in item:
+                    # Query-answer format (m-a-p/CodeFeedback-Filtered-Instruction)
+                    sample = {
+                        "question": item["query"],
+                        "reasoning": item.get("reasoning", item.get("analysis", "")),
+                        "answer": item["answer"]
+                    }
+                elif "query" in item and "response" in item:
+                    # Query-response format (meta-math/MetaMathQA)
+                    sample = {
+                        "question": item["query"],
+                        "reasoning": item.get("reasoning", item.get("analysis", "")),
+                        "answer": item["response"]
+                    }
+                elif "problem statement" in item and "solution" in item:
+                    # Problem statement-solution format (hpcgroup/hpc-instruct)
+                    sample = {
+                        "question": item["problem statement"],
+                        "reasoning": item.get("reasoning", item.get("analysis", "")),
+                        "answer": item["solution"]
                     }
                 else:
                     # Log unknown format for debugging
@@ -614,6 +642,25 @@ def load_instruction_datasets_with_percentages(
             else:
                 dataset = load_dataset(dataset_name, split=split)
             
+            # Check dataset size and adjust if needed
+            try:
+                # Try to get dataset length (works for non-streaming datasets)
+                dataset_size = len(dataset)
+                if dataset_size < dataset_samples:
+                    logging.warning(
+                        f"  Dataset {dataset_name} has only {dataset_size:,} samples, "
+                        f"less than requested {dataset_samples:,} ({percentage}%). "
+                        f"Using all available samples."
+                    )
+                    dataset_samples = dataset_size
+                elif dataset_size == dataset_samples:
+                    logging.info(f"  Dataset {dataset_name} has exactly {dataset_size:,} samples")
+                else:
+                    logging.info(f"  Dataset {dataset_name} has {dataset_size:,} samples, taking {dataset_samples:,}")
+            except (TypeError, AttributeError):
+                # Streaming dataset or unknown size - proceed with requested limit
+                logging.info(f"  Dataset size unknown (streaming?), will take up to {dataset_samples:,} samples")
+            
             # Convert to our format
             dataset_data = []
             for i, item in enumerate(dataset):
@@ -626,6 +673,14 @@ def load_instruction_datasets_with_percentages(
                     sample = {
                         "question": item["problem"],
                         "reasoning": item.get("generated_solution", ""),
+                        "answer": item["expected_answer"],
+                        "dataset": dataset_name  # Track source dataset
+                    }
+                elif "question" in item and "expected_answer" in item:
+                    # nvidia/OpenMathInstruct format
+                    sample = {
+                        "question": item["question"],
+                        "reasoning": item.get("generated_solution", item.get("reasoning", item.get("analysis", ""))),
                         "answer": item["expected_answer"],
                         "dataset": dataset_name  # Track source dataset
                     }
@@ -645,6 +700,30 @@ def load_instruction_datasets_with_percentages(
                         "answer": item["output"],
                         "dataset": dataset_name  # Track source dataset
                     }
+                elif "query" in item and "answer" in item:
+                    # Query-answer format (m-a-p/CodeFeedback-Filtered-Instruction)
+                    sample = {
+                        "question": item["query"],
+                        "reasoning": item.get("reasoning", item.get("analysis", "")),
+                        "answer": item["answer"],
+                        "dataset": dataset_name  # Track source dataset
+                    }
+                elif "query" in item and "response" in item:
+                    # Query-response format (meta-math/MetaMathQA)
+                    sample = {
+                        "question": item["query"],
+                        "reasoning": item.get("reasoning", item.get("analysis", "")),
+                        "answer": item["response"],
+                        "dataset": dataset_name  # Track source dataset
+                    }
+                elif "problem statement" in item and "solution" in item:
+                    # Problem statement-solution format (hpcgroup/hpc-instruct)
+                    sample = {
+                        "question": item["problem statement"],
+                        "reasoning": item.get("reasoning", item.get("analysis", "")),
+                        "answer": item["solution"],
+                        "dataset": dataset_name  # Track source dataset
+                    }
                 else:
                     # Log unknown format for debugging
                     logging.debug(f"Unknown format in {dataset_name}: {list(item.keys())}")
@@ -653,7 +732,14 @@ def load_instruction_datasets_with_percentages(
                 dataset_data.append(sample)
             
             all_data.extend(dataset_data)
-            logging.info(f"Loaded {len(dataset_data)} samples from {dataset_name}")
+            requested_samples = int(max_samples * (percentage / 100.0))
+            if len(dataset_data) < requested_samples:
+                logging.info(
+                    f"Loaded {len(dataset_data):,} samples from {dataset_name} "
+                    f"(requested {requested_samples:,}, {len(dataset_data)/requested_samples*100:.1f}% of requested)"
+                )
+            else:
+                logging.info(f"Loaded {len(dataset_data):,} samples from {dataset_name}")
             
         except Exception as e:
             logging.warning(f"Failed to load dataset {dataset_name}: {e}")

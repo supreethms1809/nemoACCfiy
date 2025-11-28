@@ -19,6 +19,7 @@ import logging
 from pathlib import Path
 import time
 import json
+import random
 
 # Add src to path
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -26,6 +27,8 @@ project_root = os.path.dirname(current_dir)
 src_path = os.path.join(project_root, 'src')
 sys.path.insert(0, src_path)
 sys.path.append(project_root)
+
+from src.utils.tokenizer_manager import get_tokenizer_with_caching
 
 # Import instruction dataset loading function
 try:
@@ -87,6 +90,7 @@ def preprocess_instruction_datasets(
         
         # Get instruction datasets configuration
         data_config = config.get("data", {})
+        processing_config = data_config.get("processing", {})
         pretraining_datasets = data_config.get("pretraining_datasets", {})
         
         if not pretraining_datasets:
@@ -95,10 +99,50 @@ def preprocess_instruction_datasets(
             return False
         
         # Get validation split ratio from config (default 0.1 = 10%)
-        validation_split_ratio = data_config.get("processing", {}).get("validation_split_ratio", 0.1)
+        validation_split_ratio = processing_config.get("validation_split_ratio", 0.1)
+        
+        seed = processing_config.get("seed", 42)
+        rng = random.Random(seed)
         
         logger.info(f"📚 Found {len(pretraining_datasets)} instruction datasets in config")
         logger.info(f"📊 Validation split ratio: {validation_split_ratio:.1%}")
+        
+        # ------------------------------------------------------------------
+        # Load tokenizer with instruction-format special tokens (same as training)
+        # ------------------------------------------------------------------
+        tokenizer_path = (
+            config.get("tokenizer_path")
+            or config.get("model", {}).get("tokenizer_path")
+            or data_config.get("tokenizer_path")
+            or "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+        )
+        logger.info(f"🔤 Loading tokenizer for preprocessing: {tokenizer_path}")
+        
+        tokenizer = get_tokenizer_with_caching(
+            tokenizer_path=tokenizer_path,
+            custom_tokens=None,  # Adds default custom tokens via TokenizerManager
+            force_download=False,
+            cache_dir="tokenizers"
+        )
+        
+        instruction_tokens = ["<|instruction|>", "<|response|>", "<|end|>"]
+        missing_tokens = [tok for tok in instruction_tokens if tok not in tokenizer.get_vocab()]
+        
+        if missing_tokens:
+            logger.info(f"➕ Adding instruction tokens: {missing_tokens}")
+            tokenizer.add_tokens(missing_tokens)
+            logger.info(f"✅ Tokenizer vocab size after additions: {len(tokenizer)}")
+        else:
+            logger.info("✅ All instruction-format tokens already present in tokenizer")
+        
+        # Ensure pad token is distinct from eos (parity with training)
+        if tokenizer.pad_token_id is None or tokenizer.pad_token_id == tokenizer.eos_token_id:
+            if tokenizer.unk_token_id is not None:
+                tokenizer.pad_token_id = tokenizer.unk_token_id
+                logger.info(f"🔧 pad_token_id set to unk_token_id ({tokenizer.unk_token_id})")
+            else:
+                tokenizer.pad_token_id = 0
+                logger.info("🔧 pad_token_id not set; defaulting to 0")
         
         # Categorize datasets by allocation strategy
         priority_datasets = []
@@ -117,14 +161,45 @@ def preprocess_instruction_datasets(
         
         # Calculate validation samples based on configurable ratio
         val_samples = max(int(total_samples * validation_split_ratio), 100)  # At least 100 validation samples
+        if val_samples >= total_samples:
+            logger.warning(
+                f"⚠️ validation_split_ratio ({validation_split_ratio:.2%}) results in "
+                f"{val_samples:,} validation samples >= total_samples ({total_samples:,}). "
+                "Reducing validation samples to keep at least 1 training sample."
+            )
+            val_samples = max(total_samples - 1, 0)
+        train_samples = max(total_samples - val_samples, 0)
+        logger.info(
+            f"📊 Sample allocation -> train: {train_samples:,} ({(train_samples / total_samples * 100) if total_samples else 0:.2f}%), "
+            f"val: {val_samples:,} ({(val_samples / total_samples * 100) if total_samples else 0:.2f}%)"
+        )
+        
+        def partition_samples(samples, target_count, split_name):
+            if target_count <= 0:
+                logger.warning(f"⚠️ Target {split_name} samples set to <= 0. Returning empty list.")
+                return [], samples
+            current_count = len(samples)
+            if current_count <= target_count:
+                if current_count < target_count:
+                    logger.warning(
+                        f"⚠️ Requested {target_count:,} {split_name} samples but only {current_count:,} available."
+                    )
+                return samples, []
+            rng.shuffle(samples)
+            logger.info(
+                f"✂️ Partitioning {split_name} dataset from {current_count:,} to {target_count:,} samples "
+                f"to respect validation_split_ratio."
+            )
+            return samples[:target_count], samples[target_count:]
         
         # Load instruction datasets
         logger.info("📥 Loading instruction datasets...")
         start_time = time.time()
         
+        train_request_samples = max(total_samples, train_samples)
         train_instruction_data = load_instruction_datasets_with_percentages(
             pretraining_datasets, 
-            total_samples, 
+            train_request_samples, 
             "train"
         )
         
@@ -133,6 +208,18 @@ def preprocess_instruction_datasets(
             val_samples,
             "validation"
         )
+        
+        # Allocate validation target and recycle any excess into the training pool
+        val_instruction_data, val_excess = partition_samples(val_instruction_data, val_samples, "validation")
+        if val_excess:
+            train_instruction_data.extend(val_excess)
+        
+        # Finally, cap training samples to requested count
+        train_instruction_data, train_excess = partition_samples(train_instruction_data, train_samples, "train")
+        if train_excess:
+            logger.info(
+                f"♻️  Discarding {len(train_excess):,} surplus training samples after enforcing split targets."
+            )
         
         load_time = time.time() - start_time
         actual_train_samples = len(train_instruction_data)
@@ -182,7 +269,11 @@ def preprocess_instruction_datasets(
             "model_config_key": model_config_key,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "datasets_config": pretraining_datasets,
-            "dataset_format": "instruction_format"
+            "dataset_format": "instruction_format",
+            "validation_split_ratio": validation_split_ratio,
+            "tokenizer_path": tokenizer_path,
+            "tokenizer_vocab_size": len(tokenizer),
+            "instruction_tokens": instruction_tokens
         }
         
         with open(metadata_dir / "preprocessing_metadata.json", 'w') as f:
